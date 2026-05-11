@@ -13,11 +13,11 @@ use super::char_diff::{char_diff, left_segments, right_segments, Segment};
 use crate::diff::{Anchor, DiffOp, Hunk};
 use crate::session::{HunkDecision, SessionId, SessionStore};
 
-/// Tall enough for the 2x Roboto Mono used in code rows.
-pub const ROW_H: f32 = 32.0;
+/// Tall enough for the 1.5x Roboto Mono used in code rows.
+pub const ROW_H: f32 = 24.0;
 
-/// Width of the line-number gutter, sized for ~4 digits in the larger mono.
-const GUTTER_W: f32 = 80.0;
+/// Width of the line-number gutter, sized for ~4 digits in the code-row mono.
+const GUTTER_W: f32 = 60.0;
 
 const CONNECTOR_W: f32 = 60.0;
 
@@ -554,9 +554,12 @@ fn draw_pane(
     if total == 0 {
         return;
     }
-    // Captures the (hunk_id, screen_pos) of the change-hunk row currently
-    // under the cursor. Set during the row loop; if non-None after the loop,
-    // the decision-button overlay is rendered at that screen position.
+    // Zero ItemSpacing.y so each row consumes exactly ROW_H. Without this,
+    // imgui adds style.ItemSpacing.y between consecutive widgets, so the
+    // screen y of row i becomes origin + i*(ROW_H + spacing) while our
+    // content-y model uses i*ROW_H — the connector ribbons drift further
+    // out of alignment with each visible row.
+    let _spacing = ui.push_style_var(StyleVar::ItemSpacing([0.0, 0.0]));
     let hover: Cell<Option<(u32, [f32; 2])>> = Cell::new(None);
     let mut clipper = ListClipper::new(total).items_height(ROW_H).begin(ui);
     while clipper.step() {
@@ -567,6 +570,7 @@ fn draw_pane(
             }
         }
     }
+    drop(_spacing);
     if let Some((hunk_id, pos)) = hover.get() {
         draw_control_overlay(ui, store, session_id, hunk_id, status, pos);
     }

@@ -180,9 +180,9 @@ impl ApplicationHandler for App {
                 ..Default::default()
             }),
         }]);
-        // Code-view font: 2x the UI size so dense diffs are easier to scan.
-        // Row heights in diff_view / merge_view scale to match.
-        let code_font_size = font_size * 2.0;
+        // Code-view font: 1.5x the UI size so dense diffs stay easier to scan
+        // than the UI font, but without dominating the layout.
+        let code_font_size = font_size * 1.5;
         let mono_font = imgui.fonts().add_font(&[FontSource::TtfData {
             data: include_bytes!("../../assets/RobotoMono-Regular.ttf"),
             size_pixels: code_font_size,
@@ -505,12 +505,13 @@ fn current_session_summary(ui: &imgui::Ui, state: &mut AppState) {
                     });
             }
             {
+                let mono = state.mono_font;
                 let result = state.result_panes.entry(id).or_default();
                 ui.child_window("result_area")
                     .size([0.0, 0.0])
                     .border(true)
                     .build(|| {
-                        result_pane::render(ui, &state.sessions, id, result);
+                        result_pane::render(ui, &state.sessions, id, result, mono);
                     });
             }
         }
@@ -532,12 +533,13 @@ fn current_session_summary(ui: &imgui::Ui, state: &mut AppState) {
                     });
             }
             {
+                let mono = state.mono_font;
                 let result = state.result_panes.entry(id).or_default();
                 ui.child_window("result_area")
                     .size([0.0, 0.0])
                     .border(true)
                     .build(|| {
-                        result_pane::render(ui, &state.sessions, id, result);
+                        result_pane::render(ui, &state.sessions, id, result, mono);
                     });
             }
         }

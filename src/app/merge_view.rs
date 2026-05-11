@@ -13,9 +13,9 @@ use imgui::{FontId, ListClipper, StyleVar, Ui};
 use crate::merge::{MergeAnchor, MergeHunk, Resolution};
 use crate::session::{SessionId, SessionStore};
 
-/// Match diff_view: tall enough for the 2x Roboto Mono used in code rows.
-pub const ROW_H: f32 = 32.0;
-const GUTTER_W: f32 = 80.0;
+/// Match diff_view: tall enough for the 1.5x Roboto Mono used in code rows.
+pub const ROW_H: f32 = 24.0;
+const GUTTER_W: f32 = 60.0;
 const CONNECTOR_W: f32 = 56.0;
 const ECHO_TOLERANCE: f32 = 0.5;
 
@@ -308,8 +308,10 @@ fn draw_pane(
     if total == 0 {
         return;
     }
-    // (hunk_id, kind, screen_pos) of the hovered non-stable row; populated
-    // during the row loop and used to render the resolution overlay after.
+    // See diff_view::draw_pane for why ItemSpacing.y must be zero: each row
+    // must consume exactly ROW_H so the connector's content-y model lines
+    // up with the actually-rendered screen positions.
+    let _spacing = ui.push_style_var(StyleVar::ItemSpacing([0.0, 0.0]));
     let hover: Cell<Option<(u32, HunkKind, [f32; 2])>> = Cell::new(None);
     let mut clipper = ListClipper::new(total).items_height(ROW_H).begin(ui);
     while clipper.step() {
@@ -317,6 +319,7 @@ fn draw_pane(
             draw_row(ui, &rows[i as usize], i, mono_font, &hover);
         }
     }
+    drop(_spacing);
     if let Some((hunk_id, kind, pos)) = hover.get() {
         draw_control_overlay(ui, store, session_id, hunk_id, kind, status, pos);
     }

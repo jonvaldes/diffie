@@ -5,12 +5,8 @@
 //! session's `manual_result` field is the source of truth once the user
 //! types. When the user is not editing, decision/resolution changes upstream
 //! recompute the result and refresh the buffer here.
-//!
-//! Step 11 uses imgui's built-in `input_text_multiline`. The originally
-//! agreed `imgui-text-edit-rs` (ColorTextEdit) would add syntax highlighting
-//! and line numbers; see TODO at the end of this file.
 
-use imgui::Ui;
+use imgui::{FontId, Ui};
 
 use crate::session::{SessionId, SessionStore};
 
@@ -21,7 +17,13 @@ pub struct ResultState {
     initialized: bool,
 }
 
-pub fn render(ui: &Ui, store: &SessionStore, session_id: SessionId, state: &mut ResultState) {
+pub fn render(
+    ui: &Ui,
+    store: &SessionStore,
+    session_id: SessionId,
+    state: &mut ResultState,
+    mono_font: Option<FontId>,
+) {
     // Sync from the session unless the user is actively typing — otherwise
     // the cursor would jump every time decisions change upstream.
     if !state.was_active_last_frame {
@@ -39,18 +41,17 @@ pub fn render(ui: &Ui, store: &SessionStore, session_id: SessionId, state: &mut 
     }
 
     let avail = ui.content_region_avail();
+    // Render the editor in the same Roboto Mono used by the diff/merge
+    // views so the result reads as code.
+    let _font_tok = mono_font.map(|f| ui.push_font(f));
     let changed = ui
         .input_text_multiline("##diffie_result", &mut state.buffer, avail)
         .build();
     let active = ui.is_item_active();
+    drop(_font_tok);
 
     if changed {
         let _ = store.update_manual_result(session_id, state.buffer.clone());
     }
     state.was_active_last_frame = active;
 }
-
-// TODO(step 11+): consider swapping in `imgui-text-edit-rs` (ColorTextEdit)
-// once we've confirmed the crate's API. Wants: line numbers, syntax
-// highlighting (Rust/JS/etc.), and inline error markers as we know the
-// session's lint state.
