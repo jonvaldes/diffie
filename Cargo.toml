@@ -13,9 +13,31 @@ path = "src/lib.rs"
 name = "diffie"
 path = "src/main.rs"
 
+[features]
+default = ["gui"]
+gui = [
+    "dep:imgui",
+    "dep:imgui-winit-support",
+    "dep:imgui-wgpu",
+    "dep:winit",
+    "dep:wgpu",
+    "dep:pollster",
+    "dep:rfd",
+]
+
 [dependencies]
+# core (always on)
 diff = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "1"
 encoding_rs = "0.8"
+
+# gui (gated by `gui` feature)
+imgui = { version = "0.12", optional = true }
+imgui-winit-support = { version = "0.13", optional = true }
+imgui-wgpu = { version = "0.25", optional = true }
+winit = { version = "0.30", features = ["x11", "wayland", "wayland-dlopen", "rwh_06"], optional = true }
+wgpu = { version = "25", optional = true }
+pollster = { version = "0.3", optional = true }
+rfd = { version = "0.14", optional = true }
