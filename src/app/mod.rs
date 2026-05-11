@@ -390,7 +390,43 @@ fn toolbar(ui: &imgui::Ui, state: &mut AppState) {
         open_three_way(state);
     }
     ui.same_line();
-    ui.text_disabled(&state.status);
+    let has_session = state.active.is_some();
+    ui.disabled(!has_session, || {
+        if ui.button("Save Result As…") {
+            save_as(state);
+        }
+    });
+    ui.same_line();
+    // Status: red-tinted for entries that read like errors, default otherwise.
+    let lower = state.status.to_ascii_lowercase();
+    if lower.contains("error") || lower.contains("failed") {
+        ui.text_colored([1.0, 0.45, 0.45, 1.0], &state.status);
+    } else {
+        ui.text_disabled(&state.status);
+    }
+}
+
+fn save_as(state: &mut AppState) {
+    let Some(id) = state.active else {
+        return;
+    };
+    let Some(path) = rfd::FileDialog::new()
+        .set_title("Save merged result")
+        .save_file()
+    else {
+        return;
+    };
+    let text = match state.sessions.compute_result(id) {
+        Ok(t) => t,
+        Err(e) => {
+            state.status = format!("compute error: {e}");
+            return;
+        }
+    };
+    match fileio::write_text(&path, &text) {
+        Ok(()) => state.status = format!("saved: {}", path.display()),
+        Err(e) => state.status = format!("save error: {e}"),
+    }
 }
 
 fn current_session_summary(ui: &imgui::Ui, state: &mut AppState) {
