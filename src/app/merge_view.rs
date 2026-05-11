@@ -418,6 +418,10 @@ fn draw_pane(
     if total == 0 {
         return;
     }
+    let pane_origin = ui.cursor_screen_pos();
+    let visible_h = ui.content_region_avail()[1];
+    let cur_scroll = ui.scroll_y();
+
     // See diff_view::draw_pane for why ItemSpacing.y must be zero: each row
     // must consume exactly row_h() so the connector's content-y model lines
     // up with the actually-rendered screen positions.
@@ -439,6 +443,45 @@ fn draw_pane(
         }
     }
     drop(_spacing);
+
+    // Drag auto-scroll. See `diff_view::draw_pane` for the rationale.
+    if let Some(sel) = selection.as_mut() {
+        if sel.dragging
+            && sel.pane == pane
+            && ui.is_mouse_down(imgui::MouseButton::Left)
+        {
+            let mouse_y = ui.io().mouse_pos[1];
+            let pane_top = pane_origin[1] + cur_scroll;
+            let pane_bot = pane_top + visible_h;
+            let max_scroll = (rows.len() as f32 * row_h() - visible_h).max(0.0);
+            let new_scroll = if mouse_y < pane_top {
+                let dist = (pane_top - mouse_y).min(160.0);
+                let speed = 8.0 + dist * 0.5;
+                Some((cur_scroll - speed).max(0.0))
+            } else if mouse_y > pane_bot {
+                let dist = (mouse_y - pane_bot).min(160.0);
+                let speed = 8.0 + dist * 0.5;
+                Some((cur_scroll + speed).min(max_scroll))
+            } else {
+                None
+            };
+            if let Some(s) = new_scroll {
+                ui.set_scroll_y(s);
+                if mouse_y < pane_top {
+                    let row_idx = ((s / row_h()) as usize).min(rows.len().saturating_sub(1));
+                    sel.caret = (row_idx, 0);
+                } else {
+                    let bot_content = s + visible_h;
+                    let row_idx = ((bot_content / row_h()) as usize)
+                        .saturating_sub(1)
+                        .min(rows.len().saturating_sub(1));
+                    let last_col = rows[row_idx].text.chars().count();
+                    sel.caret = (row_idx, last_col);
+                }
+            }
+        }
+    }
+
     if let Some((hunk_id, kind, pos)) = hover.get() {
         draw_control_overlay(ui, store, session_id, hunk_id, kind, status, pos);
     }
@@ -555,6 +598,9 @@ fn draw_row(
     let p1 = [p0[0] + row_w, p0[1] + row_h()];
 
     let _ = ui.invisible_button(format!("mrow_{idx}"), [row_w, row_h()]);
+    // See `diff_view::draw_row` for why drag-related hit detection uses
+    // `is_mouse_hovering_rect` instead of `is_item_hovered`.
+    let mouse_in_row = ui.is_mouse_hovering_rect(p0, p1);
     let hovered = ui.is_item_hovered();
     let activated = ui.is_item_activated();
     if let Some(kind) = row.kind {
@@ -575,7 +621,7 @@ fn draw_row(
     let text_start_x = p0[0] + gutter_w();
     let char_count = row.text.chars().count();
 
-    let col_at_mouse = if hovered {
+    let col_at_mouse = if mouse_in_row {
         let mx = ui.io().mouse_pos[0];
         let raw = ((mx - text_start_x) / char_w).round();
         Some(raw.clamp(0.0, char_count as f32) as usize)
@@ -601,7 +647,7 @@ fn draw_row(
         }
         focus_event.set(Some(pane.as_focused_pane()));
     }
-    if hovered {
+    if mouse_in_row {
         if let Some(sel) = selection.as_mut() {
             if sel.dragging && sel.pane == pane && ui.is_mouse_down(imgui::MouseButton::Left) {
                 if let Some(col) = col_at_mouse {

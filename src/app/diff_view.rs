@@ -704,6 +704,13 @@ fn draw_pane(
     if total == 0 {
         return;
     }
+
+    // Captured before the clipper / rows render so we have an accurate
+    // pane origin (post-scroll screen y of content_y=0) for auto-scroll.
+    let pane_origin = ui.cursor_screen_pos();
+    let visible_h = ui.content_region_avail()[1];
+    let cur_scroll = ui.scroll_y();
+
     let _spacing = ui.push_style_var(StyleVar::ItemSpacing([0.0, 0.0]));
     let hover: Cell<Option<(u32, [f32; 2])>> = Cell::new(None);
     let mut clipper = ListClipper::new(total).items_height(row_h()).begin(ui);
@@ -728,6 +735,55 @@ fn draw_pane(
         }
     }
     drop(_spacing);
+
+    // Drag auto-scroll: while LMB is held and the mouse is past the pane's
+    // visible band, scroll proportionally and extend the caret to the new
+    // boundary so the selection keeps tracking the mouse.
+    if let Some(sel) = selection.as_mut() {
+        if sel.dragging
+            && sel.side == side
+            && ui.is_mouse_down(imgui::MouseButton::Left)
+        {
+            let mouse_y = ui.io().mouse_pos[1];
+            let pane_top = pane_origin[1] + cur_scroll;
+            let pane_bot = pane_top + visible_h;
+            let max_scroll = (rows.len() as f32 * row_h() - visible_h).max(0.0);
+            let new_scroll = if mouse_y < pane_top {
+                let dist = (pane_top - mouse_y).min(160.0);
+                let speed = 8.0 + dist * 0.5;
+                Some((cur_scroll - speed).max(0.0))
+            } else if mouse_y > pane_bot {
+                let dist = (mouse_y - pane_bot).min(160.0);
+                let speed = 8.0 + dist * 0.5;
+                Some((cur_scroll + speed).min(max_scroll))
+            } else {
+                None
+            };
+            if let Some(s) = new_scroll {
+                ui.set_scroll_y(s);
+                // Snap the caret to the row that will be at the relevant edge
+                // after scrolling, with column 0 going up and end-of-line
+                // going down — mirrors how text editors extend selection
+                // during edge-drag.
+                if mouse_y < pane_top {
+                    let row_idx = ((s / row_h()) as usize).min(rows.len().saturating_sub(1));
+                    sel.caret = (row_idx, 0);
+                } else {
+                    let bot_content = s + visible_h;
+                    let row_idx = ((bot_content / row_h()) as usize)
+                        .saturating_sub(1)
+                        .min(rows.len().saturating_sub(1));
+                    let last_col: usize = rows[row_idx]
+                        .segments
+                        .iter()
+                        .map(|seg| seg.text.chars().count())
+                        .sum();
+                    sel.caret = (row_idx, last_col);
+                }
+            }
+        }
+    }
+
     if let Some((hunk_id, pos)) = hover.get() {
         draw_control_overlay(ui, store, session_id, hunk_id, status, pos);
     }
@@ -877,6 +933,11 @@ fn draw_row(
 
     let id_str = format!("row_{:?}_{idx}", side);
     let _clicked_lmb = ui.invisible_button(id_str, [row_w, row_h()]);
+    // `is_item_hovered` returns false for any row that isn't the active item
+    // while a drag is in progress (imgui blocks hover for non-active items).
+    // For drag-extend-selection we need a pure-positional hover check, so we
+    // use `is_mouse_hovering_rect` (clipped by the child window).
+    let mouse_in_row = ui.is_mouse_hovering_rect(p0, p1);
     let hovered = ui.is_item_hovered();
     let activated = ui.is_item_activated();
     let dbl_click = hovered && ui.is_mouse_double_clicked(imgui::MouseButton::Left);
@@ -923,7 +984,10 @@ fn draw_row(
     let text_start_x = p0[0] + gutter_w();
     let char_count: usize = row.segments.iter().map(|s| s.text.chars().count()).sum();
 
-    let col_at_mouse = if hovered {
+    // For drag-extend selection we want the column under the mouse even when
+    // another row holds the active state, so use the positional `mouse_in_row`
+    // check rather than imgui's hover (which is blocked during drag).
+    let col_at_mouse = if mouse_in_row {
         let mx = ui.io().mouse_pos[0];
         let raw = ((mx - text_start_x) / char_w).round();
         Some(raw.clamp(0.0, char_count as f32) as usize)
@@ -950,7 +1014,7 @@ fn draw_row(
         }
         focus_event.set(Some(side.as_focused_pane()));
     }
-    if hovered {
+    if mouse_in_row {
         if let Some(sel) = selection.as_mut() {
             if sel.dragging
                 && sel.side == side
