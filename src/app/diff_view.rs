@@ -163,6 +163,10 @@ struct Row {
     /// True iff this row sits inside a change hunk (i.e., a hunk the
     /// decision buttons can act on).
     is_change: bool,
+    /// Index of the first row of `hunk_id` inside the pane's `rows` Vec.
+    /// Used to position the hover overlay at the top of the hunk rather
+    /// than at the cursor.
+    hunk_first_row: usize,
 }
 
 struct Pane {
@@ -191,6 +195,7 @@ fn build_pane(hunks: &[Hunk], side: Side) -> Pane {
     let mut y: f32 = 0.0;
     for h in hunks {
         let start_y = y;
+        let hunk_first_row = rows.len();
         let is_change = is_change_hunk(h);
         if is_change {
             // Pair deletes with inserts to drive character-level highlights.
@@ -223,6 +228,7 @@ fn build_pane(hunks: &[Hunk], side: Side) -> Pane {
                             cls: Cls::Delete,
                             hunk_id: h.id,
                             is_change: true,
+                            hunk_first_row,
                         });
                         line_ys.insert(dels[i].0, y);
                         y += row_h();
@@ -237,6 +243,7 @@ fn build_pane(hunks: &[Hunk], side: Side) -> Pane {
                             cls: Cls::Delete,
                             hunk_id: h.id,
                             is_change: true,
+                            hunk_first_row,
                         });
                         line_ys.insert(dels[i].0, y);
                         y += row_h();
@@ -252,6 +259,7 @@ fn build_pane(hunks: &[Hunk], side: Side) -> Pane {
                             cls: Cls::Insert,
                             hunk_id: h.id,
                             is_change: true,
+                            hunk_first_row,
                         });
                         line_ys.insert(inss[i].0, y);
                         y += row_h();
@@ -266,6 +274,7 @@ fn build_pane(hunks: &[Hunk], side: Side) -> Pane {
                             cls: Cls::Insert,
                             hunk_id: h.id,
                             is_change: true,
+                            hunk_first_row,
                         });
                         line_ys.insert(inss[i].0, y);
                         y += row_h();
@@ -285,6 +294,7 @@ fn build_pane(hunks: &[Hunk], side: Side) -> Pane {
                         cls: Cls::Equal,
                         hunk_id: h.id,
                         is_change: false,
+                        hunk_first_row,
                     });
                     line_ys.insert(line_no, y);
                     y += row_h();
@@ -872,7 +882,15 @@ fn draw_row(
     let dbl_click = hovered && ui.is_mouse_double_clicked(imgui::MouseButton::Left);
     let rmb_anchor = hovered && ui.is_mouse_clicked(imgui::MouseButton::Right);
     if hovered && row.is_change {
-        hover_out.set(Some((row.hunk_id, p0)));
+        // Anchor the hover overlay at the first row of the hunk (so it
+        // doesn't follow the cursor row-by-row). If that first row has
+        // scrolled above the visible band, clamp to the band's top so the
+        // overlay always shows for a hunk the user is inside of.
+        let pane_origin_y = p0[1] - (idx as f32) * row_h();
+        let pane_visible_top = pane_origin_y + ui.scroll_y();
+        let first_row_y = pane_origin_y + (row.hunk_first_row as f32) * row_h();
+        let anchor_y = first_row_y.max(pane_visible_top);
+        hover_out.set(Some((row.hunk_id, [p0[0], anchor_y])));
     }
 
     // Double-click starts inline edit on rows that have a real source line.

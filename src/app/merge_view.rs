@@ -133,6 +133,9 @@ struct Row {
     /// non-stable hunk (i.e., a hunk the resolution overlay can act on),
     /// else None for stable hunks.
     kind: Option<HunkKind>,
+    /// First row of this hunk in the pane's `rows` Vec. Used to anchor the
+    /// hover overlay at the top of the hunk.
+    hunk_first_row: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -189,6 +192,7 @@ fn build_layout(hunks: &[MergeHunk], pane: Pane) -> PaneLayout {
     let mut line_n: u32 = 1;
     for h in hunks {
         let start_y = y;
+        let hunk_first_row = rows.len();
         let kind = hunk_kind(h);
         let cls = cls_for(h);
         let cls_for_row = match cls {
@@ -202,6 +206,7 @@ fn build_layout(hunks: &[MergeHunk], pane: Pane) -> PaneLayout {
                 cls: cls_for_row,
                 hunk_id: h.id(),
                 kind,
+                hunk_first_row,
             });
             line_ys.insert(line_n, y);
             line_n += 1;
@@ -554,7 +559,14 @@ fn draw_row(
     let activated = ui.is_item_activated();
     if let Some(kind) = row.kind {
         if hovered {
-            hover_out.set(Some((row.hunk_id, kind, p0)));
+            // Anchor the overlay at the hunk's first row, clamped to the
+            // pane's visible top so it stays in view while the user moves
+            // around inside a hunk.
+            let pane_origin_y = p0[1] - (idx as f32) * row_h();
+            let pane_visible_top = pane_origin_y + ui.scroll_y();
+            let first_row_y = pane_origin_y + (row.hunk_first_row as f32) * row_h();
+            let anchor_y = first_row_y.max(pane_visible_top);
+            hover_out.set(Some((row.hunk_id, kind, [p0[0], anchor_y])));
         }
     }
 
