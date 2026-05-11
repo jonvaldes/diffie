@@ -4,6 +4,7 @@
 //! frame loop. The actual diff UI is rendered inside `frame_ui()`; everything
 //! else here is plumbing that shouldn't change as the UI grows.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -17,6 +18,9 @@ use winit::{
     window::{Window, WindowId},
 };
 
+use crate::io as fileio;
+use crate::session::{SessionId, SessionMode, SessionStore};
+
 const INITIAL_WIDTH: u32 = 1400;
 const INITIAL_HEIGHT: u32 = 900;
 
@@ -26,9 +30,36 @@ pub fn run() {
     event_loop.run_app(&mut app).expect("run event loop");
 }
 
-#[derive(Default)]
+#[derive(Clone, Debug)]
+enum TabMode {
+    TwoWay,
+    ThreeWay,
+}
+
+#[derive(Clone, Debug)]
+struct Tab {
+    session_id: SessionId,
+    label: String,
+    #[allow(dead_code)] // surfaced in step 12 when the tab bar renders
+    mode: TabMode,
+}
+
 struct AppState {
-    // Real state lands here as features come online (sessions, tabs, status).
+    sessions: SessionStore,
+    tabs: Vec<Tab>,
+    active: Option<SessionId>,
+    status: String,
+}
+
+impl Default for AppState {
+    fn default() -> Self {
+        Self {
+            sessions: SessionStore::new(),
+            tabs: Vec::new(),
+            active: None,
+            status: "Open files to begin.".to_string(),
+        }
+    }
 }
 
 /// Boot-time resources. Populated lazily in `resumed` since `winit` 0.30 only
@@ -80,15 +111,13 @@ impl ApplicationHandler for App {
                 force_fallback_adapter: false,
             }))
             .expect("request adapter");
-        let (device, queue) = pollster::block_on(adapter.request_device(
-            &wgpu::DeviceDescriptor {
-                label: Some("diffie-device"),
-                required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::default(),
-                memory_hints: wgpu::MemoryHints::default(),
-                trace: wgpu::Trace::default(),
-            },
-        ))
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("diffie-device"),
+            required_features: wgpu::Features::empty(),
+            required_limits: wgpu::Limits::default(),
+            memory_hints: wgpu::MemoryHints::default(),
+            trace: wgpu::Trace::default(),
+        }))
         .expect("request device");
 
         let size = window.inner_size();
@@ -160,8 +189,6 @@ impl ApplicationHandler for App {
         let Some(gpu) = self.gpu.as_mut() else {
             return;
         };
-        // Forward to imgui first. We reconstruct an Event::WindowEvent because
-        // imgui-winit-support takes the full Event enum.
         let full_event: winit::event::Event<()> = winit::event::Event::WindowEvent {
             window_id: gpu.window.id(),
             event: event.clone(),
@@ -246,7 +273,9 @@ fn render(gpu: &mut Gpu, state: &mut AppState) {
     frame.present();
 }
 
-fn frame_ui(ui: &imgui::Ui, _state: &mut AppState) {
+// --- UI -------------------------------------------------------------------
+
+fn frame_ui(ui: &imgui::Ui, state: &mut AppState) {
     let display = ui.io().display_size;
     ui.window("Diffie")
         .position([0.0, 0.0], imgui::Condition::Always)
@@ -258,7 +287,159 @@ fn frame_ui(ui: &imgui::Ui, _state: &mut AppState) {
                 | imgui::WindowFlags::NO_BRING_TO_FRONT_ON_FOCUS,
         )
         .build(|| {
-            ui.text("Diffie — native GUI bootstrap");
-            ui.text_disabled("imgui + wgpu + winit running. Diff UI lands next.");
+            toolbar(ui, state);
+            ui.separator();
+            current_session_summary(ui, state);
         });
+}
+
+fn toolbar(ui: &imgui::Ui, state: &mut AppState) {
+    if ui.button("Open 2-way…") {
+        open_two_way(state);
+    }
+    ui.same_line();
+    if ui.button("Open 3-way…") {
+        open_three_way(state);
+    }
+    ui.same_line();
+    ui.text_disabled(&state.status);
+}
+
+fn current_session_summary(ui: &imgui::Ui, state: &AppState) {
+    let Some(id) = state.active else {
+        ui.text_disabled("No session open. Open two files (2-way) or three files (3-way) to begin.");
+        return;
+    };
+    let snap = match state.sessions.snapshot(id) {
+        Ok(s) => s,
+        Err(e) => {
+            ui.text_colored([1.0, 0.4, 0.4, 1.0], format!("Session error: {e}"));
+            return;
+        }
+    };
+    let tab = state.tabs.iter().find(|t| t.session_id == id);
+    if let Some(t) = tab {
+        ui.text(format!("Tab: {} (id={})", t.label, t.session_id));
+    }
+    match &snap.mode {
+        SessionMode::TwoWay { a_lines, b_lines, hunks, anchors, .. } => {
+            ui.text(format!(
+                "2-way: A {} lines | B {} lines | {} hunks | {} anchors",
+                a_lines.len(),
+                b_lines.len(),
+                hunks.len(),
+                anchors.len(),
+            ));
+        }
+        SessionMode::ThreeWay {
+            base_lines, local_lines, remote_lines, hunks, anchors, ..
+        } => {
+            ui.text(format!(
+                "3-way: BASE {} | LOCAL {} | REMOTE {} | {} hunks | {} anchors",
+                base_lines.len(),
+                local_lines.len(),
+                remote_lines.len(),
+                hunks.len(),
+                anchors.len(),
+            ));
+        }
+    }
+    ui.text_disabled("Diff view renders next step.");
+}
+
+// --- File-dialog actions ---------------------------------------------------
+
+fn basename(p: &PathBuf) -> String {
+    p.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| p.to_string_lossy().into_owned())
+}
+
+fn pick_file(title: &str) -> Option<PathBuf> {
+    rfd::FileDialog::new().set_title(title).pick_file()
+}
+
+fn open_two_way(state: &mut AppState) {
+    let Some(a) = pick_file("Open file A (2-way)") else {
+        return;
+    };
+    let Some(b) = pick_file("Open file B (2-way)") else {
+        return;
+    };
+    let a_text = match fileio::read_text(&a) {
+        Ok(t) => t,
+        Err(e) => {
+            state.status = format!("Read error (A): {e}");
+            return;
+        }
+    };
+    let b_text = match fileio::read_text(&b) {
+        Ok(t) => t,
+        Err(e) => {
+            state.status = format!("Read error (B): {e}");
+            return;
+        }
+    };
+    match state.sessions.open_two_way(&a_text, &b_text, None) {
+        Ok(id) => {
+            let label = format!("{} ↔ {}", basename(&a), basename(&b));
+            state.tabs.push(Tab {
+                session_id: id,
+                label: label.clone(),
+                mode: TabMode::TwoWay,
+            });
+            state.active = Some(id);
+            state.status = format!("Opened 2-way: {label}");
+        }
+        Err(e) => state.status = format!("Open 2-way failed: {e}"),
+    }
+}
+
+fn open_three_way(state: &mut AppState) {
+    let Some(base) = pick_file("Open BASE (3-way)") else {
+        return;
+    };
+    let Some(local) = pick_file("Open LOCAL (3-way)") else {
+        return;
+    };
+    let Some(remote) = pick_file("Open REMOTE (3-way)") else {
+        return;
+    };
+    let base_text = match fileio::read_text(&base) {
+        Ok(t) => t,
+        Err(e) => {
+            state.status = format!("Read error (BASE): {e}");
+            return;
+        }
+    };
+    let local_text = match fileio::read_text(&local) {
+        Ok(t) => t,
+        Err(e) => {
+            state.status = format!("Read error (LOCAL): {e}");
+            return;
+        }
+    };
+    let remote_text = match fileio::read_text(&remote) {
+        Ok(t) => t,
+        Err(e) => {
+            state.status = format!("Read error (REMOTE): {e}");
+            return;
+        }
+    };
+    match state
+        .sessions
+        .open_three_way(&base_text, &local_text, &remote_text, None)
+    {
+        Ok(id) => {
+            let label = format!("{} (3-way)", basename(&base));
+            state.tabs.push(Tab {
+                session_id: id,
+                label: label.clone(),
+                mode: TabMode::ThreeWay,
+            });
+            state.active = Some(id);
+            state.status = format!("Opened 3-way: {label}");
+        }
+        Err(e) => state.status = format!("Open 3-way failed: {e}"),
+    }
 }
