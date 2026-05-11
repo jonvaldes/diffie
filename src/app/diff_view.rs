@@ -9,6 +9,7 @@ use std::collections::{HashMap, HashSet};
 
 use imgui::{ListClipper, StyleVar, Ui};
 
+use super::char_diff::{char_diff, left_segments, right_segments, Segment};
 use crate::diff::{Anchor, DiffOp, Hunk};
 use crate::session::{HunkDecision, SessionId, SessionStore};
 
@@ -46,7 +47,7 @@ enum Cls {
 #[derive(Clone)]
 struct Row {
     line_no: Option<u32>,
-    text: String,
+    segments: Vec<Segment>,
     cls: Cls,
 }
 
@@ -69,6 +70,13 @@ fn is_change_hunk(h: &Hunk) -> bool {
     h.ops.iter().any(|op| !matches!(op, DiffOp::Equal { .. }))
 }
 
+fn plain(text: &str) -> Vec<Segment> {
+    vec![Segment {
+        text: text.to_string(),
+        hl: false,
+    }]
+}
+
 fn build_pane(hunks: &[Hunk], side: Side) -> Pane {
     let mut entries: Vec<Entry> = Vec::new();
     let mut ranges: Vec<(u32, f32, f32)> = Vec::new();
@@ -82,46 +90,95 @@ fn build_pane(hunks: &[Hunk], side: Side) -> Pane {
                 Side::Right => Entry::ControlPlaceholder,
             });
             y += ROW_H;
-        }
-        for op in &h.ops {
-            match (op, side) {
-                (DiffOp::Equal { a, text, .. }, Side::Left) => {
+
+            // For change hunks, pair deletes with inserts so we can show
+            // character-level differences on the paired rows.
+            let dels: Vec<(u32, &str)> = h
+                .ops
+                .iter()
+                .filter_map(|op| match op {
+                    DiffOp::Delete { a, text } => Some((*a, text.as_str())),
+                    _ => None,
+                })
+                .collect();
+            let inss: Vec<(u32, &str)> = h
+                .ops
+                .iter()
+                .filter_map(|op| match op {
+                    DiffOp::Insert { b, text } => Some((*b, text.as_str())),
+                    _ => None,
+                })
+                .collect();
+            let n_pairs = dels.len().min(inss.len());
+
+            match side {
+                Side::Left => {
+                    for i in 0..n_pairs {
+                        let runs = char_diff(dels[i].1, inss[i].1);
+                        let segments = left_segments(&runs);
+                        entries.push(Entry::Row(Row {
+                            line_no: Some(dels[i].0),
+                            segments,
+                            cls: Cls::Delete,
+                        }));
+                        line_ys.insert(dels[i].0, y);
+                        y += ROW_H;
+                    }
+                    for i in n_pairs..dels.len() {
+                        entries.push(Entry::Row(Row {
+                            line_no: Some(dels[i].0),
+                            segments: vec![Segment {
+                                text: dels[i].1.to_string(),
+                                hl: true,
+                            }],
+                            cls: Cls::Delete,
+                        }));
+                        line_ys.insert(dels[i].0, y);
+                        y += ROW_H;
+                    }
+                }
+                Side::Right => {
+                    for i in 0..n_pairs {
+                        let runs = char_diff(dels[i].1, inss[i].1);
+                        let segments = right_segments(&runs);
+                        entries.push(Entry::Row(Row {
+                            line_no: Some(inss[i].0),
+                            segments,
+                            cls: Cls::Insert,
+                        }));
+                        line_ys.insert(inss[i].0, y);
+                        y += ROW_H;
+                    }
+                    for i in n_pairs..inss.len() {
+                        entries.push(Entry::Row(Row {
+                            line_no: Some(inss[i].0),
+                            segments: vec![Segment {
+                                text: inss[i].1.to_string(),
+                                hl: true,
+                            }],
+                            cls: Cls::Insert,
+                        }));
+                        line_ys.insert(inss[i].0, y);
+                        y += ROW_H;
+                    }
+                }
+            }
+        } else {
+            // Equal hunks: just mirror text on both sides.
+            for op in &h.ops {
+                if let DiffOp::Equal { a, b, text } = op {
+                    let (line_no, segments) = match side {
+                        Side::Left => (*a, plain(text)),
+                        Side::Right => (*b, plain(text)),
+                    };
                     entries.push(Entry::Row(Row {
-                        line_no: Some(*a),
-                        text: text.clone(),
+                        line_no: Some(line_no),
+                        segments,
                         cls: Cls::Equal,
                     }));
-                    line_ys.insert(*a, y);
+                    line_ys.insert(line_no, y);
                     y += ROW_H;
                 }
-                (DiffOp::Equal { b, text, .. }, Side::Right) => {
-                    entries.push(Entry::Row(Row {
-                        line_no: Some(*b),
-                        text: text.clone(),
-                        cls: Cls::Equal,
-                    }));
-                    line_ys.insert(*b, y);
-                    y += ROW_H;
-                }
-                (DiffOp::Delete { a, text }, Side::Left) => {
-                    entries.push(Entry::Row(Row {
-                        line_no: Some(*a),
-                        text: text.clone(),
-                        cls: Cls::Delete,
-                    }));
-                    line_ys.insert(*a, y);
-                    y += ROW_H;
-                }
-                (DiffOp::Insert { b, text }, Side::Right) => {
-                    entries.push(Entry::Row(Row {
-                        line_no: Some(*b),
-                        text: text.clone(),
-                        cls: Cls::Insert,
-                    }));
-                    line_ys.insert(*b, y);
-                    y += ROW_H;
-                }
-                _ => {}
             }
         }
         if y > start_y {
@@ -523,7 +580,29 @@ fn draw_row(
         Cls::Delete => [1.0, 0.65, 0.62, 1.0],
         Cls::Insert => [0.72, 1.0, 0.78, 1.0],
     };
-    dl.add_text([p0[0] + 44.0, text_y], fg, &row.text);
+    let hl_bg = match row.cls {
+        Cls::Delete => [0.85, 0.18, 0.18, 0.55],
+        Cls::Insert => [0.18, 0.70, 0.30, 0.55],
+        Cls::Equal => [0.0, 0.0, 0.0, 0.0],
+    };
+    let mut x = p0[0] + 44.0;
+    for seg in &row.segments {
+        if seg.text.is_empty() {
+            continue;
+        }
+        let w = ui.calc_text_size(&seg.text)[0];
+        if seg.hl {
+            dl.add_rect(
+                [x, p0[1] + 1.0],
+                [x + w, p0[1] + ROW_H - 1.0],
+                hl_bg,
+            )
+            .filled(true)
+            .build();
+        }
+        dl.add_text([x, text_y], fg, &seg.text);
+        x += w;
+    }
 
     if let Some(ln) = row.line_no {
         if anchored.contains(&ln) {
