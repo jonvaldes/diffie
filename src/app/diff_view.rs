@@ -1,23 +1,22 @@
 //! 2-way diff view.
 //!
-//! Side-by-side virtualized panes with a connector strip between them that
-//! draws filled bezier ribbons linking matching hunks. Pending: char-level
-//! highlights, anchor lines/clicks, scroll sync.
+//! Side-by-side virtualized panes, a bezier-ribbon connector strip, inline
+//! per-hunk decision buttons, center-anchored scroll sync, and click-to-anchor
+//! line correspondence. Pending: char-level highlights (step 9).
 
 use std::cell::Cell;
+use std::collections::{HashMap, HashSet};
 
-use imgui::{ListClipper, StyleColor, StyleVar, Ui};
+use imgui::{ListClipper, StyleVar, Ui};
 
-use crate::diff::{DiffOp, Hunk};
+use crate::diff::{Anchor, DiffOp, Hunk};
 use crate::session::{HunkDecision, SessionId, SessionStore};
 
 pub const ROW_H: f32 = 20.0;
 
 const CONNECTOR_W: f32 = 60.0;
 
-/// Per-session view state that must persist across frames: scroll positions,
-/// last-written echo guards, and pending programmatic scrolls to apply on the
-/// next frame's render of each pane.
+/// Per-session view state that must persist across frames.
 #[derive(Default)]
 pub struct DiffViewState {
     last_left: f32,
@@ -26,9 +25,12 @@ pub struct DiffViewState {
     written_right: Option<f32>,
     pending_left: Option<f32>,
     pending_right: Option<f32>,
+    /// Two-click anchor creation: line picked on side A awaiting partner on B.
+    pending_a: Option<u32>,
+    pending_b: Option<u32>,
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum Side {
     Left,
     Right,
@@ -55,11 +57,12 @@ enum Entry {
     Row(Row),
 }
 
-#[derive(Clone)]
 struct Pane {
     entries: Vec<Entry>,
     /// (hunk_id, top_y, bot_y) per hunk in content-pixel coordinates.
     ranges: Vec<(u32, f32, f32)>,
+    /// Line number → y in content-pixel coordinates.
+    line_ys: HashMap<u32, f32>,
 }
 
 fn is_change_hunk(h: &Hunk) -> bool {
@@ -69,6 +72,7 @@ fn is_change_hunk(h: &Hunk) -> bool {
 fn build_pane(hunks: &[Hunk], side: Side) -> Pane {
     let mut entries: Vec<Entry> = Vec::new();
     let mut ranges: Vec<(u32, f32, f32)> = Vec::new();
+    let mut line_ys: HashMap<u32, f32> = HashMap::new();
     let mut y: f32 = 0.0;
     for h in hunks {
         let start_y = y;
@@ -87,6 +91,7 @@ fn build_pane(hunks: &[Hunk], side: Side) -> Pane {
                         text: text.clone(),
                         cls: Cls::Equal,
                     }));
+                    line_ys.insert(*a, y);
                     y += ROW_H;
                 }
                 (DiffOp::Equal { b, text, .. }, Side::Right) => {
@@ -95,6 +100,7 @@ fn build_pane(hunks: &[Hunk], side: Side) -> Pane {
                         text: text.clone(),
                         cls: Cls::Equal,
                     }));
+                    line_ys.insert(*b, y);
                     y += ROW_H;
                 }
                 (DiffOp::Delete { a, text }, Side::Left) => {
@@ -103,6 +109,7 @@ fn build_pane(hunks: &[Hunk], side: Side) -> Pane {
                         text: text.clone(),
                         cls: Cls::Delete,
                     }));
+                    line_ys.insert(*a, y);
                     y += ROW_H;
                 }
                 (DiffOp::Insert { b, text }, Side::Right) => {
@@ -111,6 +118,7 @@ fn build_pane(hunks: &[Hunk], side: Side) -> Pane {
                         text: text.clone(),
                         cls: Cls::Insert,
                     }));
+                    line_ys.insert(*b, y);
                     y += ROW_H;
                 }
                 _ => {}
@@ -120,19 +128,30 @@ fn build_pane(hunks: &[Hunk], side: Side) -> Pane {
             ranges.push((h.id, start_y, y));
         }
     }
-    Pane { entries, ranges }
+    Pane { entries, ranges, line_ys }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn render(
     ui: &Ui,
     store: &SessionStore,
     session_id: SessionId,
     hunks: &[Hunk],
+    anchors: &[Anchor],
     status: &mut String,
     state: &mut DiffViewState,
 ) {
     let left = build_pane(hunks, Side::Left);
     let right = build_pane(hunks, Side::Right);
+    let anchored_a: HashSet<u32> = anchors.iter().map(|a| a.a).collect();
+    let anchored_b: HashSet<u32> = anchors.iter().map(|a| a.b).collect();
+
+    // Click capture: rows accumulate into these cells; we apply after the
+    // pane render so we can mutate `state` and call into `store` without
+    // overlapping borrows.
+    let left_click: Cell<Option<u32>> = Cell::new(None);
+    let right_click: Cell<Option<u32>> = Cell::new(None);
+
     let avail = ui.content_region_avail();
     let pane_w = ((avail[0] - CONNECTOR_W) * 0.5).max(80.0);
 
@@ -143,8 +162,6 @@ pub fn render(
     let left_visible = Cell::new(avail[1]);
     let right_visible = Cell::new(avail[1]);
 
-    // Take pending writes for this frame; they'll be re-armed below if a
-    // driver is detected.
     let apply_left = state.pending_left.take();
     let apply_right = state.pending_right.take();
 
@@ -159,14 +176,21 @@ pub fn render(
             left_scroll.set(ui.scroll_y());
             left_origin.set(ui.window_pos());
             left_visible.set(ui.content_region_avail()[1]);
-            draw_pane(ui, &left.entries, store, session_id, status);
+            draw_pane(
+                ui,
+                &left.entries,
+                Side::Left,
+                store,
+                session_id,
+                status,
+                &anchored_a,
+                &left_click,
+            );
         });
 
     ui.same_line_with_spacing(0.0, 0.0);
-
     let connector_origin = ui.cursor_screen_pos();
     ui.dummy([CONNECTOR_W, avail[1]]);
-
     ui.same_line_with_spacing(0.0, 0.0);
 
     ui.child_window("diffie_right")
@@ -180,8 +204,26 @@ pub fn render(
             right_scroll.set(ui.scroll_y());
             right_origin.set(ui.window_pos());
             right_visible.set(ui.content_region_avail()[1]);
-            draw_pane(ui, &right.entries, store, session_id, status);
+            draw_pane(
+                ui,
+                &right.entries,
+                Side::Right,
+                store,
+                session_id,
+                status,
+                &anchored_b,
+                &right_click,
+            );
         });
+
+    handle_anchor_clicks(
+        store,
+        session_id,
+        state,
+        status,
+        left_click.get(),
+        right_click.get(),
+    );
 
     let l = left_scroll.get();
     let r = right_scroll.get();
@@ -200,103 +242,47 @@ pub fn render(
         r,
         &left.ranges,
         &right.ranges,
+        &left.line_ys,
+        &right.line_ys,
+        anchors,
         hunks,
     );
 }
 
-const ECHO_TOLERANCE: f32 = 0.5;
-
-fn sync_scrolls(
+fn handle_anchor_clicks(
+    store: &SessionStore,
+    session_id: SessionId,
     state: &mut DiffViewState,
-    curr_left: f32,
-    curr_right: f32,
-    left_view_h: f32,
-    right_view_h: f32,
-    left_ranges: &[(u32, f32, f32)],
-    right_ranges: &[(u32, f32, f32)],
+    status: &mut String,
+    left_click: Option<u32>,
+    right_click: Option<u32>,
 ) {
-    let l_changed = (curr_left - state.last_left).abs() > ECHO_TOLERANCE;
-    let r_changed = (curr_right - state.last_right).abs() > ECHO_TOLERANCE;
-    let l_echo = state
-        .written_left
-        .map_or(false, |w| (curr_left - w).abs() < ECHO_TOLERANCE);
-    let r_echo = state
-        .written_right
-        .map_or(false, |w| (curr_right - w).abs() < ECHO_TOLERANCE);
-
-    if l_changed && !l_echo {
-        if let Some(target) =
-            target_scroll(curr_left, left_view_h, right_view_h, left_ranges, right_ranges)
-        {
-            state.pending_right = Some(target);
-        }
-    } else if r_changed && !r_echo {
-        if let Some(target) = target_scroll(
-            curr_right,
-            right_view_h,
-            left_view_h,
-            right_ranges,
-            left_ranges,
-        ) {
-            state.pending_left = Some(target);
-        }
+    if let Some(a) = left_click {
+        state.pending_a = Some(a);
+        *status = format!("anchor pending: A:{a} → click a row on B");
     }
-
-    state.last_left = curr_left;
-    state.last_right = curr_right;
-    if l_echo {
-        state.written_left = None;
+    if let Some(b) = right_click {
+        state.pending_b = Some(b);
+        *status = format!("anchor pending: B:{b} → click a row on A");
     }
-    if r_echo {
-        state.written_right = None;
-    }
-}
-
-/// Map a center-anchored scroll position in the source pane to the equivalent
-/// scroll position in the destination pane, using matching-hunk fractions.
-fn target_scroll(
-    src_scroll: f32,
-    src_view_h: f32,
-    dst_view_h: f32,
-    src_ranges: &[(u32, f32, f32)],
-    dst_ranges: &[(u32, f32, f32)],
-) -> Option<f32> {
-    let center = src_scroll + src_view_h * 0.5;
-    let (hunk_id, fraction) = locate_hunk(src_ranges, center)?;
-    let (_id, top, bot) = dst_ranges.iter().find(|r| r.0 == hunk_id)?;
-    let dst_center = top + fraction * (bot - top);
-    Some((dst_center - dst_view_h * 0.5).max(0.0))
-}
-
-fn locate_hunk(ranges: &[(u32, f32, f32)], y: f32) -> Option<(u32, f32)> {
-    let mut best: Option<(u32, f32, f32)> = None;
-    for r in ranges {
-        if r.1 <= y && y < r.2 {
-            let span = (r.2 - r.1).max(1.0);
-            return Some((r.0, ((y - r.1) / span).clamp(0.0, 1.0)));
+    if let (Some(a), Some(b)) = (state.pending_a, state.pending_b) {
+        match store.add_anchor_two_way(session_id, Anchor { a, b }) {
+            Ok(()) => *status = format!("anchor added: A:{a} ↔ B:{b}"),
+            Err(e) => *status = format!("anchor error: {e}"),
         }
-        if r.1 <= y && best.map_or(true, |b| r.2 > b.2) {
-            best = Some(*r);
-        }
+        state.pending_a = None;
+        state.pending_b = None;
     }
-    best.map(|b| {
-        let span = (b.2 - b.1).max(1.0);
-        (b.0, ((y - b.1) / span).clamp(0.0, 1.0))
-    })
 }
 
 fn ribbon_color(is_change: bool) -> [f32; 4] {
     if is_change {
-        // Accent blue, semi-transparent.
         [0.42, 0.66, 1.0, 0.28]
     } else {
-        // Faint neutral so equal stretches still imply correspondence.
         [0.55, 0.60, 0.70, 0.10]
     }
 }
 
-/// Number of segments each bezier curve is tessellated into. Higher = smoother
-/// curve at the cost of more triangles per ribbon.
 const BEZIER_SEGMENTS: usize = 16;
 
 fn cubic_bezier(p0: [f32; 2], p1: [f32; 2], p2: [f32; 2], p3: [f32; 2], t: f32) -> [f32; 2] {
@@ -329,6 +315,9 @@ fn draw_connector(
     right_scroll: f32,
     left_ranges: &[(u32, f32, f32)],
     right_ranges: &[(u32, f32, f32)],
+    left_line_ys: &HashMap<u32, f32>,
+    right_line_ys: &HashMap<u32, f32>,
+    anchors: &[Anchor],
     hunks: &[Hunk],
 ) {
     let dl = ui.get_window_draw_list();
@@ -338,6 +327,7 @@ fn draw_connector(
         let cx = origin[0] + w * 0.5;
         let band_top = origin[1];
         let band_bot = origin[1] + h;
+
         for h_obj in hunks {
             let Some(lr) = left_ranges.iter().find(|r| r.0 == h_obj.id) else {
                 continue;
@@ -353,9 +343,6 @@ fn draw_connector(
                 continue;
             }
             let color = ribbon_color(is_change_hunk(h_obj));
-            // Tessellate top + bottom bezier curves, then emit one quad per
-            // segment as two triangles. imgui-rs 0.12 does not expose the
-            // path_* fill API, so we render the ribbon explicitly.
             let top = sample_curve([x_l, a1], [cx, a1], [cx, b1], [x_r, b1]);
             let bot = sample_curve([x_l, a2], [cx, a2], [cx, b2], [x_r, b2]);
             for i in 0..top.len() - 1 {
@@ -367,15 +354,44 @@ fn draw_connector(
                     .build();
             }
         }
+
+        // Anchor lines on top: thick black bezier from anchored row's y on
+        // each side. Skip if either side is not in the layout (shouldn't
+        // happen for a valid anchor).
+        for anc in anchors {
+            let Some(ly_content) = left_line_ys.get(&anc.a) else {
+                continue;
+            };
+            let Some(ry_content) = right_line_ys.get(&anc.b) else {
+                continue;
+            };
+            let ly = left_top_screen_y + ly_content + ROW_H * 0.5 - left_scroll;
+            let ry = right_top_screen_y + ry_content + ROW_H * 0.5 - right_scroll;
+            if (ly < band_top && ry < band_top) || (ly > band_bot && ry > band_bot) {
+                continue;
+            }
+            let pts = sample_curve([x_l, ly], [cx, ly], [cx, ry], [x_r, ry]);
+            // Render as a thick line by drawing connected segments with a
+            // small fill quad. Using add_line for simplicity at thickness 3.
+            for i in 0..pts.len() - 1 {
+                dl.add_line(pts[i], pts[i + 1], [0.0, 0.0, 0.0, 1.0])
+                    .thickness(3.0)
+                    .build();
+            }
+        }
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_pane(
     ui: &Ui,
     entries: &[Entry],
+    side: Side,
     store: &SessionStore,
     session_id: SessionId,
     status: &mut String,
+    anchored: &HashSet<u32>,
+    click_out: &Cell<Option<u32>>,
 ) {
     let total = entries.len() as i32;
     if total == 0 {
@@ -389,7 +405,11 @@ fn draw_pane(
                     draw_control_row(ui, store, session_id, *hunk_id, status)
                 }
                 Entry::ControlPlaceholder => draw_placeholder(ui),
-                Entry::Row(r) => draw_row(ui, r),
+                Entry::Row(r) => {
+                    if let Some(clicked_line) = draw_row(ui, r, side, i, anchored) {
+                        click_out.set(Some(clicked_line));
+                    }
+                }
             }
         }
     }
@@ -458,35 +478,144 @@ fn apply_decision(
     }
 }
 
-fn draw_row(ui: &Ui, row: &Row) {
-    let (bg, fg) = match row.cls {
-        Cls::Equal => (None, None),
-        Cls::Delete => (Some([0.55, 0.18, 0.18, 0.30]), Some([1.0, 0.65, 0.62, 1.0])),
-        Cls::Insert => (Some([0.18, 0.50, 0.22, 0.30]), Some([0.72, 1.0, 0.78, 1.0])),
+/// Render a single row using invisible_button for hit-testing + draw list for
+/// visuals. Returns Some(line_no) if the row was clicked this frame.
+fn draw_row(
+    ui: &Ui,
+    row: &Row,
+    side: Side,
+    idx: i32,
+    anchored: &HashSet<u32>,
+) -> Option<u32> {
+    let p0 = ui.cursor_screen_pos();
+    let row_w = ui.content_region_avail()[0];
+    let p1 = [p0[0] + row_w, p0[1] + ROW_H];
+
+    let id_str = format!("row_{:?}_{idx}", side);
+    let clicked = ui.invisible_button(id_str, [row_w, ROW_H]);
+    let hovered = ui.is_item_hovered();
+
+    let dl = ui.get_window_draw_list();
+
+    let bg = match row.cls {
+        Cls::Equal => None,
+        Cls::Delete => Some([0.55, 0.18, 0.18, 0.30]),
+        Cls::Insert => Some([0.18, 0.50, 0.22, 0.30]),
     };
     if let Some(bg_rgba) = bg {
-        let cursor = ui.cursor_screen_pos();
-        let dl = ui.get_window_draw_list();
-        let row_w = ui.content_region_avail()[0];
-        dl.add_rect(
-            [cursor[0], cursor[1]],
-            [cursor[0] + row_w, cursor[1] + ROW_H],
-            bg_rgba,
-        )
-        .filled(true)
-        .build();
+        dl.add_rect(p0, p1, bg_rgba).filled(true).build();
     }
+    if hovered {
+        dl.add_rect(p0, p1, [1.0, 1.0, 1.0, 0.05])
+            .filled(true)
+            .build();
+    }
+
     let line_text = match row.line_no {
-        Some(n) => format!("{n:>4} "),
-        None => "     ".to_string(),
+        Some(n) => format!("{n:>4}"),
+        None => "    ".to_string(),
     };
-    let _line_no_style = ui.push_style_color(StyleColor::Text, [0.55, 0.60, 0.70, 1.0]);
-    ui.text(&line_text);
-    drop(_line_no_style);
-    ui.same_line_with_spacing(0.0, 0.0);
-    if let Some(fg_rgba) = fg {
-        ui.text_colored(fg_rgba, &row.text);
-    } else {
-        ui.text(&row.text);
+    let text_y = p0[1] + 3.0;
+    dl.add_text([p0[0] + 4.0, text_y], [0.55, 0.60, 0.70, 1.0], &line_text);
+
+    let fg = match row.cls {
+        Cls::Equal => [0.90, 0.92, 0.96, 1.0],
+        Cls::Delete => [1.0, 0.65, 0.62, 1.0],
+        Cls::Insert => [0.72, 1.0, 0.78, 1.0],
+    };
+    dl.add_text([p0[0] + 44.0, text_y], fg, &row.text);
+
+    if let Some(ln) = row.line_no {
+        if anchored.contains(&ln) {
+            // Black left edge marker.
+            dl.add_rect(p0, [p0[0] + 3.0, p1[1]], [0.0, 0.0, 0.0, 1.0])
+                .filled(true)
+                .build();
+        }
     }
+
+    if clicked {
+        row.line_no
+    } else {
+        None
+    }
+}
+
+const ECHO_TOLERANCE: f32 = 0.5;
+
+fn sync_scrolls(
+    state: &mut DiffViewState,
+    curr_left: f32,
+    curr_right: f32,
+    left_view_h: f32,
+    right_view_h: f32,
+    left_ranges: &[(u32, f32, f32)],
+    right_ranges: &[(u32, f32, f32)],
+) {
+    let l_changed = (curr_left - state.last_left).abs() > ECHO_TOLERANCE;
+    let r_changed = (curr_right - state.last_right).abs() > ECHO_TOLERANCE;
+    let l_echo = state
+        .written_left
+        .map_or(false, |w| (curr_left - w).abs() < ECHO_TOLERANCE);
+    let r_echo = state
+        .written_right
+        .map_or(false, |w| (curr_right - w).abs() < ECHO_TOLERANCE);
+
+    if l_changed && !l_echo {
+        if let Some(target) =
+            target_scroll(curr_left, left_view_h, right_view_h, left_ranges, right_ranges)
+        {
+            state.pending_right = Some(target);
+        }
+    } else if r_changed && !r_echo {
+        if let Some(target) = target_scroll(
+            curr_right,
+            right_view_h,
+            left_view_h,
+            right_ranges,
+            left_ranges,
+        ) {
+            state.pending_left = Some(target);
+        }
+    }
+
+    state.last_left = curr_left;
+    state.last_right = curr_right;
+    if l_echo {
+        state.written_left = None;
+    }
+    if r_echo {
+        state.written_right = None;
+    }
+}
+
+fn target_scroll(
+    src_scroll: f32,
+    src_view_h: f32,
+    dst_view_h: f32,
+    src_ranges: &[(u32, f32, f32)],
+    dst_ranges: &[(u32, f32, f32)],
+) -> Option<f32> {
+    let center = src_scroll + src_view_h * 0.5;
+    let (hunk_id, fraction) = locate_hunk(src_ranges, center)?;
+    let (_id, top, bot) = dst_ranges.iter().find(|r| r.0 == hunk_id)?;
+    let dst_center = top + fraction * (bot - top);
+    Some((dst_center - dst_view_h * 0.5).max(0.0))
+}
+
+fn locate_hunk(ranges: &[(u32, f32, f32)], y: f32) -> Option<(u32, f32)> {
+    let mut best: Option<(u32, f32, f32)> = None;
+    for r in ranges {
+        if r.1 <= y && y < r.2 {
+            let span = (r.2 - r.1).max(1.0);
+            return Some((r.0, ((y - r.1) / span).clamp(0.0, 1.0)));
+        }
+        if r.1 <= y && best.map_or(true, |b| r.2 > b.2) {
+            best = Some(*r);
+        }
+    }
+    best.map(|b| {
+        let span = (b.2 - b.1).max(1.0);
+        (b.0, ((y - b.1) / span).clamp(0.0, 1.0))
+    })
 }
