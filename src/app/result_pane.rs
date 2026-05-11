@@ -23,9 +23,8 @@ pub fn render(
     session_id: SessionId,
     state: &mut ResultState,
     mono_font: Option<FontId>,
+    focus_request: &mut Option<crate::app::FocusedPane>,
 ) {
-    // Sync from the session unless the user is actively typing — otherwise
-    // the cursor would jump every time decisions change upstream.
     if !state.was_active_last_frame {
         if let Ok(text) = store.compute_result(session_id) {
             if text != state.buffer {
@@ -41,14 +40,17 @@ pub fn render(
     }
 
     let avail = ui.content_region_avail();
-    // Render the editor in the same Roboto Mono used by the diff/merge
-    // views so the result reads as code.
     let _font_tok = mono_font.map(|f| ui.push_font(f));
     let changed = ui
         .input_text_multiline("##diffie_result", &mut state.buffer, avail)
         .build();
     let active = ui.is_item_active();
+    let focused = ui.is_item_focused();
     drop(_font_tok);
+
+    if active || focused {
+        *focus_request = Some(crate::app::FocusedPane::Result);
+    }
 
     if changed {
         let _ = store.update_manual_result(session_id, state.buffer.clone());

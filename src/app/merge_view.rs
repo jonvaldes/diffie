@@ -13,10 +13,19 @@ use imgui::{FontId, ListClipper, StyleVar, Ui};
 use crate::merge::{MergeAnchor, MergeHunk, Resolution};
 use crate::session::{SessionId, SessionStore};
 
-/// Match diff_view: tall enough for the 1.5x Roboto Mono used in code rows.
-pub const ROW_H: f32 = 24.0;
-const GUTTER_W: f32 = 60.0;
+/// Match diff_view: tall enough for the 1.5x Roboto Mono used in code rows
+/// at zoom=1.0.
+const ROW_H_BASE: f32 = 24.0;
+const GUTTER_W_BASE: f32 = 60.0;
 const CONNECTOR_W: f32 = 56.0;
+
+fn row_h() -> f32 {
+    ROW_H_BASE * crate::app::code_font_zoom()
+}
+
+fn gutter_w() -> f32 {
+    GUTTER_W_BASE * crate::app::code_font_zoom()
+}
 const ECHO_TOLERANCE: f32 = 0.5;
 
 #[derive(Default)]
@@ -24,13 +33,85 @@ pub struct MergeViewState {
     last: [f32; 3],
     written: [Option<f32>; 3],
     pending: [Option<f32>; 3],
+    pub selection: Option<Selection>,
+}
+
+#[derive(Clone)]
+pub struct Selection {
+    pub pane: Pane,
+    pub anchor: (usize, usize),
+    pub caret: (usize, usize),
+    pub dragging: bool,
+}
+
+fn normalize_selection(sel: &Selection) -> (usize, usize, usize, usize) {
+    let (a, b) = (sel.anchor, sel.caret);
+    if a.0 < b.0 || (a.0 == b.0 && a.1 <= b.1) {
+        (a.0, a.1, b.0, b.1)
+    } else {
+        (b.0, b.1, a.0, a.1)
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
-enum Pane {
+pub enum Pane {
     Base = 0,
     Local = 1,
     Remote = 2,
+}
+
+impl Pane {
+    pub fn as_focused_pane(self) -> crate::app::FocusedPane {
+        match self {
+            Pane::Base => crate::app::FocusedPane::ThreeWayBase,
+            Pane::Local => crate::app::FocusedPane::ThreeWayLocal,
+            Pane::Remote => crate::app::FocusedPane::ThreeWayRemote,
+        }
+    }
+}
+
+pub fn extract_selection_text(snap: &crate::session::DiffSession, sel: &Selection) -> String {
+    let crate::session::SessionMode::ThreeWay { hunks, .. } = &snap.mode else {
+        return String::new();
+    };
+    let pane = build_layout(hunks, sel.pane);
+    if pane.rows.is_empty() {
+        return String::new();
+    }
+    let (s_row, s_col, e_row, e_col) = normalize_selection(sel);
+    let last = pane.rows.len() - 1;
+    let s_row = s_row.min(last);
+    let e_row = e_row.min(last);
+    let mut out = String::new();
+    for r in s_row..=e_row {
+        let row = &pane.rows[r];
+        let chars: Vec<char> = row.text.chars().collect();
+        let l = if r == s_row { s_col } else { 0 }.min(chars.len());
+        let h = if r == e_row { e_col } else { chars.len() }.min(chars.len());
+        out.extend(chars[l..h].iter());
+        if r < e_row {
+            out.push('\n');
+        }
+    }
+    out
+}
+
+pub fn select_all(snap: &crate::session::DiffSession, pane: Pane) -> Option<Selection> {
+    let crate::session::SessionMode::ThreeWay { hunks, .. } = &snap.mode else {
+        return None;
+    };
+    let layout = build_layout(hunks, pane);
+    if layout.rows.is_empty() {
+        return None;
+    }
+    let last_idx = layout.rows.len() - 1;
+    let last_chars = layout.rows[last_idx].text.chars().count();
+    Some(Selection {
+        pane,
+        anchor: (0, 0),
+        caret: (last_idx, last_chars),
+        dragging: false,
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -124,7 +205,7 @@ fn build_layout(hunks: &[MergeHunk], pane: Pane) -> PaneLayout {
             });
             line_ys.insert(line_n, y);
             line_n += 1;
-            y += ROW_H;
+            y += row_h();
         }
         if y > start_y {
             ranges.push((h.id(), start_y, y));
@@ -143,6 +224,7 @@ pub fn render(
     status: &mut String,
     state: &mut MergeViewState,
     mono_font: Option<FontId>,
+    focus_request: &mut Option<crate::app::FocusedPane>,
 ) {
     let base = build_layout(hunks, Pane::Base);
     let local = build_layout(hunks, Pane::Local);
@@ -160,6 +242,7 @@ pub fn render(
     ];
     let visibles: [Cell<f32>; 3] =
         [Cell::new(avail[1]), Cell::new(avail[1]), Cell::new(avail[1])];
+    let focus_event: Cell<Option<crate::app::FocusedPane>> = Cell::new(None);
 
     let applies: [Option<f32>; 3] = [
         state.pending[0].take(),
@@ -183,6 +266,8 @@ pub fn render(
         &origins[Pane::Base as usize],
         &visibles[Pane::Base as usize],
         mono_font,
+        &mut state.selection,
+        &focus_event,
     );
 
     ui.same_line_with_spacing(0.0, 0.0);
@@ -206,6 +291,8 @@ pub fn render(
         &origins[Pane::Local as usize],
         &visibles[Pane::Local as usize],
         mono_font,
+        &mut state.selection,
+        &focus_event,
     );
 
     ui.same_line_with_spacing(0.0, 0.0);
@@ -229,7 +316,18 @@ pub fn render(
         &origins[Pane::Remote as usize],
         &visibles[Pane::Remote as usize],
         mono_font,
+        &mut state.selection,
+        &focus_event,
     );
+
+    if let Some(p) = focus_event.get() {
+        *focus_request = Some(p);
+    }
+    if !ui.is_mouse_down(imgui::MouseButton::Left) {
+        if let Some(sel) = state.selection.as_mut() {
+            sel.dragging = false;
+        }
+    }
 
     let s = [scrolls[0].get(), scrolls[1].get(), scrolls[2].get()];
     let v = [visibles[0].get(), visibles[1].get(), visibles[2].get()];
@@ -282,6 +380,8 @@ fn render_pane(
     origin_out: &Cell<[f32; 2]>,
     visible_out: &Cell<f32>,
     mono_font: Option<FontId>,
+    selection: &mut Option<Selection>,
+    focus_event: &Cell<Option<crate::app::FocusedPane>>,
 ) {
     ui.child_window(id).size([w, h]).border(true).build(|| {
         if let Some(y) = apply {
@@ -291,32 +391,46 @@ fn render_pane(
         scroll_out.set(ui.scroll_y());
         origin_out.set(ui.cursor_screen_pos());
         visible_out.set(ui.content_region_avail()[1]);
-        draw_pane(ui, rows, pane, store, session_id, status, mono_font);
+        draw_pane(
+            ui, rows, pane, store, session_id, status, mono_font, selection, focus_event,
+        );
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_pane(
     ui: &Ui,
     rows: &[Row],
-    _pane: Pane,
+    pane: Pane,
     store: &SessionStore,
     session_id: SessionId,
     status: &mut String,
     mono_font: Option<FontId>,
+    selection: &mut Option<Selection>,
+    focus_event: &Cell<Option<crate::app::FocusedPane>>,
 ) {
     let total = rows.len() as i32;
     if total == 0 {
         return;
     }
     // See diff_view::draw_pane for why ItemSpacing.y must be zero: each row
-    // must consume exactly ROW_H so the connector's content-y model lines
+    // must consume exactly row_h() so the connector's content-y model lines
     // up with the actually-rendered screen positions.
     let _spacing = ui.push_style_var(StyleVar::ItemSpacing([0.0, 0.0]));
     let hover: Cell<Option<(u32, HunkKind, [f32; 2])>> = Cell::new(None);
-    let mut clipper = ListClipper::new(total).items_height(ROW_H).begin(ui);
+    let mut clipper = ListClipper::new(total).items_height(row_h()).begin(ui);
     while clipper.step() {
         for i in clipper.display_start()..clipper.display_end() {
-            draw_row(ui, &rows[i as usize], i, mono_font, &hover);
+            draw_row(
+                ui,
+                &rows[i as usize],
+                i,
+                pane,
+                mono_font,
+                &hover,
+                selection,
+                focus_event,
+            );
         }
     }
     drop(_spacing);
@@ -340,7 +454,7 @@ fn draw_control_overlay(
     let panel_x = pos[0] + 4.0;
     let panel_y = pos[1] + 2.0;
     let panel_w = 260.0;
-    let panel_h = ROW_H - 4.0;
+    let panel_h = row_h() - 4.0;
 
     let dl = ui.get_window_draw_list();
     dl.add_rect(
@@ -420,21 +534,68 @@ fn apply_res(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_row(
     ui: &Ui,
     row: &Row,
     idx: i32,
+    pane: Pane,
     mono_font: Option<FontId>,
     hover_out: &Cell<Option<(u32, HunkKind, [f32; 2])>>,
+    selection: &mut Option<Selection>,
+    focus_event: &Cell<Option<crate::app::FocusedPane>>,
 ) {
     let p0 = ui.cursor_screen_pos();
     let row_w = ui.content_region_avail()[0];
-    let p1 = [p0[0] + row_w, p0[1] + ROW_H];
+    let p1 = [p0[0] + row_w, p0[1] + row_h()];
 
-    let _ = ui.invisible_button(format!("mrow_{idx}"), [row_w, ROW_H]);
+    let _ = ui.invisible_button(format!("mrow_{idx}"), [row_w, row_h()]);
+    let hovered = ui.is_item_hovered();
+    let activated = ui.is_item_activated();
     if let Some(kind) = row.kind {
-        if ui.is_item_hovered() {
+        if hovered {
             hover_out.set(Some((row.hunk_id, kind, p0)));
+        }
+    }
+
+    let _font_tok = mono_font.map(|f| ui.push_font(f));
+    let char_w = ui.calc_text_size("m")[0].max(1.0);
+    let text_start_x = p0[0] + gutter_w();
+    let char_count = row.text.chars().count();
+
+    let col_at_mouse = if hovered {
+        let mx = ui.io().mouse_pos[0];
+        let raw = ((mx - text_start_x) / char_w).round();
+        Some(raw.clamp(0.0, char_count as f32) as usize)
+    } else {
+        None
+    };
+
+    if activated {
+        let col = col_at_mouse.unwrap_or(0);
+        let row_idx = idx as usize;
+        let shift = ui.io().key_shift;
+        if shift && selection.as_ref().map_or(false, |s| s.pane == pane) {
+            let sel = selection.as_mut().unwrap();
+            sel.caret = (row_idx, col);
+            sel.dragging = true;
+        } else {
+            *selection = Some(Selection {
+                pane,
+                anchor: (row_idx, col),
+                caret: (row_idx, col),
+                dragging: true,
+            });
+        }
+        focus_event.set(Some(pane.as_focused_pane()));
+    }
+    if hovered {
+        if let Some(sel) = selection.as_mut() {
+            if sel.dragging && sel.pane == pane && ui.is_mouse_down(imgui::MouseButton::Left) {
+                if let Some(col) = col_at_mouse {
+                    sel.caret = (idx as usize, col);
+                }
+            }
         }
     }
 
@@ -449,9 +610,26 @@ fn draw_row(
     if let Some(bg_rgba) = bg {
         dl.add_rect(p0, p1, bg_rgba).filled(true).build();
     }
+    // Selection background overlay.
+    if let Some(sel) = selection.as_ref() {
+        if sel.pane == pane {
+            let (s_row, s_col, e_row, e_col) = normalize_selection(sel);
+            let row_idx = idx as usize;
+            if row_idx >= s_row && row_idx <= e_row {
+                let l_col = if row_idx == s_row { s_col } else { 0 };
+                let r_col = if row_idx == e_row { e_col } else { char_count };
+                if r_col > l_col {
+                    let sel_x0 = text_start_x + l_col as f32 * char_w;
+                    let sel_x1 = text_start_x + r_col as f32 * char_w;
+                    dl.add_rect([sel_x0, p0[1]], [sel_x1, p1[1]], [0.26, 0.59, 0.98, 0.40])
+                        .filled(true)
+                        .build();
+                }
+            }
+        }
+    }
     let line_text = format!("{:>4}", row.line_no);
     let text_y = p0[1] + 3.0;
-    let _font_tok = mono_font.map(|f| ui.push_font(f));
     dl.add_text([p0[0] + 6.0, text_y], [0.55, 0.60, 0.70, 1.0], &line_text);
     let fg = match row.cls {
         Cls::Equal | Cls::Stable => [0.90, 0.92, 0.96, 1.0],
@@ -464,7 +642,7 @@ fn draw_row(
     } else {
         row.text.as_str()
     };
-    dl.add_text([p0[0] + GUTTER_W, text_y], fg, display);
+    dl.add_text([p0[0] + gutter_w(), text_y], fg, display);
     drop(_font_tok);
 }
 
@@ -640,8 +818,8 @@ fn draw_connector(
             let Some(ry_content) = right_line_ys.get(r_line) else {
                 continue;
             };
-            let ly = left_origin_y + ly_content + ROW_H * 0.5;
-            let ry = right_origin_y + ry_content + ROW_H * 0.5;
+            let ly = left_origin_y + ly_content + row_h() * 0.5;
+            let ry = right_origin_y + ry_content + row_h() * 0.5;
             if (ly < band_top && ry < band_top) || (ly > band_bot && ry > band_bot) {
                 continue;
             }

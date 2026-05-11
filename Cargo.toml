@@ -25,6 +25,7 @@ gui = [
     "dep:rfd",
     "dep:aetna-fonts-roboto",
     "dep:earcutr",
+    "dep:arboard",
 ]
 
 [dependencies]
@@ -45,3 +46,4 @@ pollster = { version = "0.3", optional = true }
 rfd = { version = "0.14", optional = true }
 aetna-fonts-roboto = { version = "0.1", optional = true }
 earcutr = { version = "0.4", optional = true }
+arboard = { version = "3", optional = true }

@@ -13,13 +13,20 @@ use super::char_diff::{char_diff, left_segments, right_segments, Segment};
 use crate::diff::{Anchor, DiffOp, Hunk};
 use crate::session::{HunkDecision, SessionId, SessionStore};
 
-/// Tall enough for the 1.5x Roboto Mono used in code rows.
-pub const ROW_H: f32 = 24.0;
-
+/// Tall enough for the 1.5x Roboto Mono used in code rows at zoom=1.0.
+const ROW_H_BASE: f32 = 24.0;
 /// Width of the line-number gutter, sized for ~4 digits in the code-row mono.
-const GUTTER_W: f32 = 60.0;
+const GUTTER_W_BASE: f32 = 60.0;
 
 const CONNECTOR_W: f32 = 60.0;
+
+fn row_h() -> f32 {
+    ROW_H_BASE * crate::app::code_font_zoom()
+}
+
+fn gutter_w() -> f32 {
+    GUTTER_W_BASE * crate::app::code_font_zoom()
+}
 
 /// Per-session view state that must persist across frames.
 #[derive(Default)]
@@ -33,10 +40,93 @@ pub struct DiffViewState {
     /// Two-click anchor creation: line picked on side A awaiting partner on B.
     pending_a: Option<u32>,
     pending_b: Option<u32>,
+    /// Active text selection. `side` is the pane the anchor was set in; the
+    /// selection is always confined to that one pane.
+    pub selection: Option<Selection>,
+}
+
+#[derive(Clone)]
+pub struct Selection {
+    pub side: Side,
+    pub anchor: (usize, usize),
+    pub caret: (usize, usize),
+    pub dragging: bool,
+}
+
+pub fn normalize_selection(sel: &Selection) -> (usize, usize, usize, usize) {
+    let (a, b) = (sel.anchor, sel.caret);
+    if a.0 < b.0 || (a.0 == b.0 && a.1 <= b.1) {
+        (a.0, a.1, b.0, b.1)
+    } else {
+        (b.0, b.1, a.0, a.1)
+    }
+}
+
+impl Side {
+    pub fn as_focused_pane(self) -> crate::app::FocusedPane {
+        match self {
+            Side::Left => crate::app::FocusedPane::TwoWayA,
+            Side::Right => crate::app::FocusedPane::TwoWayB,
+        }
+    }
+}
+
+/// Build the pane's text for `sel.side` and slice out the selected range.
+/// Returns an empty string if the session isn't 2-way or the selection
+/// references rows that no longer exist (e.g. after a hunk recompute).
+pub fn extract_selection_text(snap: &crate::session::DiffSession, sel: &Selection) -> String {
+    let crate::session::SessionMode::TwoWay { hunks, .. } = &snap.mode else {
+        return String::new();
+    };
+    let pane = build_pane(hunks, sel.side);
+    if pane.rows.is_empty() {
+        return String::new();
+    }
+    let (s_row, s_col, e_row, e_col) = normalize_selection(sel);
+    let last = pane.rows.len() - 1;
+    let s_row = s_row.min(last);
+    let e_row = e_row.min(last);
+    let mut out = String::new();
+    for r in s_row..=e_row {
+        let row = &pane.rows[r];
+        let line: String = row.segments.iter().map(|s| s.text.as_str()).collect();
+        let chars: Vec<char> = line.chars().collect();
+        let l = if r == s_row { s_col } else { 0 }.min(chars.len());
+        let h = if r == e_row { e_col } else { chars.len() }.min(chars.len());
+        out.extend(chars[l..h].iter());
+        if r < e_row {
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// Select all rows on `side` for the active diff session. Returns a
+/// `Selection` the caller can drop into `DiffViewState.selection`.
+pub fn select_all(snap: &crate::session::DiffSession, side: Side) -> Option<Selection> {
+    let crate::session::SessionMode::TwoWay { hunks, .. } = &snap.mode else {
+        return None;
+    };
+    let pane = build_pane(hunks, side);
+    if pane.rows.is_empty() {
+        return None;
+    }
+    let last_idx = pane.rows.len() - 1;
+    let last_chars: usize = pane.rows[last_idx]
+        .segments
+        .iter()
+        .map(|s| s.text.chars().count())
+        .sum();
+    Some(Selection {
+        side,
+        anchor: (0, 0),
+        caret: (last_idx, last_chars),
+        dragging: false,
+    })
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
-enum Side {
+pub enum Side {
     Left,
     Right,
 }
@@ -121,7 +211,7 @@ fn build_pane(hunks: &[Hunk], side: Side) -> Pane {
                             is_change: true,
                         });
                         line_ys.insert(dels[i].0, y);
-                        y += ROW_H;
+                        y += row_h();
                     }
                     for i in n_pairs..dels.len() {
                         rows.push(Row {
@@ -135,7 +225,7 @@ fn build_pane(hunks: &[Hunk], side: Side) -> Pane {
                             is_change: true,
                         });
                         line_ys.insert(dels[i].0, y);
-                        y += ROW_H;
+                        y += row_h();
                     }
                 }
                 Side::Right => {
@@ -150,7 +240,7 @@ fn build_pane(hunks: &[Hunk], side: Side) -> Pane {
                             is_change: true,
                         });
                         line_ys.insert(inss[i].0, y);
-                        y += ROW_H;
+                        y += row_h();
                     }
                     for i in n_pairs..inss.len() {
                         rows.push(Row {
@@ -164,7 +254,7 @@ fn build_pane(hunks: &[Hunk], side: Side) -> Pane {
                             is_change: true,
                         });
                         line_ys.insert(inss[i].0, y);
-                        y += ROW_H;
+                        y += row_h();
                     }
                 }
             }
@@ -183,7 +273,7 @@ fn build_pane(hunks: &[Hunk], side: Side) -> Pane {
                         is_change: false,
                     });
                     line_ys.insert(line_no, y);
-                    y += ROW_H;
+                    y += row_h();
                 }
             }
         }
@@ -204,6 +294,7 @@ pub fn render(
     status: &mut String,
     state: &mut DiffViewState,
     mono_font: Option<FontId>,
+    focus_request: &mut Option<crate::app::FocusedPane>,
 ) {
     let left = build_pane(hunks, Side::Left);
     let right = build_pane(hunks, Side::Right);
@@ -215,6 +306,10 @@ pub fn render(
     // overlapping borrows.
     let left_click: Cell<Option<u32>> = Cell::new(None);
     let right_click: Cell<Option<u32>> = Cell::new(None);
+
+    // Pane focus event from selection mouse-down. The right pane writes
+    // here too — last wins, matching imgui's standard last-clicked focus.
+    let focus_event: Cell<Option<crate::app::FocusedPane>> = Cell::new(None);
 
     let avail = ui.content_region_avail();
     let pane_w = ((avail[0] - CONNECTOR_W) * 0.5).max(80.0);
@@ -238,10 +333,6 @@ pub fn render(
                 state.written_left = Some(y);
             }
             left_scroll.set(ui.scroll_y());
-            // cursor_screen_pos captured before any item is rendered is the
-            // screen y where content-y=0 lands (already accounts for scroll
-            // and content padding). Using that as the origin keeps the
-            // ribbon endpoints aligned with the rows themselves.
             left_origin.set(ui.cursor_screen_pos());
             left_visible.set(ui.content_region_avail()[1]);
             draw_pane(
@@ -254,6 +345,8 @@ pub fn render(
                 &anchored_a,
                 &left_click,
                 mono_font,
+                &mut state.selection,
+                &focus_event,
             );
         });
 
@@ -283,8 +376,20 @@ pub fn render(
                 &anchored_b,
                 &right_click,
                 mono_font,
+                &mut state.selection,
+                &focus_event,
             );
         });
+
+    if let Some(p) = focus_event.get() {
+        *focus_request = Some(p);
+    }
+    // Clear drag flag once the mouse button is released anywhere.
+    if !ui.is_mouse_down(imgui::MouseButton::Left) {
+        if let Some(sel) = state.selection.as_mut() {
+            sel.dragging = false;
+        }
+    }
 
     handle_anchor_clicks(
         store,
@@ -528,8 +633,8 @@ fn draw_connector(
             let Some(ry_content) = right_line_ys.get(&anc.b) else {
                 continue;
             };
-            let ly = left_origin_y + ly_content + ROW_H * 0.5;
-            let ry = right_origin_y + ry_content + ROW_H * 0.5;
+            let ly = left_origin_y + ly_content + row_h() * 0.5;
+            let ry = right_origin_y + ry_content + row_h() * 0.5;
             if (ly < band_top && ry < band_top) || (ly > band_bot && ry > band_bot) {
                 continue;
             }
@@ -549,23 +654,22 @@ fn draw_pane(
     anchored: &HashSet<u32>,
     click_out: &Cell<Option<u32>>,
     mono_font: Option<FontId>,
+    selection: &mut Option<Selection>,
+    focus_event: &Cell<Option<crate::app::FocusedPane>>,
 ) {
     let total = rows.len() as i32;
     if total == 0 {
         return;
     }
-    // Zero ItemSpacing.y so each row consumes exactly ROW_H. Without this,
-    // imgui adds style.ItemSpacing.y between consecutive widgets, so the
-    // screen y of row i becomes origin + i*(ROW_H + spacing) while our
-    // content-y model uses i*ROW_H — the connector ribbons drift further
-    // out of alignment with each visible row.
     let _spacing = ui.push_style_var(StyleVar::ItemSpacing([0.0, 0.0]));
     let hover: Cell<Option<(u32, [f32; 2])>> = Cell::new(None);
-    let mut clipper = ListClipper::new(total).items_height(ROW_H).begin(ui);
+    let mut clipper = ListClipper::new(total).items_height(row_h()).begin(ui);
     while clipper.step() {
         for i in clipper.display_start()..clipper.display_end() {
             let r = &rows[i as usize];
-            if let Some(clicked_line) = draw_row(ui, r, side, i, anchored, mono_font, &hover) {
+            if let Some(clicked_line) =
+                draw_row(ui, r, side, i, anchored, mono_font, &hover, selection, focus_event)
+            {
                 click_out.set(Some(clicked_line));
             }
         }
@@ -593,7 +697,7 @@ fn draw_control_overlay(
     let panel_x = pos[0] + 4.0;
     let panel_y = pos[1] + 2.0;
     let panel_w = 220.0;
-    let panel_h = ROW_H - 4.0;
+    let panel_h = row_h() - 4.0;
 
     let dl = ui.get_window_draw_list();
     dl.add_rect(
@@ -653,7 +757,9 @@ fn apply_decision(
 }
 
 /// Render a single row using invisible_button for hit-testing + draw list for
-/// visuals. Returns Some(line_no) if the row was clicked this frame.
+/// visuals. Returns Some(line_no) if the row was right-clicked this frame
+/// (anchor pick). LMB drives selection instead.
+#[allow(clippy::too_many_arguments)]
 fn draw_row(
     ui: &Ui,
     row: &Row,
@@ -662,16 +768,68 @@ fn draw_row(
     anchored: &HashSet<u32>,
     mono_font: Option<FontId>,
     hover_out: &Cell<Option<(u32, [f32; 2])>>,
+    selection: &mut Option<Selection>,
+    focus_event: &Cell<Option<crate::app::FocusedPane>>,
 ) -> Option<u32> {
     let p0 = ui.cursor_screen_pos();
     let row_w = ui.content_region_avail()[0];
-    let p1 = [p0[0] + row_w, p0[1] + ROW_H];
+    let p1 = [p0[0] + row_w, p0[1] + row_h()];
 
     let id_str = format!("row_{:?}_{idx}", side);
-    let clicked = ui.invisible_button(id_str, [row_w, ROW_H]);
+    let _clicked_lmb = ui.invisible_button(id_str, [row_w, row_h()]);
     let hovered = ui.is_item_hovered();
+    let activated = ui.is_item_activated();
+    let rmb_anchor = hovered && ui.is_mouse_clicked(imgui::MouseButton::Right);
     if hovered && row.is_change {
         hover_out.set(Some((row.hunk_id, p0)));
+    }
+
+    // Push mono for both text rendering and column hit-testing. calc_text_size
+    // and the per-character width inferred from it both depend on the active
+    // font, so they must be measured under the same push.
+    let _font_tok = mono_font.map(|f| ui.push_font(f));
+    let char_w = ui.calc_text_size("m")[0].max(1.0);
+    let text_start_x = p0[0] + gutter_w();
+    let char_count: usize = row.segments.iter().map(|s| s.text.chars().count()).sum();
+
+    let col_at_mouse = if hovered {
+        let mx = ui.io().mouse_pos[0];
+        let raw = ((mx - text_start_x) / char_w).round();
+        Some(raw.clamp(0.0, char_count as f32) as usize)
+    } else {
+        None
+    };
+
+    // --- Selection events ---
+    if activated {
+        let col = col_at_mouse.unwrap_or(0);
+        let row_idx = idx as usize;
+        let shift = ui.io().key_shift;
+        if shift && selection.as_ref().map_or(false, |s| s.side == side) {
+            let sel = selection.as_mut().unwrap();
+            sel.caret = (row_idx, col);
+            sel.dragging = true;
+        } else {
+            *selection = Some(Selection {
+                side,
+                anchor: (row_idx, col),
+                caret: (row_idx, col),
+                dragging: true,
+            });
+        }
+        focus_event.set(Some(side.as_focused_pane()));
+    }
+    if hovered {
+        if let Some(sel) = selection.as_mut() {
+            if sel.dragging
+                && sel.side == side
+                && ui.is_mouse_down(imgui::MouseButton::Left)
+            {
+                if let Some(col) = col_at_mouse {
+                    sel.caret = (idx as usize, col);
+                }
+            }
+        }
     }
 
     let dl = ui.get_window_draw_list();
@@ -690,15 +848,31 @@ fn draw_row(
             .build();
     }
 
+    // Selection background — drawn after hunk bg / hover so it overrides them,
+    // but before text so glyphs remain readable.
+    if let Some(sel) = selection.as_ref() {
+        if sel.side == side {
+            let (s_row, s_col, e_row, e_col) = normalize_selection(sel);
+            let row_idx = idx as usize;
+            if row_idx >= s_row && row_idx <= e_row {
+                let l_col = if row_idx == s_row { s_col } else { 0 };
+                let r_col = if row_idx == e_row { e_col } else { char_count };
+                if r_col > l_col {
+                    let sel_x0 = text_start_x + l_col as f32 * char_w;
+                    let sel_x1 = text_start_x + r_col as f32 * char_w;
+                    dl.add_rect([sel_x0, p0[1]], [sel_x1, p1[1]], [0.26, 0.59, 0.98, 0.40])
+                        .filled(true)
+                        .build();
+                }
+            }
+        }
+    }
+
     let line_text = match row.line_no {
         Some(n) => format!("{n:>4}"),
         None => "    ".to_string(),
     };
     let text_y = p0[1] + 3.0;
-    // Push Roboto Mono so the gutter and code align column-wise. The push
-    // also affects `calc_text_size`, so highlight rectangles are sized in
-    // monospace metrics.
-    let _font_tok = mono_font.map(|f| ui.push_font(f));
     dl.add_text([p0[0] + 6.0, text_y], [0.55, 0.60, 0.70, 1.0], &line_text);
 
     let fg = match row.cls {
@@ -711,7 +885,7 @@ fn draw_row(
         Cls::Insert => [0.18, 0.70, 0.30, 0.55],
         Cls::Equal => [0.0, 0.0, 0.0, 0.0],
     };
-    let mut x = p0[0] + GUTTER_W;
+    let mut x = text_start_x;
     for seg in &row.segments {
         if seg.text.is_empty() {
             continue;
@@ -720,7 +894,7 @@ fn draw_row(
         if seg.hl {
             dl.add_rect(
                 [x, p0[1] + 2.0],
-                [x + w, p0[1] + ROW_H - 2.0],
+                [x + w, p0[1] + row_h() - 2.0],
                 hl_bg,
             )
             .filled(true)
@@ -740,7 +914,7 @@ fn draw_row(
         }
     }
 
-    if clicked {
+    if rmb_anchor {
         row.line_no
     } else {
         None
