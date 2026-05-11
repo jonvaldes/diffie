@@ -23,6 +23,8 @@ gui = [
     "dep:wgpu",
     "dep:pollster",
     "dep:rfd",
+    "dep:aetna-fonts-roboto",
+    "dep:earcutr",
 ]
 
 [dependencies]
@@ -41,3 +43,5 @@ winit = { version = "0.30", features = ["x11", "wayland", "wayland-dlopen", "rwh
 wgpu = { version = "25", optional = true }
 pollster = { version = "0.3", optional = true }
 rfd = { version = "0.14", optional = true }
+aetna-fonts-roboto = { version = "0.1", optional = true }
+earcutr = { version = "0.4", optional = true }

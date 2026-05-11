@@ -8,12 +8,14 @@
 use std::cell::Cell;
 use std::collections::HashMap;
 
-use imgui::{ListClipper, StyleVar, Ui};
+use imgui::{FontId, ListClipper, StyleVar, Ui};
 
 use crate::merge::{MergeAnchor, MergeHunk, Resolution};
 use crate::session::{SessionId, SessionStore};
 
-pub const ROW_H: f32 = 20.0;
+/// Match diff_view: tall enough for the 2x Roboto Mono used in code rows.
+pub const ROW_H: f32 = 32.0;
+const GUTTER_W: f32 = 80.0;
 const CONNECTOR_W: f32 = 56.0;
 const ECHO_TOLERANCE: f32 = 0.5;
 
@@ -45,13 +47,11 @@ struct Row {
     line_no: u32,
     text: String,
     cls: Cls,
-}
-
-#[derive(Clone)]
-enum Entry {
-    Control { hunk_id: u32, kind: HunkKind },
-    ControlPlaceholder,
-    Row(Row),
+    hunk_id: u32,
+    /// One of LocalOnly / RemoteOnly / Conflict if this row belongs to a
+    /// non-stable hunk (i.e., a hunk the resolution overlay can act on),
+    /// else None for stable hunks.
+    kind: Option<HunkKind>,
 }
 
 #[derive(Clone, Copy)]
@@ -62,7 +62,7 @@ enum HunkKind {
 }
 
 struct PaneLayout {
-    entries: Vec<Entry>,
+    rows: Vec<Row>,
     ranges: Vec<(u32, f32, f32)>,
     line_ys: HashMap<u32, f32>,
 }
@@ -101,34 +101,27 @@ fn hunk_kind(h: &MergeHunk) -> Option<HunkKind> {
 }
 
 fn build_layout(hunks: &[MergeHunk], pane: Pane) -> PaneLayout {
-    let mut entries: Vec<Entry> = Vec::new();
+    let mut rows: Vec<Row> = Vec::new();
     let mut ranges: Vec<(u32, f32, f32)> = Vec::new();
     let mut line_ys: HashMap<u32, f32> = HashMap::new();
     let mut y: f32 = 0.0;
     let mut line_n: u32 = 1;
     for h in hunks {
         let start_y = y;
-        // Control row appears only in LOCAL pane for non-stable hunks.
-        // Other panes reserve the same height with a placeholder so hunk
-        // y-ranges stay aligned across panes for ribbon drawing.
-        if let Some(kind) = hunk_kind(h) {
-            entries.push(match pane {
-                Pane::Local => Entry::Control { hunk_id: h.id(), kind },
-                _ => Entry::ControlPlaceholder,
-            });
-            y += ROW_H;
-        }
+        let kind = hunk_kind(h);
         let cls = cls_for(h);
         let cls_for_row = match cls {
             Cls::Stable => Cls::Equal,
             other => other,
         };
         for t in select_text(h, pane) {
-            entries.push(Entry::Row(Row {
+            rows.push(Row {
                 line_no: line_n,
                 text: t.clone(),
                 cls: cls_for_row,
-            }));
+                hunk_id: h.id(),
+                kind,
+            });
             line_ys.insert(line_n, y);
             line_n += 1;
             y += ROW_H;
@@ -137,7 +130,7 @@ fn build_layout(hunks: &[MergeHunk], pane: Pane) -> PaneLayout {
             ranges.push((h.id(), start_y, y));
         }
     }
-    PaneLayout { entries, ranges, line_ys }
+    PaneLayout { rows, ranges, line_ys }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -149,6 +142,7 @@ pub fn render(
     anchors: &[MergeAnchor],
     status: &mut String,
     state: &mut MergeViewState,
+    mono_font: Option<FontId>,
 ) {
     let base = build_layout(hunks, Pane::Base);
     let local = build_layout(hunks, Pane::Local);
@@ -178,7 +172,7 @@ pub fn render(
         "diffie_base",
         pane_w,
         avail[1],
-        &base.entries,
+        &base.rows,
         Pane::Base,
         store,
         session_id,
@@ -188,6 +182,7 @@ pub fn render(
         &scrolls[Pane::Base as usize],
         &origins[Pane::Base as usize],
         &visibles[Pane::Base as usize],
+        mono_font,
     );
 
     ui.same_line_with_spacing(0.0, 0.0);
@@ -200,7 +195,7 @@ pub fn render(
         "diffie_local",
         pane_w,
         avail[1],
-        &local.entries,
+        &local.rows,
         Pane::Local,
         store,
         session_id,
@@ -210,6 +205,7 @@ pub fn render(
         &scrolls[Pane::Local as usize],
         &origins[Pane::Local as usize],
         &visibles[Pane::Local as usize],
+        mono_font,
     );
 
     ui.same_line_with_spacing(0.0, 0.0);
@@ -222,7 +218,7 @@ pub fn render(
         "diffie_remote",
         pane_w,
         avail[1],
-        &remote.entries,
+        &remote.rows,
         Pane::Remote,
         store,
         session_id,
@@ -232,6 +228,7 @@ pub fn render(
         &scrolls[Pane::Remote as usize],
         &origins[Pane::Remote as usize],
         &visibles[Pane::Remote as usize],
+        mono_font,
     );
 
     let s = [scrolls[0].get(), scrolls[1].get(), scrolls[2].get()];
@@ -245,8 +242,6 @@ pub fn render(
         avail[1],
         origins[0].get()[1],
         origins[1].get()[1],
-        s[0],
-        s[1],
         &base.ranges,
         &local.ranges,
         &base.line_ys,
@@ -261,8 +256,6 @@ pub fn render(
         avail[1],
         origins[1].get()[1],
         origins[2].get()[1],
-        s[1],
-        s[2],
         &local.ranges,
         &remote.ranges,
         &local.line_ys,
@@ -278,7 +271,7 @@ fn render_pane(
     id: &str,
     w: f32,
     h: f32,
-    entries: &[Entry],
+    rows: &[Row],
     pane: Pane,
     store: &SessionStore,
     session_id: SessionId,
@@ -288,6 +281,7 @@ fn render_pane(
     scroll_out: &Cell<f32>,
     origin_out: &Cell<[f32; 2]>,
     visible_out: &Cell<f32>,
+    mono_font: Option<FontId>,
 ) {
     ui.child_window(id).size([w, h]).border(true).build(|| {
         if let Some(y) = apply {
@@ -295,91 +289,109 @@ fn render_pane(
             *written = Some(y);
         }
         scroll_out.set(ui.scroll_y());
-        origin_out.set(ui.window_pos());
+        origin_out.set(ui.cursor_screen_pos());
         visible_out.set(ui.content_region_avail()[1]);
-        draw_pane(ui, entries, pane, store, session_id, status);
+        draw_pane(ui, rows, pane, store, session_id, status, mono_font);
     });
 }
 
 fn draw_pane(
     ui: &Ui,
-    entries: &[Entry],
+    rows: &[Row],
     _pane: Pane,
     store: &SessionStore,
     session_id: SessionId,
     status: &mut String,
+    mono_font: Option<FontId>,
 ) {
-    let total = entries.len() as i32;
+    let total = rows.len() as i32;
     if total == 0 {
         return;
     }
+    // (hunk_id, kind, screen_pos) of the hovered non-stable row; populated
+    // during the row loop and used to render the resolution overlay after.
+    let hover: Cell<Option<(u32, HunkKind, [f32; 2])>> = Cell::new(None);
     let mut clipper = ListClipper::new(total).items_height(ROW_H).begin(ui);
     while clipper.step() {
         for i in clipper.display_start()..clipper.display_end() {
-            match &entries[i as usize] {
-                Entry::Control { hunk_id, kind } => {
-                    draw_control_row(ui, store, session_id, *hunk_id, *kind, status)
-                }
-                Entry::ControlPlaceholder => {
-                    ui.dummy([0.0, ROW_H]);
-                }
-                Entry::Row(r) => draw_row(ui, r, i),
-            }
+            draw_row(ui, &rows[i as usize], i, mono_font, &hover);
         }
+    }
+    if let Some((hunk_id, kind, pos)) = hover.get() {
+        draw_control_overlay(ui, store, session_id, hunk_id, kind, status, pos);
     }
 }
 
-fn draw_control_row(
+fn draw_control_overlay(
     ui: &Ui,
     store: &SessionStore,
     session_id: SessionId,
     hunk_id: u32,
     kind: HunkKind,
     status: &mut String,
+    pos: [f32; 2],
 ) {
-    let _pad = ui.push_style_var(StyleVar::FramePadding([4.0, 1.0]));
-    let _spacing = ui.push_style_var(StyleVar::ItemSpacing([3.0, 0.0]));
+    let _pad = ui.push_style_var(StyleVar::FramePadding([6.0, 2.0]));
+    let _spacing = ui.push_style_var(StyleVar::ItemSpacing([4.0, 0.0]));
 
-    let cursor = ui.cursor_screen_pos();
+    let panel_x = pos[0] + 4.0;
+    let panel_y = pos[1] + 2.0;
+    let panel_w = 260.0;
+    let panel_h = ROW_H - 4.0;
+
     let dl = ui.get_window_draw_list();
-    let row_w = ui.content_region_avail()[0];
     dl.add_rect(
-        [cursor[0], cursor[1]],
-        [cursor[0] + row_w, cursor[1] + ROW_H],
-        [0.20, 0.24, 0.30, 1.0],
+        [panel_x, panel_y],
+        [panel_x + panel_w, panel_y + panel_h],
+        [0.10, 0.13, 0.18, 0.95],
     )
     .filled(true)
+    .rounding(4.0)
+    .build();
+    let border_color = match kind {
+        HunkKind::LocalOnly => [0.15, 0.45, 0.92, 1.0],
+        HunkKind::RemoteOnly => [0.50, 0.30, 0.85, 1.0],
+        HunkKind::Conflict => [0.85, 0.45, 0.15, 1.0],
+    };
+    dl.add_rect(
+        [panel_x, panel_y],
+        [panel_x + panel_w, panel_y + panel_h],
+        border_color,
+    )
+    .rounding(4.0)
+    .thickness(1.0)
     .build();
 
+    ui.set_cursor_screen_pos([panel_x + 6.0, panel_y + 3.0]);
     match kind {
         HunkKind::LocalOnly => {
-            if ui.small_button(format!("Use Local##L{hunk_id}")) {
+            if ui.small_button(format!("Use Local##ovL{hunk_id}")) {
                 apply_res(store, session_id, hunk_id, Resolution::Local, status);
             }
             ui.same_line();
-            if ui.small_button(format!("Use Base##B{hunk_id}")) {
+            if ui.small_button(format!("Use Base##ovB{hunk_id}")) {
                 apply_res(store, session_id, hunk_id, Resolution::Base, status);
             }
         }
         HunkKind::RemoteOnly => {
-            if ui.small_button(format!("Use Remote##R{hunk_id}")) {
+            if ui.small_button(format!("Use Remote##ovR{hunk_id}")) {
                 apply_res(store, session_id, hunk_id, Resolution::Remote, status);
             }
             ui.same_line();
-            if ui.small_button(format!("Use Base##B{hunk_id}")) {
+            if ui.small_button(format!("Use Base##ovB{hunk_id}")) {
                 apply_res(store, session_id, hunk_id, Resolution::Base, status);
             }
         }
         HunkKind::Conflict => {
-            if ui.small_button(format!("Use Local##L{hunk_id}")) {
+            if ui.small_button(format!("Use Local##ovL{hunk_id}")) {
                 apply_res(store, session_id, hunk_id, Resolution::Local, status);
             }
             ui.same_line();
-            if ui.small_button(format!("Use Base##B{hunk_id}")) {
+            if ui.small_button(format!("Use Base##ovB{hunk_id}")) {
                 apply_res(store, session_id, hunk_id, Resolution::Base, status);
             }
             ui.same_line();
-            if ui.small_button(format!("Use Remote##R{hunk_id}")) {
+            if ui.small_button(format!("Use Remote##ovR{hunk_id}")) {
                 apply_res(store, session_id, hunk_id, Resolution::Remote, status);
             }
         }
@@ -405,12 +417,23 @@ fn apply_res(
     }
 }
 
-fn draw_row(ui: &Ui, row: &Row, idx: i32) {
+fn draw_row(
+    ui: &Ui,
+    row: &Row,
+    idx: i32,
+    mono_font: Option<FontId>,
+    hover_out: &Cell<Option<(u32, HunkKind, [f32; 2])>>,
+) {
     let p0 = ui.cursor_screen_pos();
     let row_w = ui.content_region_avail()[0];
     let p1 = [p0[0] + row_w, p0[1] + ROW_H];
 
     let _ = ui.invisible_button(format!("mrow_{idx}"), [row_w, ROW_H]);
+    if let Some(kind) = row.kind {
+        if ui.is_item_hovered() {
+            hover_out.set(Some((row.hunk_id, kind, p0)));
+        }
+    }
 
     let dl = ui.get_window_draw_list();
     let bg = match row.cls {
@@ -425,7 +448,8 @@ fn draw_row(ui: &Ui, row: &Row, idx: i32) {
     }
     let line_text = format!("{:>4}", row.line_no);
     let text_y = p0[1] + 3.0;
-    dl.add_text([p0[0] + 4.0, text_y], [0.55, 0.60, 0.70, 1.0], &line_text);
+    let _font_tok = mono_font.map(|f| ui.push_font(f));
+    dl.add_text([p0[0] + 6.0, text_y], [0.55, 0.60, 0.70, 1.0], &line_text);
     let fg = match row.cls {
         Cls::Equal | Cls::Stable => [0.90, 0.92, 0.96, 1.0],
         Cls::LocalOnly => [0.78, 0.88, 1.0, 1.0],
@@ -437,12 +461,22 @@ fn draw_row(ui: &Ui, row: &Row, idx: i32) {
     } else {
         row.text.as_str()
     };
-    dl.add_text([p0[0] + 44.0, text_y], fg, display);
+    dl.add_text([p0[0] + GUTTER_W, text_y], fg, display);
+    drop(_font_tok);
 }
 
 // ----------------- connector & sync -----------------
 
-const BEZIER_SEGMENTS: usize = 16;
+fn pack_color(c: [f32; 4]) -> u32 {
+    let to8 = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u32;
+    to8(c[0]) | (to8(c[1]) << 8) | (to8(c[2]) << 16) | (to8(c[3]) << 24)
+}
+
+fn v2(x: f32, y: f32) -> imgui::sys::ImVec2 {
+    imgui::sys::ImVec2 { x, y }
+}
+
+const BEZIER_SEGMENTS: usize = 24;
 
 fn cubic_bezier(p0: [f32; 2], p1: [f32; 2], p2: [f32; 2], p3: [f32; 2], t: f32) -> [f32; 2] {
     let u = 1.0 - t;
@@ -462,6 +496,91 @@ fn sample_curve(p0: [f32; 2], p1: [f32; 2], p2: [f32; 2], p3: [f32; 2]) -> Vec<[
         .collect()
 }
 
+fn fill_polygon(pts: &[[f32; 2]], color: [f32; 4]) {
+    if pts.len() < 3 {
+        return;
+    }
+    let mut flat: Vec<f32> = Vec::with_capacity(pts.len() * 2);
+    for p in pts {
+        flat.push(p[0]);
+        flat.push(p[1]);
+    }
+    let tris = match earcutr::earcut(&flat, &[], 2) {
+        Ok(t) => t,
+        Err(_) => return,
+    };
+    if tris.is_empty() {
+        return;
+    }
+    let col = pack_color(color);
+    unsafe {
+        let dl = imgui::sys::igGetWindowDrawList();
+        let mut uv = imgui::sys::ImVec2 { x: 0.0, y: 0.0 };
+        imgui::sys::igGetFontTexUvWhitePixel(&mut uv);
+        let vtx_count = pts.len() as i32;
+        let idx_count = tris.len() as i32;
+        imgui::sys::ImDrawList_PrimReserve(dl, idx_count, vtx_count);
+        let base = (*dl)._VtxCurrentIdx;
+        for p in pts {
+            imgui::sys::ImDrawList_PrimWriteVtx(dl, v2(p[0], p[1]), uv, col);
+        }
+        for &idx in &tris {
+            imgui::sys::ImDrawList_PrimWriteIdx(
+                dl,
+                (base + idx as u32) as imgui::sys::ImDrawIdx,
+            );
+        }
+    }
+}
+
+fn fill_bezier_ribbon(x_l: f32, x_r: f32, a1: f32, a2: f32, b1: f32, b2: f32, color: [f32; 4]) {
+    let cx = (x_l + x_r) * 0.5;
+    let top = sample_curve([x_l, a1], [cx, a1], [cx, b1], [x_r, b1]);
+    let bot = sample_curve([x_l, a2], [cx, a2], [cx, b2], [x_r, b2]);
+    let mut outline: Vec<[f32; 2]> = top;
+    outline.extend(bot.into_iter().rev());
+    fill_polygon(&outline, color);
+    let col = pack_color(color);
+    unsafe {
+        let dl = imgui::sys::igGetWindowDrawList();
+        imgui::sys::ImDrawList_PathClear(dl);
+        for p in &outline {
+            imgui::sys::ImDrawList_PathLineTo(dl, v2(p[0], p[1]));
+        }
+        imgui::sys::ImDrawList_PathStroke(
+            dl,
+            col,
+            imgui::sys::ImDrawFlags_Closed as i32,
+            1.0,
+        );
+    }
+}
+
+fn stroke_bezier_curve(
+    x_l: f32,
+    x_r: f32,
+    y1: f32,
+    y2: f32,
+    color: [f32; 4],
+    thickness: f32,
+) {
+    let cx = (x_l + x_r) * 0.5;
+    let col = pack_color(color);
+    unsafe {
+        let dl = imgui::sys::igGetWindowDrawList();
+        imgui::sys::ImDrawList_PathClear(dl);
+        imgui::sys::ImDrawList_PathLineTo(dl, v2(x_l, y1));
+        imgui::sys::ImDrawList_PathBezierCubicCurveTo(
+            dl,
+            v2(cx, y1),
+            v2(cx, y2),
+            v2(x_r, y2),
+            0,
+        );
+        imgui::sys::ImDrawList_PathStroke(dl, col, imgui::sys::ImDrawFlags_None as i32, thickness);
+    }
+}
+
 fn ribbon_color(h: &MergeHunk) -> [f32; 4] {
     match h {
         MergeHunk::Stable { .. } => [0.55, 0.60, 0.70, 0.10],
@@ -477,10 +596,8 @@ fn draw_connector(
     origin: [f32; 2],
     w: f32,
     h: f32,
-    left_top_screen_y: f32,
-    right_top_screen_y: f32,
-    left_scroll: f32,
-    right_scroll: f32,
+    left_origin_y: f32,
+    right_origin_y: f32,
     left_ranges: &[(u32, f32, f32)],
     right_ranges: &[(u32, f32, f32)],
     left_line_ys: &HashMap<u32, f32>,
@@ -492,7 +609,6 @@ fn draw_connector(
     dl.with_clip_rect_intersect(origin, [origin[0] + w, origin[1] + h], || {
         let x_l = origin[0];
         let x_r = origin[0] + w;
-        let cx = origin[0] + w * 0.5;
         let band_top = origin[1];
         let band_bot = origin[1] + h;
 
@@ -504,24 +620,14 @@ fn draw_connector(
             let Some(rr) = right_ranges.iter().find(|r| r.0 == id) else {
                 continue;
             };
-            let a1 = left_top_screen_y + lr.1 - left_scroll;
-            let a2 = left_top_screen_y + lr.2 - left_scroll;
-            let b1 = right_top_screen_y + rr.1 - right_scroll;
-            let b2 = right_top_screen_y + rr.2 - right_scroll;
+            let a1 = left_origin_y + lr.1;
+            let a2 = left_origin_y + lr.2;
+            let b1 = right_origin_y + rr.1;
+            let b2 = right_origin_y + rr.2;
             if (a2 < band_top && b2 < band_top) || (a1 > band_bot && b1 > band_bot) {
                 continue;
             }
-            let color = ribbon_color(h_obj);
-            let top = sample_curve([x_l, a1], [cx, a1], [cx, b1], [x_r, b1]);
-            let bot = sample_curve([x_l, a2], [cx, a2], [cx, b2], [x_r, b2]);
-            for i in 0..top.len() - 1 {
-                dl.add_triangle(top[i], top[i + 1], bot[i + 1], color)
-                    .filled(true)
-                    .build();
-                dl.add_triangle(top[i], bot[i + 1], bot[i], color)
-                    .filled(true)
-                    .build();
-            }
+            fill_bezier_ribbon(x_l, x_r, a1, a2, b1, b2, ribbon_color(h_obj));
         }
 
         for (l_line, r_line) in anchor_lines {
@@ -531,19 +637,18 @@ fn draw_connector(
             let Some(ry_content) = right_line_ys.get(r_line) else {
                 continue;
             };
-            let ly = left_top_screen_y + ly_content + ROW_H * 0.5 - left_scroll;
-            let ry = right_top_screen_y + ry_content + ROW_H * 0.5 - right_scroll;
+            let ly = left_origin_y + ly_content + ROW_H * 0.5;
+            let ry = right_origin_y + ry_content + ROW_H * 0.5;
             if (ly < band_top && ry < band_top) || (ly > band_bot && ry > band_bot) {
                 continue;
             }
-            let pts = sample_curve([x_l, ly], [cx, ly], [cx, ry], [x_r, ry]);
-            for i in 0..pts.len() - 1 {
-                dl.add_line(pts[i], pts[i + 1], [0.0, 0.0, 0.0, 1.0])
-                    .thickness(3.0)
-                    .build();
-            }
+            stroke_bezier_curve(x_l, x_r, ly, ry, [0.0, 0.0, 0.0, 1.0], 3.0);
         }
     });
+    // dl is only used inside the closure for clipping; the path ops use
+    // sys::igGetWindowDrawList directly. Touching the binding silences
+    // unused-variable lints if the loops happen to skip everything.
+    let _ = dl;
 }
 
 fn sync_scrolls(

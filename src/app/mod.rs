@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
-use imgui::{Context, FontSource};
+use imgui::{Context, FontId, FontSource};
 use imgui_wgpu::{Renderer, RendererConfig};
 use imgui_winit_support::{HiDpiMode, WinitPlatform};
 use winit::{
@@ -30,6 +30,11 @@ mod result_pane;
 
 const INITIAL_WIDTH: u32 = 1400;
 const INITIAL_HEIGHT: u32 = 900;
+
+/// One "wheel unit" is ~one text line in imgui's internal scroll math.
+/// `MouseScrollDelta::PixelDelta` from touchpads arrives in raw pixels; we
+/// divide by this to get a comparable per-line value.
+const PIXEL_DELTA_PER_LINE: f32 = 16.0;
 
 pub fn run() {
     let event_loop = EventLoop::new().expect("create event loop");
@@ -58,6 +63,10 @@ struct AppState {
     diff_views: HashMap<SessionId, diff_view::DiffViewState>,
     merge_views: HashMap<SessionId, merge_view::MergeViewState>,
     result_panes: HashMap<SessionId, result_pane::ResultState>,
+    /// FontId of Roboto Mono, registered alongside the UI font in `resumed`.
+    /// Pushed around the diff/merge code rows so columns align character by
+    /// character.
+    mono_font: Option<FontId>,
 }
 
 impl Default for AppState {
@@ -70,6 +79,7 @@ impl Default for AppState {
             diff_views: HashMap::new(),
             merge_views: HashMap::new(),
             result_panes: HashMap::new(),
+            mono_font: None,
         }
     }
 }
@@ -162,12 +172,26 @@ impl ApplicationHandler for App {
         let hidpi_factor = window.scale_factor();
         let font_size = (13.0 * hidpi_factor) as f32;
         imgui.io_mut().font_global_scale = (1.0 / hidpi_factor) as f32;
-        imgui.fonts().add_font(&[FontSource::DefaultFontData {
+        imgui.fonts().add_font(&[FontSource::TtfData {
+            data: aetna_fonts_roboto::ROBOTO_REGULAR,
+            size_pixels: font_size,
             config: Some(imgui::FontConfig {
                 size_pixels: font_size,
                 ..Default::default()
             }),
         }]);
+        // Code-view font: 2x the UI size so dense diffs are easier to scan.
+        // Row heights in diff_view / merge_view scale to match.
+        let code_font_size = font_size * 2.0;
+        let mono_font = imgui.fonts().add_font(&[FontSource::TtfData {
+            data: include_bytes!("../../assets/RobotoMono-Regular.ttf"),
+            size_pixels: code_font_size,
+            config: Some(imgui::FontConfig {
+                size_pixels: code_font_size,
+                ..Default::default()
+            }),
+        }]);
+        self.state.mono_font = Some(mono_font);
 
         let renderer = Renderer::new(
             &mut imgui,
@@ -201,11 +225,28 @@ impl ApplicationHandler for App {
         let Some(gpu) = self.gpu.as_mut() else {
             return;
         };
-        let full_event: winit::event::Event<()> = winit::event::Event::WindowEvent {
-            window_id: gpu.window.id(),
-            event: event.clone(),
-        };
-        gpu.platform.handle_event(gpu.imgui.io_mut(), &gpu.window, &full_event);
+        // Handle mouse-wheel ourselves so PixelDelta (touchpad / hi-res
+        // scroll) doesn't get fed to imgui as raw-pixel wheel units, which
+        // makes scroll fly at multiple screens per gesture. LineDelta passes
+        // through 1:1 (matches the OS's default per-notch step).
+        if let WindowEvent::MouseWheel { delta, .. } = &event {
+            let (h, v) = match delta {
+                winit::event::MouseScrollDelta::LineDelta(x, y) => (*x, *y),
+                winit::event::MouseScrollDelta::PixelDelta(p) => (
+                    (p.x as f32) / PIXEL_DELTA_PER_LINE,
+                    (p.y as f32) / PIXEL_DELTA_PER_LINE,
+                ),
+            };
+            let io = gpu.imgui.io_mut();
+            io.mouse_wheel_h += h;
+            io.mouse_wheel += v;
+        } else {
+            let full_event: winit::event::Event<()> = winit::event::Event::WindowEvent {
+                window_id: gpu.window.id(),
+                event: event.clone(),
+            };
+            gpu.platform.handle_event(gpu.imgui.io_mut(), &gpu.window, &full_event);
+        }
 
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
@@ -455,11 +496,12 @@ fn current_session_summary(ui: &imgui::Ui, state: &mut AppState) {
             {
                 let store = &state.sessions;
                 let status = &mut state.status;
+                let mono = state.mono_font;
                 let view_state = state.diff_views.entry(id).or_default();
                 ui.child_window("diff_area")
                     .size([0.0, diff_h])
                     .build(|| {
-                        diff_view::render(ui, store, id, hunks, anchors, status, view_state);
+                        diff_view::render(ui, store, id, hunks, anchors, status, view_state, mono);
                     });
             }
             {
@@ -481,11 +523,12 @@ fn current_session_summary(ui: &imgui::Ui, state: &mut AppState) {
             {
                 let store = &state.sessions;
                 let status = &mut state.status;
+                let mono = state.mono_font;
                 let view_state = state.merge_views.entry(id).or_default();
                 ui.child_window("merge_area")
                     .size([0.0, diff_h])
                     .build(|| {
-                        merge_view::render(ui, store, id, hunks, anchors, status, view_state);
+                        merge_view::render(ui, store, id, hunks, anchors, status, view_state, mono);
                     });
             }
             {

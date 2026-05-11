@@ -7,13 +7,17 @@
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 
-use imgui::{ListClipper, StyleVar, Ui};
+use imgui::{FontId, ListClipper, StyleVar, Ui};
 
 use super::char_diff::{char_diff, left_segments, right_segments, Segment};
 use crate::diff::{Anchor, DiffOp, Hunk};
 use crate::session::{HunkDecision, SessionId, SessionStore};
 
-pub const ROW_H: f32 = 20.0;
+/// Tall enough for the 2x Roboto Mono used in code rows.
+pub const ROW_H: f32 = 32.0;
+
+/// Width of the line-number gutter, sized for ~4 digits in the larger mono.
+const GUTTER_W: f32 = 80.0;
 
 const CONNECTOR_W: f32 = 60.0;
 
@@ -49,17 +53,16 @@ struct Row {
     line_no: Option<u32>,
     segments: Vec<Segment>,
     cls: Cls,
-}
-
-#[derive(Clone)]
-enum Entry {
-    Control { hunk_id: u32 },
-    ControlPlaceholder,
-    Row(Row),
+    /// Hunk this row belongs to. Used so the hover overlay knows which hunk
+    /// the user is interacting with without re-scanning the list.
+    hunk_id: u32,
+    /// True iff this row sits inside a change hunk (i.e., a hunk the
+    /// decision buttons can act on).
+    is_change: bool,
 }
 
 struct Pane {
-    entries: Vec<Entry>,
+    rows: Vec<Row>,
     /// (hunk_id, top_y, bot_y) per hunk in content-pixel coordinates.
     ranges: Vec<(u32, f32, f32)>,
     /// Line number → y in content-pixel coordinates.
@@ -78,21 +81,15 @@ fn plain(text: &str) -> Vec<Segment> {
 }
 
 fn build_pane(hunks: &[Hunk], side: Side) -> Pane {
-    let mut entries: Vec<Entry> = Vec::new();
+    let mut rows: Vec<Row> = Vec::new();
     let mut ranges: Vec<(u32, f32, f32)> = Vec::new();
     let mut line_ys: HashMap<u32, f32> = HashMap::new();
     let mut y: f32 = 0.0;
     for h in hunks {
         let start_y = y;
-        if is_change_hunk(h) {
-            entries.push(match side {
-                Side::Left => Entry::Control { hunk_id: h.id },
-                Side::Right => Entry::ControlPlaceholder,
-            });
-            y += ROW_H;
-
-            // For change hunks, pair deletes with inserts so we can show
-            // character-level differences on the paired rows.
+        let is_change = is_change_hunk(h);
+        if is_change {
+            // Pair deletes with inserts to drive character-level highlights.
             let dels: Vec<(u32, &str)> = h
                 .ops
                 .iter()
@@ -116,23 +113,27 @@ fn build_pane(hunks: &[Hunk], side: Side) -> Pane {
                     for i in 0..n_pairs {
                         let runs = char_diff(dels[i].1, inss[i].1);
                         let segments = left_segments(&runs);
-                        entries.push(Entry::Row(Row {
+                        rows.push(Row {
                             line_no: Some(dels[i].0),
                             segments,
                             cls: Cls::Delete,
-                        }));
+                            hunk_id: h.id,
+                            is_change: true,
+                        });
                         line_ys.insert(dels[i].0, y);
                         y += ROW_H;
                     }
                     for i in n_pairs..dels.len() {
-                        entries.push(Entry::Row(Row {
+                        rows.push(Row {
                             line_no: Some(dels[i].0),
                             segments: vec![Segment {
                                 text: dels[i].1.to_string(),
                                 hl: true,
                             }],
                             cls: Cls::Delete,
-                        }));
+                            hunk_id: h.id,
+                            is_change: true,
+                        });
                         line_ys.insert(dels[i].0, y);
                         y += ROW_H;
                     }
@@ -141,41 +142,46 @@ fn build_pane(hunks: &[Hunk], side: Side) -> Pane {
                     for i in 0..n_pairs {
                         let runs = char_diff(dels[i].1, inss[i].1);
                         let segments = right_segments(&runs);
-                        entries.push(Entry::Row(Row {
+                        rows.push(Row {
                             line_no: Some(inss[i].0),
                             segments,
                             cls: Cls::Insert,
-                        }));
+                            hunk_id: h.id,
+                            is_change: true,
+                        });
                         line_ys.insert(inss[i].0, y);
                         y += ROW_H;
                     }
                     for i in n_pairs..inss.len() {
-                        entries.push(Entry::Row(Row {
+                        rows.push(Row {
                             line_no: Some(inss[i].0),
                             segments: vec![Segment {
                                 text: inss[i].1.to_string(),
                                 hl: true,
                             }],
                             cls: Cls::Insert,
-                        }));
+                            hunk_id: h.id,
+                            is_change: true,
+                        });
                         line_ys.insert(inss[i].0, y);
                         y += ROW_H;
                     }
                 }
             }
         } else {
-            // Equal hunks: just mirror text on both sides.
             for op in &h.ops {
                 if let DiffOp::Equal { a, b, text } = op {
                     let (line_no, segments) = match side {
                         Side::Left => (*a, plain(text)),
                         Side::Right => (*b, plain(text)),
                     };
-                    entries.push(Entry::Row(Row {
+                    rows.push(Row {
                         line_no: Some(line_no),
                         segments,
                         cls: Cls::Equal,
-                    }));
+                        hunk_id: h.id,
+                        is_change: false,
+                    });
                     line_ys.insert(line_no, y);
                     y += ROW_H;
                 }
@@ -185,7 +191,7 @@ fn build_pane(hunks: &[Hunk], side: Side) -> Pane {
             ranges.push((h.id, start_y, y));
         }
     }
-    Pane { entries, ranges, line_ys }
+    Pane { rows, ranges, line_ys }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -197,6 +203,7 @@ pub fn render(
     anchors: &[Anchor],
     status: &mut String,
     state: &mut DiffViewState,
+    mono_font: Option<FontId>,
 ) {
     let left = build_pane(hunks, Side::Left);
     let right = build_pane(hunks, Side::Right);
@@ -231,17 +238,22 @@ pub fn render(
                 state.written_left = Some(y);
             }
             left_scroll.set(ui.scroll_y());
-            left_origin.set(ui.window_pos());
+            // cursor_screen_pos captured before any item is rendered is the
+            // screen y where content-y=0 lands (already accounts for scroll
+            // and content padding). Using that as the origin keeps the
+            // ribbon endpoints aligned with the rows themselves.
+            left_origin.set(ui.cursor_screen_pos());
             left_visible.set(ui.content_region_avail()[1]);
             draw_pane(
                 ui,
-                &left.entries,
+                &left.rows,
                 Side::Left,
                 store,
                 session_id,
                 status,
                 &anchored_a,
                 &left_click,
+                mono_font,
             );
         });
 
@@ -259,17 +271,18 @@ pub fn render(
                 state.written_right = Some(y);
             }
             right_scroll.set(ui.scroll_y());
-            right_origin.set(ui.window_pos());
+            right_origin.set(ui.cursor_screen_pos());
             right_visible.set(ui.content_region_avail()[1]);
             draw_pane(
                 ui,
-                &right.entries,
+                &right.rows,
                 Side::Right,
                 store,
                 session_id,
                 status,
                 &anchored_b,
                 &right_click,
+                mono_font,
             );
         });
 
@@ -295,8 +308,6 @@ pub fn render(
         avail[1],
         left_origin.get()[1],
         right_origin.get()[1],
-        l,
-        r,
         &left.ranges,
         &right.ranges,
         &left.line_ys,
@@ -340,7 +351,16 @@ fn ribbon_color(is_change: bool) -> [f32; 4] {
     }
 }
 
-const BEZIER_SEGMENTS: usize = 16;
+fn pack_color(c: [f32; 4]) -> u32 {
+    let to8 = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u32;
+    to8(c[0]) | (to8(c[1]) << 8) | (to8(c[2]) << 16) | (to8(c[3]) << 24)
+}
+
+fn v2(x: f32, y: f32) -> imgui::sys::ImVec2 {
+    imgui::sys::ImVec2 { x, y }
+}
+
+const BEZIER_SEGMENTS: usize = 24;
 
 fn cubic_bezier(p0: [f32; 2], p1: [f32; 2], p2: [f32; 2], p3: [f32; 2], t: f32) -> [f32; 2] {
     let u = 1.0 - t;
@@ -360,16 +380,112 @@ fn sample_curve(p0: [f32; 2], p1: [f32; 2], p2: [f32; 2], p3: [f32; 2]) -> Vec<[
         .collect()
 }
 
+/// Fill an arbitrary (possibly concave) polygon by triangulating it with
+/// earcut, then submitting the resulting triangles directly via imgui's
+/// low-level primitive API. imgui's own `AddConvexPolyFilled` / `PathFillConvex`
+/// fans from vertex 0, which only works for convex shapes; this bypass
+/// guarantees correct fill regardless of polygon shape.
+fn fill_polygon(pts: &[[f32; 2]], color: [f32; 4]) {
+    if pts.len() < 3 {
+        return;
+    }
+    let mut flat: Vec<f32> = Vec::with_capacity(pts.len() * 2);
+    for p in pts {
+        flat.push(p[0]);
+        flat.push(p[1]);
+    }
+    let tris = match earcutr::earcut(&flat, &[], 2) {
+        Ok(t) => t,
+        Err(_) => return,
+    };
+    if tris.is_empty() {
+        return;
+    }
+    let col = pack_color(color);
+    unsafe {
+        let dl = imgui::sys::igGetWindowDrawList();
+        let mut uv = imgui::sys::ImVec2 { x: 0.0, y: 0.0 };
+        imgui::sys::igGetFontTexUvWhitePixel(&mut uv);
+        let vtx_count = pts.len() as i32;
+        let idx_count = tris.len() as i32;
+        imgui::sys::ImDrawList_PrimReserve(dl, idx_count, vtx_count);
+        let base = (*dl)._VtxCurrentIdx;
+        for p in pts {
+            imgui::sys::ImDrawList_PrimWriteVtx(dl, v2(p[0], p[1]), uv, col);
+        }
+        for &idx in &tris {
+            imgui::sys::ImDrawList_PrimWriteIdx(
+                dl,
+                (base + idx as u32) as imgui::sys::ImDrawIdx,
+            );
+        }
+    }
+}
+
+/// Bezier-bounded ribbon. Samples the top + bottom curves into points, builds
+/// a closed outline, and runs that through `fill_polygon` so any concavity is
+/// triangulated correctly. The outline is then stroked thinly so the curve
+/// edges look smooth (AA only on the boundary).
+fn fill_bezier_ribbon(x_l: f32, x_r: f32, a1: f32, a2: f32, b1: f32, b2: f32, color: [f32; 4]) {
+    let cx = (x_l + x_r) * 0.5;
+    let top = sample_curve([x_l, a1], [cx, a1], [cx, b1], [x_r, b1]);
+    let bot = sample_curve([x_l, a2], [cx, a2], [cx, b2], [x_r, b2]);
+    // Top forward, then bottom reversed: closed polygon going around the
+    // ribbon perimeter.
+    let mut outline: Vec<[f32; 2]> = top;
+    outline.extend(bot.into_iter().rev());
+    fill_polygon(&outline, color);
+    // Thin AA stroke along the same outline so the curve edges appear
+    // smooth even though the fill itself isn't anti-aliased.
+    let col = pack_color(color);
+    unsafe {
+        let dl = imgui::sys::igGetWindowDrawList();
+        imgui::sys::ImDrawList_PathClear(dl);
+        for p in &outline {
+            imgui::sys::ImDrawList_PathLineTo(dl, v2(p[0], p[1]));
+        }
+        imgui::sys::ImDrawList_PathStroke(
+            dl,
+            col,
+            imgui::sys::ImDrawFlags_Closed as i32,
+            1.0,
+        );
+    }
+}
+
+fn stroke_bezier_curve(
+    x_l: f32,
+    x_r: f32,
+    y1: f32,
+    y2: f32,
+    color: [f32; 4],
+    thickness: f32,
+) {
+    let cx = (x_l + x_r) * 0.5;
+    let col = pack_color(color);
+    unsafe {
+        let dl = imgui::sys::igGetWindowDrawList();
+        imgui::sys::ImDrawList_PathClear(dl);
+        imgui::sys::ImDrawList_PathLineTo(dl, v2(x_l, y1));
+        imgui::sys::ImDrawList_PathBezierCubicCurveTo(
+            dl,
+            v2(cx, y1),
+            v2(cx, y2),
+            v2(x_r, y2),
+            0,
+        );
+        imgui::sys::ImDrawList_PathStroke(dl, col, imgui::sys::ImDrawFlags_None as i32, thickness);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn draw_connector(
     ui: &Ui,
     origin: [f32; 2],
     w: f32,
     h: f32,
-    left_top_screen_y: f32,
-    right_top_screen_y: f32,
-    left_scroll: f32,
-    right_scroll: f32,
+    left_origin_y: f32,
+    right_origin_y: f32,
     left_ranges: &[(u32, f32, f32)],
     right_ranges: &[(u32, f32, f32)],
     left_line_ys: &HashMap<u32, f32>,
@@ -381,7 +497,6 @@ fn draw_connector(
     dl.with_clip_rect_intersect(origin, [origin[0] + w, origin[1] + h], || {
         let x_l = origin[0];
         let x_r = origin[0] + w;
-        let cx = origin[0] + w * 0.5;
         let band_top = origin[1];
         let band_bot = origin[1] + h;
 
@@ -392,29 +507,20 @@ fn draw_connector(
             let Some(rr) = right_ranges.iter().find(|r| r.0 == h_obj.id) else {
                 continue;
             };
-            let a1 = left_top_screen_y + lr.1 - left_scroll;
-            let a2 = left_top_screen_y + lr.2 - left_scroll;
-            let b1 = right_top_screen_y + rr.1 - right_scroll;
-            let b2 = right_top_screen_y + rr.2 - right_scroll;
+            // left/right_origin_y already account for scroll (captured via
+            // cursor_screen_pos inside the scrolling pane), so content-y
+            // maps directly to screen-y by addition.
+            let a1 = left_origin_y + lr.1;
+            let a2 = left_origin_y + lr.2;
+            let b1 = right_origin_y + rr.1;
+            let b2 = right_origin_y + rr.2;
             if (a2 < band_top && b2 < band_top) || (a1 > band_bot && b1 > band_bot) {
                 continue;
             }
             let color = ribbon_color(is_change_hunk(h_obj));
-            let top = sample_curve([x_l, a1], [cx, a1], [cx, b1], [x_r, b1]);
-            let bot = sample_curve([x_l, a2], [cx, a2], [cx, b2], [x_r, b2]);
-            for i in 0..top.len() - 1 {
-                dl.add_triangle(top[i], top[i + 1], bot[i + 1], color)
-                    .filled(true)
-                    .build();
-                dl.add_triangle(top[i], bot[i + 1], bot[i], color)
-                    .filled(true)
-                    .build();
-            }
+            fill_bezier_ribbon(x_l, x_r, a1, a2, b1, b2, color);
         }
 
-        // Anchor lines on top: thick black bezier from anchored row's y on
-        // each side. Skip if either side is not in the layout (shouldn't
-        // happen for a valid anchor).
         for anc in anchors {
             let Some(ly_content) = left_line_ys.get(&anc.a) else {
                 continue;
@@ -422,19 +528,12 @@ fn draw_connector(
             let Some(ry_content) = right_line_ys.get(&anc.b) else {
                 continue;
             };
-            let ly = left_top_screen_y + ly_content + ROW_H * 0.5 - left_scroll;
-            let ry = right_top_screen_y + ry_content + ROW_H * 0.5 - right_scroll;
+            let ly = left_origin_y + ly_content + ROW_H * 0.5;
+            let ry = right_origin_y + ry_content + ROW_H * 0.5;
             if (ly < band_top && ry < band_top) || (ly > band_bot && ry > band_bot) {
                 continue;
             }
-            let pts = sample_curve([x_l, ly], [cx, ly], [cx, ry], [x_r, ry]);
-            // Render as a thick line by drawing connected segments with a
-            // small fill quad. Using add_line for simplicity at thickness 3.
-            for i in 0..pts.len() - 1 {
-                dl.add_line(pts[i], pts[i + 1], [0.0, 0.0, 0.0, 1.0])
-                    .thickness(3.0)
-                    .build();
-            }
+            stroke_bezier_curve(x_l, x_r, ly, ry, [0.0, 0.0, 0.0, 1.0], 3.0);
         }
     });
 }
@@ -442,74 +541,88 @@ fn draw_connector(
 #[allow(clippy::too_many_arguments)]
 fn draw_pane(
     ui: &Ui,
-    entries: &[Entry],
+    rows: &[Row],
     side: Side,
     store: &SessionStore,
     session_id: SessionId,
     status: &mut String,
     anchored: &HashSet<u32>,
     click_out: &Cell<Option<u32>>,
+    mono_font: Option<FontId>,
 ) {
-    let total = entries.len() as i32;
+    let total = rows.len() as i32;
     if total == 0 {
         return;
     }
+    // Captures the (hunk_id, screen_pos) of the change-hunk row currently
+    // under the cursor. Set during the row loop; if non-None after the loop,
+    // the decision-button overlay is rendered at that screen position.
+    let hover: Cell<Option<(u32, [f32; 2])>> = Cell::new(None);
     let mut clipper = ListClipper::new(total).items_height(ROW_H).begin(ui);
     while clipper.step() {
         for i in clipper.display_start()..clipper.display_end() {
-            match &entries[i as usize] {
-                Entry::Control { hunk_id } => {
-                    draw_control_row(ui, store, session_id, *hunk_id, status)
-                }
-                Entry::ControlPlaceholder => draw_placeholder(ui),
-                Entry::Row(r) => {
-                    if let Some(clicked_line) = draw_row(ui, r, side, i, anchored) {
-                        click_out.set(Some(clicked_line));
-                    }
-                }
+            let r = &rows[i as usize];
+            if let Some(clicked_line) = draw_row(ui, r, side, i, anchored, mono_font, &hover) {
+                click_out.set(Some(clicked_line));
             }
         }
     }
+    if let Some((hunk_id, pos)) = hover.get() {
+        draw_control_overlay(ui, store, session_id, hunk_id, status, pos);
+    }
 }
 
-fn draw_placeholder(ui: &Ui) {
-    ui.dummy([0.0, ROW_H]);
-}
-
-fn draw_control_row(
+/// Floating panel with the four decision buttons, rendered on top of the
+/// hovered row. Takes no space in the row layout because it sets the cursor
+/// to an absolute screen position and we ignore the cursor advance afterwards.
+fn draw_control_overlay(
     ui: &Ui,
     store: &SessionStore,
     session_id: SessionId,
     hunk_id: u32,
     status: &mut String,
+    pos: [f32; 2],
 ) {
-    let _pad = ui.push_style_var(StyleVar::FramePadding([4.0, 1.0]));
-    let _spacing = ui.push_style_var(StyleVar::ItemSpacing([3.0, 0.0]));
+    let _pad = ui.push_style_var(StyleVar::FramePadding([6.0, 2.0]));
+    let _spacing = ui.push_style_var(StyleVar::ItemSpacing([4.0, 0.0]));
 
-    let cursor = ui.cursor_screen_pos();
+    let panel_x = pos[0] + 4.0;
+    let panel_y = pos[1] + 2.0;
+    let panel_w = 220.0;
+    let panel_h = ROW_H - 4.0;
+
     let dl = ui.get_window_draw_list();
-    let row_w = ui.content_region_avail()[0];
     dl.add_rect(
-        [cursor[0], cursor[1]],
-        [cursor[0] + row_w, cursor[1] + ROW_H],
-        [0.20, 0.24, 0.30, 1.0],
+        [panel_x, panel_y],
+        [panel_x + panel_w, panel_y + panel_h],
+        [0.10, 0.13, 0.18, 0.95],
     )
     .filled(true)
+    .rounding(4.0)
+    .build();
+    dl.add_rect(
+        [panel_x, panel_y],
+        [panel_x + panel_w, panel_y + panel_h],
+        [0.42, 0.66, 1.0, 1.0],
+    )
+    .rounding(4.0)
+    .thickness(1.0)
     .build();
 
-    if ui.small_button(format!("← A##{hunk_id}_a")) {
+    ui.set_cursor_screen_pos([panel_x + 6.0, panel_y + 3.0]);
+    if ui.small_button(format!("← A##ov{hunk_id}_a")) {
         apply_decision(store, session_id, hunk_id, HunkDecision::AcceptA, status);
     }
     ui.same_line();
-    if ui.small_button(format!("B →##{hunk_id}_b")) {
+    if ui.small_button(format!("B →##ov{hunk_id}_b")) {
         apply_decision(store, session_id, hunk_id, HunkDecision::AcceptB, status);
     }
     ui.same_line();
-    if ui.small_button(format!("Both##{hunk_id}_bo")) {
+    if ui.small_button(format!("Both##ov{hunk_id}_bo")) {
         apply_decision(store, session_id, hunk_id, HunkDecision::Both, status);
     }
     ui.same_line();
-    if ui.small_button(format!("None##{hunk_id}_n")) {
+    if ui.small_button(format!("None##ov{hunk_id}_n")) {
         apply_decision(store, session_id, hunk_id, HunkDecision::Neither, status);
     }
 }
@@ -543,6 +656,8 @@ fn draw_row(
     side: Side,
     idx: i32,
     anchored: &HashSet<u32>,
+    mono_font: Option<FontId>,
+    hover_out: &Cell<Option<(u32, [f32; 2])>>,
 ) -> Option<u32> {
     let p0 = ui.cursor_screen_pos();
     let row_w = ui.content_region_avail()[0];
@@ -551,6 +666,9 @@ fn draw_row(
     let id_str = format!("row_{:?}_{idx}", side);
     let clicked = ui.invisible_button(id_str, [row_w, ROW_H]);
     let hovered = ui.is_item_hovered();
+    if hovered && row.is_change {
+        hover_out.set(Some((row.hunk_id, p0)));
+    }
 
     let dl = ui.get_window_draw_list();
 
@@ -573,7 +691,11 @@ fn draw_row(
         None => "    ".to_string(),
     };
     let text_y = p0[1] + 3.0;
-    dl.add_text([p0[0] + 4.0, text_y], [0.55, 0.60, 0.70, 1.0], &line_text);
+    // Push Roboto Mono so the gutter and code align column-wise. The push
+    // also affects `calc_text_size`, so highlight rectangles are sized in
+    // monospace metrics.
+    let _font_tok = mono_font.map(|f| ui.push_font(f));
+    dl.add_text([p0[0] + 6.0, text_y], [0.55, 0.60, 0.70, 1.0], &line_text);
 
     let fg = match row.cls {
         Cls::Equal => [0.90, 0.92, 0.96, 1.0],
@@ -585,7 +707,7 @@ fn draw_row(
         Cls::Insert => [0.18, 0.70, 0.30, 0.55],
         Cls::Equal => [0.0, 0.0, 0.0, 0.0],
     };
-    let mut x = p0[0] + 44.0;
+    let mut x = p0[0] + GUTTER_W;
     for seg in &row.segments {
         if seg.text.is_empty() {
             continue;
@@ -593,8 +715,8 @@ fn draw_row(
         let w = ui.calc_text_size(&seg.text)[0];
         if seg.hl {
             dl.add_rect(
-                [x, p0[1] + 1.0],
-                [x + w, p0[1] + ROW_H - 1.0],
+                [x, p0[1] + 2.0],
+                [x + w, p0[1] + ROW_H - 2.0],
                 hl_bg,
             )
             .filled(true)
@@ -603,6 +725,7 @@ fn draw_row(
         dl.add_text([x, text_y], fg, &seg.text);
         x += w;
     }
+    drop(_font_tok);
 
     if let Some(ln) = row.line_no {
         if anchored.contains(&ln) {

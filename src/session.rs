@@ -103,7 +103,27 @@ fn recompute_two_way(
         let wrapper = AnchoredDiff::new(DynEngine(inner.as_ref()), anchors.to_vec());
         wrapper.diff_checked(&a, &b)?
     };
-    Ok(group_into_hunks(&ops))
+    Ok(group_into_hunks(&split_trivial_equals(ops)))
+}
+
+/// Reject Myers matches on whitespace-only lines. Such "matches" between
+/// distant blanks (or coincidental `}` / `{` sections) produce tiny equal
+/// hunks that drag the connector ribbons across huge vertical distances and
+/// leave blank rows on each side that look out of place. Treating them as
+/// independent delete+insert keeps the diff visually local and gives each
+/// blank its own insert/delete background.
+fn split_trivial_equals(ops: Vec<DiffOp>) -> Vec<DiffOp> {
+    let mut out: Vec<DiffOp> = Vec::with_capacity(ops.len());
+    for op in ops {
+        match op {
+            DiffOp::Equal { a, b, text } if text.trim().is_empty() => {
+                out.push(DiffOp::Delete { a, text: text.clone() });
+                out.push(DiffOp::Insert { b, text });
+            }
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 fn recompute_three_way(
