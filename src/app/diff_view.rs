@@ -15,6 +15,19 @@ pub const ROW_H: f32 = 20.0;
 
 const CONNECTOR_W: f32 = 60.0;
 
+/// Per-session view state that must persist across frames: scroll positions,
+/// last-written echo guards, and pending programmatic scrolls to apply on the
+/// next frame's render of each pane.
+#[derive(Default)]
+pub struct DiffViewState {
+    last_left: f32,
+    last_right: f32,
+    written_left: Option<f32>,
+    written_right: Option<f32>,
+    pending_left: Option<f32>,
+    pending_right: Option<f32>,
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum Side {
     Left,
@@ -116,26 +129,36 @@ pub fn render(
     session_id: SessionId,
     hunks: &[Hunk],
     status: &mut String,
+    state: &mut DiffViewState,
 ) {
     let left = build_pane(hunks, Side::Left);
     let right = build_pane(hunks, Side::Right);
     let avail = ui.content_region_avail();
     let pane_w = ((avail[0] - CONNECTOR_W) * 0.5).max(80.0);
 
-    // Snapshot scroll positions of each pane so the connector pass (rendered
-    // last) can convert content-y → screen-y for every hunk pair.
     let left_scroll = Cell::new(0.0_f32);
     let right_scroll = Cell::new(0.0_f32);
     let left_origin = Cell::new([0.0_f32, 0.0_f32]);
     let right_origin = Cell::new([0.0_f32, 0.0_f32]);
+    let left_visible = Cell::new(avail[1]);
+    let right_visible = Cell::new(avail[1]);
+
+    // Take pending writes for this frame; they'll be re-armed below if a
+    // driver is detected.
+    let apply_left = state.pending_left.take();
+    let apply_right = state.pending_right.take();
 
     ui.child_window("diffie_left")
         .size([pane_w, avail[1]])
         .border(true)
         .build(|| {
+            if let Some(y) = apply_left {
+                ui.set_scroll_y(y);
+                state.written_left = Some(y);
+            }
             left_scroll.set(ui.scroll_y());
-            // window_pos is the top-left of this child's content area (after border).
             left_origin.set(ui.window_pos());
+            left_visible.set(ui.content_region_avail()[1]);
             draw_pane(ui, &left.entries, store, session_id, status);
         });
 
@@ -150,10 +173,21 @@ pub fn render(
         .size([pane_w, avail[1]])
         .border(true)
         .build(|| {
+            if let Some(y) = apply_right {
+                ui.set_scroll_y(y);
+                state.written_right = Some(y);
+            }
             right_scroll.set(ui.scroll_y());
             right_origin.set(ui.window_pos());
+            right_visible.set(ui.content_region_avail()[1]);
             draw_pane(ui, &right.entries, store, session_id, status);
         });
+
+    let l = left_scroll.get();
+    let r = right_scroll.get();
+    let l_view = left_visible.get();
+    let r_view = right_visible.get();
+    sync_scrolls(state, l, r, l_view, r_view, &left.ranges, &right.ranges);
 
     draw_connector(
         ui,
@@ -162,12 +196,93 @@ pub fn render(
         avail[1],
         left_origin.get()[1],
         right_origin.get()[1],
-        left_scroll.get(),
-        right_scroll.get(),
+        l,
+        r,
         &left.ranges,
         &right.ranges,
         hunks,
     );
+}
+
+const ECHO_TOLERANCE: f32 = 0.5;
+
+fn sync_scrolls(
+    state: &mut DiffViewState,
+    curr_left: f32,
+    curr_right: f32,
+    left_view_h: f32,
+    right_view_h: f32,
+    left_ranges: &[(u32, f32, f32)],
+    right_ranges: &[(u32, f32, f32)],
+) {
+    let l_changed = (curr_left - state.last_left).abs() > ECHO_TOLERANCE;
+    let r_changed = (curr_right - state.last_right).abs() > ECHO_TOLERANCE;
+    let l_echo = state
+        .written_left
+        .map_or(false, |w| (curr_left - w).abs() < ECHO_TOLERANCE);
+    let r_echo = state
+        .written_right
+        .map_or(false, |w| (curr_right - w).abs() < ECHO_TOLERANCE);
+
+    if l_changed && !l_echo {
+        if let Some(target) =
+            target_scroll(curr_left, left_view_h, right_view_h, left_ranges, right_ranges)
+        {
+            state.pending_right = Some(target);
+        }
+    } else if r_changed && !r_echo {
+        if let Some(target) = target_scroll(
+            curr_right,
+            right_view_h,
+            left_view_h,
+            right_ranges,
+            left_ranges,
+        ) {
+            state.pending_left = Some(target);
+        }
+    }
+
+    state.last_left = curr_left;
+    state.last_right = curr_right;
+    if l_echo {
+        state.written_left = None;
+    }
+    if r_echo {
+        state.written_right = None;
+    }
+}
+
+/// Map a center-anchored scroll position in the source pane to the equivalent
+/// scroll position in the destination pane, using matching-hunk fractions.
+fn target_scroll(
+    src_scroll: f32,
+    src_view_h: f32,
+    dst_view_h: f32,
+    src_ranges: &[(u32, f32, f32)],
+    dst_ranges: &[(u32, f32, f32)],
+) -> Option<f32> {
+    let center = src_scroll + src_view_h * 0.5;
+    let (hunk_id, fraction) = locate_hunk(src_ranges, center)?;
+    let (_id, top, bot) = dst_ranges.iter().find(|r| r.0 == hunk_id)?;
+    let dst_center = top + fraction * (bot - top);
+    Some((dst_center - dst_view_h * 0.5).max(0.0))
+}
+
+fn locate_hunk(ranges: &[(u32, f32, f32)], y: f32) -> Option<(u32, f32)> {
+    let mut best: Option<(u32, f32, f32)> = None;
+    for r in ranges {
+        if r.1 <= y && y < r.2 {
+            let span = (r.2 - r.1).max(1.0);
+            return Some((r.0, ((y - r.1) / span).clamp(0.0, 1.0)));
+        }
+        if r.1 <= y && best.map_or(true, |b| r.2 > b.2) {
+            best = Some(*r);
+        }
+    }
+    best.map(|b| {
+        let span = (b.2 - b.1).max(1.0);
+        (b.0, ((y - b.1) / span).clamp(0.0, 1.0))
+    })
 }
 
 fn ribbon_color(is_change: bool) -> [f32; 4] {
