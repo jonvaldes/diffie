@@ -27,6 +27,7 @@ use crate::session::{SessionId, SessionMode, SessionStore};
 mod char_diff;
 mod diff_view;
 mod merge_view;
+mod recents;
 mod result_pane;
 
 const INITIAL_WIDTH: u32 = 1400;
@@ -136,6 +137,9 @@ struct AppState {
     /// the imgui font atlas, re-adds Roboto + Roboto Mono at the new size,
     /// reloads the GPU font texture, and stores the new mono `FontId`.
     font_rebuild_pending: bool,
+    /// Recently-opened comparisons (move-to-front, persisted to JSON in
+    /// the platform's config dir). Populated from disk in `Default`.
+    recents: Vec<recents::RecentEntry>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -174,6 +178,7 @@ impl Default for AppState {
             focused: None,
             pending_keys: Vec::new(),
             font_rebuild_pending: false,
+            recents: recents::load(),
         }
     }
 }
@@ -454,8 +459,6 @@ fn frame_ui(ui: &imgui::Ui, state: &mut AppState) {
                 | imgui::WindowFlags::NO_BRING_TO_FRONT_ON_FOCUS,
         )
         .build(|| {
-            toolbar(ui, state);
-            ui.separator();
             tab_bar(ui, state);
             ui.separator();
             current_session_summary(ui, state);
@@ -479,6 +482,31 @@ fn menu_bar(ui: &imgui::Ui, state: &mut AppState) {
             {
                 open_three_way(state);
             }
+            // Recents submenu — last-12 list, persisted to JSON.
+            ui.menu("Recents", || {
+                if state.recents.is_empty() {
+                    ui.text_disabled("(no recent comparisons)");
+                    return;
+                }
+                let mut to_open: Option<recents::RecentEntry> = None;
+                let mut clear = false;
+                for entry in &state.recents {
+                    if ui.menu_item(entry.label()) {
+                        to_open = Some(entry.clone());
+                    }
+                }
+                ui.separator();
+                if ui.menu_item("Clear Recents") {
+                    clear = true;
+                }
+                if let Some(entry) = to_open {
+                    open_recent(state, &entry);
+                }
+                if clear {
+                    state.recents.clear();
+                    recents::save(&state.recents);
+                }
+            });
             ui.separator();
             let has_session = state.active.is_some();
             let is_two_way = active_mode(state) == Some(TabMode::TwoWay);
@@ -613,6 +641,20 @@ fn menu_bar(ui: &imgui::Ui, state: &mut AppState) {
                 cycle_tab(state, -1);
             }
         });
+
+        // Right-aligned status text in the menu bar — replaces the old
+        // toolbar status. Open / Save / etc. all moved to File menu items.
+        let lower = state.status.to_ascii_lowercase();
+        let text_w = ui.calc_text_size(&state.status)[0];
+        let avail_w = ui.content_region_avail()[0];
+        let pad = (avail_w - text_w - 12.0).max(8.0);
+        ui.dummy([pad, 0.0]);
+        ui.same_line();
+        if lower.contains("error") || lower.contains("failed") {
+            ui.text_colored([1.0, 0.45, 0.45, 1.0], &state.status);
+        } else {
+            ui.text_disabled(&state.status);
+        }
     });
 }
 
@@ -905,31 +947,6 @@ fn anchor_bar_two_way(
     }
 }
 
-fn toolbar(ui: &imgui::Ui, state: &mut AppState) {
-    if ui.button("Open 2-way…") {
-        open_two_way(state);
-    }
-    ui.same_line();
-    if ui.button("Open 3-way…") {
-        open_three_way(state);
-    }
-    ui.same_line();
-    let has_session = state.active.is_some();
-    ui.disabled(!has_session, || {
-        if ui.button("Save Result As…") {
-            save_as(state);
-        }
-    });
-    ui.same_line();
-    // Status: red-tinted for entries that read like errors, default otherwise.
-    let lower = state.status.to_ascii_lowercase();
-    if lower.contains("error") || lower.contains("failed") {
-        ui.text_colored([1.0, 0.45, 0.45, 1.0], &state.status);
-    } else {
-        ui.text_disabled(&state.status);
-    }
-}
-
 fn active_mode(state: &AppState) -> Option<TabMode> {
     let id = state.active?;
     state.tabs.iter().find(|t| t.session_id == id).map(|t| t.mode)
@@ -1150,6 +1167,10 @@ fn open_two_way(state: &mut AppState) {
     let Some(b) = pick_file("Open file B (2-way)") else {
         return;
     };
+    open_two_way_paths(state, a, b);
+}
+
+fn open_two_way_paths(state: &mut AppState, a: PathBuf, b: PathBuf) {
     let a_text = match fileio::read_text(&a) {
         Ok(t) => t,
         Err(e) => {
@@ -1167,6 +1188,10 @@ fn open_two_way(state: &mut AppState) {
     match state.sessions.open_two_way(&a_text, &b_text, None) {
         Ok(id) => {
             let label = format!("{} ↔ {}", basename(&a), basename(&b));
+            let recent = recents::RecentEntry::TwoWay {
+                a: a.clone(),
+                b: b.clone(),
+            };
             state.tabs.push(Tab {
                 session_id: id,
                 label: label.clone(),
@@ -1175,6 +1200,7 @@ fn open_two_way(state: &mut AppState) {
             });
             state.active = Some(id);
             state.status = format!("Opened 2-way: {label}");
+            recents::add(&mut state.recents, recent);
         }
         Err(e) => state.status = format!("Open 2-way failed: {e}"),
     }
@@ -1190,6 +1216,15 @@ fn open_three_way(state: &mut AppState) {
     let Some(remote) = pick_file("Open REMOTE (3-way)") else {
         return;
     };
+    open_three_way_paths(state, base, local, remote);
+}
+
+fn open_three_way_paths(
+    state: &mut AppState,
+    base: PathBuf,
+    local: PathBuf,
+    remote: PathBuf,
+) {
     let base_text = match fileio::read_text(&base) {
         Ok(t) => t,
         Err(e) => {
@@ -1217,6 +1252,11 @@ fn open_three_way(state: &mut AppState) {
     {
         Ok(id) => {
             let label = format!("{} (3-way)", basename(&base));
+            let recent = recents::RecentEntry::ThreeWay {
+                base: base.clone(),
+                local: local.clone(),
+                remote: remote.clone(),
+            };
             state.tabs.push(Tab {
                 session_id: id,
                 label: label.clone(),
@@ -1225,7 +1265,17 @@ fn open_three_way(state: &mut AppState) {
             });
             state.active = Some(id);
             state.status = format!("Opened 3-way: {label}");
+            recents::add(&mut state.recents, recent);
         }
         Err(e) => state.status = format!("Open 3-way failed: {e}"),
+    }
+}
+
+fn open_recent(state: &mut AppState, entry: &recents::RecentEntry) {
+    match entry.clone() {
+        recents::RecentEntry::TwoWay { a, b } => open_two_way_paths(state, a, b),
+        recents::RecentEntry::ThreeWay { base, local, remote } => {
+            open_three_way_paths(state, base, local, remote)
+        }
     }
 }
