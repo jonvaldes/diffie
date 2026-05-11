@@ -84,6 +84,42 @@ pub fn available_engines() -> Vec<String> {
     vec!["basic".to_string()]
 }
 
+/// Walk all hunks in order and emit the lines that should make up the
+/// rebuilt `target` side: untouched hunks keep their current target-side
+/// content (Equal + the target's own change-op text), but the targeted
+/// hunk uses the OTHER side's content. Used by `replace_hunk_side`.
+fn rebuild_for_replace(hunks: &[Hunk], target_hunk: u32, target: TwoWaySide) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for h in hunks {
+        let is_target = h.id == target_hunk;
+        for op in &h.ops {
+            let (include, text) = match op {
+                DiffOp::Equal { text, .. } => (true, text.clone()),
+                DiffOp::Delete { text, .. } => {
+                    let keep = if is_target {
+                        target == TwoWaySide::B
+                    } else {
+                        target == TwoWaySide::A
+                    };
+                    (keep, text.clone())
+                }
+                DiffOp::Insert { text, .. } => {
+                    let keep = if is_target {
+                        target == TwoWaySide::A
+                    } else {
+                        target == TwoWaySide::B
+                    };
+                    (keep, text.clone())
+                }
+            };
+            if include {
+                out.push(text);
+            }
+        }
+    }
+    out
+}
+
 fn refs<'a>(v: &'a [String]) -> Vec<&'a str> {
     v.iter().map(|s| s.as_str()).collect()
 }
@@ -213,6 +249,44 @@ impl SessionStore {
         let g = self.sessions.lock().unwrap();
         let s = g.get(&id).ok_or(SessionError::UnknownSession(id))?;
         Ok(s.clone())
+    }
+
+    /// Replace one side's content for the given hunk with the other side's
+    /// content. The whole target file is reconstructed by walking all hunks
+    /// in order and emitting either the current side's lines (untouched
+    /// hunks) or the other side's lines (the targeted hunk). Hunks are then
+    /// recomputed against the new file.
+    ///
+    /// `target` is the side being rewritten (e.g. `TwoWaySide::B` to make
+    /// B match A for this hunk).
+    pub fn replace_hunk_side(
+        &self,
+        id: SessionId,
+        hunk_id: u32,
+        target: TwoWaySide,
+    ) -> Result<(), SessionError> {
+        self.with(id, |s| {
+            let engine = s.engine.clone();
+            match &mut s.mode {
+                SessionMode::TwoWay {
+                    a_lines,
+                    b_lines,
+                    anchors,
+                    hunks,
+                    ..
+                } => {
+                    let rebuilt = rebuild_for_replace(hunks, hunk_id, target);
+                    match target {
+                        TwoWaySide::A => *a_lines = rebuilt,
+                        TwoWaySide::B => *b_lines = rebuilt,
+                    }
+                    let new_hunks = recompute_two_way(&engine, a_lines, b_lines, anchors)?;
+                    *hunks = new_hunks;
+                    Ok(())
+                }
+                _ => Err(SessionError::WrongMode),
+            }
+        })
     }
 
     /// Replace a single line of the underlying A or B file (1-based line

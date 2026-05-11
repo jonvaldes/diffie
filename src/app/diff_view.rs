@@ -11,7 +11,7 @@ use imgui::{FontId, ListClipper, StyleVar, Ui};
 
 use super::char_diff::{char_diff, left_segments, right_segments, Segment};
 use crate::diff::{Anchor, DiffOp, Hunk};
-use crate::session::{HunkDecision, SessionId, SessionStore};
+use crate::session::{SessionId, SessionStore, TwoWaySide};
 
 /// Tall enough for the 1.5x Roboto Mono used in code rows at zoom=1.0.
 const ROW_H_BASE: f32 = 24.0;
@@ -739,7 +739,7 @@ fn draw_control_overlay(
 
     let panel_x = pos[0] + 4.0;
     let panel_y = pos[1] + 2.0;
-    let panel_w = 220.0;
+    let panel_w = 200.0;
     let panel_h = row_h() - 4.0;
 
     let dl = ui.get_window_draw_list();
@@ -761,39 +761,29 @@ fn draw_control_overlay(
     .build();
 
     ui.set_cursor_screen_pos([panel_x + 6.0, panel_y + 3.0]);
-    if ui.small_button(format!("← A##ov{hunk_id}_a")) {
-        apply_decision(store, session_id, hunk_id, HunkDecision::AcceptA, status);
+    // 2-way edit mode: these copy this hunk's content from one side to the
+    // other, directly modifying the underlying file lines.
+    if ui.small_button(format!("Apply A → B##ov{hunk_id}_atob")) {
+        apply_replace(store, session_id, hunk_id, TwoWaySide::B, status);
     }
     ui.same_line();
-    if ui.small_button(format!("B →##ov{hunk_id}_b")) {
-        apply_decision(store, session_id, hunk_id, HunkDecision::AcceptB, status);
-    }
-    ui.same_line();
-    if ui.small_button(format!("Both##ov{hunk_id}_bo")) {
-        apply_decision(store, session_id, hunk_id, HunkDecision::Both, status);
-    }
-    ui.same_line();
-    if ui.small_button(format!("None##ov{hunk_id}_n")) {
-        apply_decision(store, session_id, hunk_id, HunkDecision::Neither, status);
+    if ui.small_button(format!("B → A##ov{hunk_id}_btoa")) {
+        apply_replace(store, session_id, hunk_id, TwoWaySide::A, status);
     }
 }
 
-fn apply_decision(
+fn apply_replace(
     store: &SessionStore,
     session_id: SessionId,
     hunk_id: u32,
-    decision: HunkDecision,
+    target: TwoWaySide,
     status: &mut String,
 ) {
-    let label = match &decision {
-        HunkDecision::AcceptA => "A",
-        HunkDecision::AcceptB => "B",
-        HunkDecision::Both => "both",
-        HunkDecision::Neither => "neither",
-        HunkDecision::Custom { .. } => "custom",
-        HunkDecision::PerLine { .. } => "per-line",
+    let label = match target {
+        TwoWaySide::A => "A ← B",
+        TwoWaySide::B => "A → B",
     };
-    match store.set_two_way_decision(session_id, hunk_id, decision) {
+    match store.replace_hunk_side(session_id, hunk_id, target) {
         Ok(()) => *status = format!("hunk {hunk_id}: {label}"),
         Err(e) => *status = format!("hunk {hunk_id}: {e}"),
     }
