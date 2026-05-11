@@ -1,0 +1,36 @@
+[package]
+name = "diffie"
+version = "0.1.0"
+edition = "2021"
+description = "A code diffing & 3-way merge desktop app"
+authors = ["juanval"]
+
+[lib]
+name = "diffie_lib"
+path = "src/lib.rs"
+
+[[bin]]
+name = "diffie"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [], optional = true }
+
+[dependencies]
+diff = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+encoding_rs = "0.8"
+tauri = { version = "2", features = [], optional = true }
+tauri-plugin-dialog = { version = "2", optional = true }
+tauri-plugin-fs = { version = "2", optional = true }
+
+[features]
+default = []
+desktop = [
+    "dep:tauri",
+    "dep:tauri-build",
+    "dep:tauri-plugin-dialog",
+    "dep:tauri-plugin-fs",
+]

@@ -1,0 +1,423 @@
+use std::collections::HashMap;
+use std::sync::{Mutex, atomic::{AtomicU64, Ordering}};
+
+use serde::{Deserialize, Serialize};
+
+use crate::diff::{anchored::AnchoredDiff, basic::BasicDiff, group_into_hunks, split_lines, Anchor, DiffEngine, DiffOp, Hunk};
+use crate::merge::{apply_resolutions, MergeAnchor, MergeHunk, Resolution, ThreeWayMerge};
+
+pub type SessionId = u64;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum HunkDecision {
+    AcceptA,
+    AcceptB,
+    Both,
+    Neither,
+    Custom { text: Vec<String> },
+    /// Per-line keep/skip mask. Length must equal the hunk's op count.
+    PerLine { keep: Vec<bool> },
+}
+
+#[derive(Debug, Clone)]
+pub enum SessionMode {
+    TwoWay {
+        a_lines: Vec<String>,
+        b_lines: Vec<String>,
+        anchors: Vec<Anchor>,
+        hunks: Vec<Hunk>,
+        decisions: HashMap<u32, HunkDecision>,
+    },
+    ThreeWay {
+        base_lines: Vec<String>,
+        local_lines: Vec<String>,
+        remote_lines: Vec<String>,
+        anchors: Vec<MergeAnchor>,
+        hunks: Vec<MergeHunk>,
+        resolutions: HashMap<u32, Resolution>,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct DiffSession {
+    pub id: SessionId,
+    pub engine: String,
+    pub mode: SessionMode,
+    /// User-edited result buffer (overrides computed result when set).
+    pub manual_result: Option<String>,
+}
+
+#[derive(Default)]
+pub struct SessionStore {
+    next_id: AtomicU64,
+    sessions: Mutex<HashMap<SessionId, DiffSession>>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum SessionError {
+    #[error("unknown session id: {0}")]
+    UnknownSession(SessionId),
+    #[error("unknown engine: {0}")]
+    UnknownEngine(String),
+    #[error("wrong session mode for this operation")]
+    WrongMode,
+    #[error("anchor error: {0}")]
+    Anchor(#[from] crate::diff::anchored::AnchorError),
+}
+
+fn build_engine(name: &str) -> Result<Box<dyn DiffEngine>, SessionError> {
+    match name {
+        "basic" => Ok(Box::new(BasicDiff)),
+        other => Err(SessionError::UnknownEngine(other.to_string())),
+    }
+}
+
+pub fn available_engines() -> Vec<String> {
+    vec!["basic".to_string()]
+}
+
+fn refs<'a>(v: &'a [String]) -> Vec<&'a str> {
+    v.iter().map(|s| s.as_str()).collect()
+}
+
+fn recompute_two_way(
+    engine_name: &str,
+    a_lines: &[String],
+    b_lines: &[String],
+    anchors: &[Anchor],
+) -> Result<Vec<Hunk>, SessionError> {
+    let inner = build_engine(engine_name)?;
+    let a = refs(a_lines);
+    let b = refs(b_lines);
+    let ops: Vec<DiffOp> = if anchors.is_empty() {
+        inner.diff(&a, &b)
+    } else {
+        // Wrap with anchored. We can't easily generic-wrap a Box<dyn>; use a
+        // small adapter struct.
+        struct DynEngine<'a>(&'a dyn DiffEngine);
+        impl<'a> DiffEngine for DynEngine<'a> {
+            fn name(&self) -> &'static str { "dyn" }
+            fn diff(&self, a: &[&str], b: &[&str]) -> Vec<DiffOp> { self.0.diff(a, b) }
+        }
+        let wrapper = AnchoredDiff::new(DynEngine(inner.as_ref()), anchors.to_vec());
+        wrapper.diff_checked(&a, &b)?
+    };
+    Ok(group_into_hunks(&ops))
+}
+
+fn recompute_three_way(
+    engine_name: &str,
+    base: &[String],
+    local: &[String],
+    remote: &[String],
+    anchors: &[MergeAnchor],
+) -> Result<Vec<MergeHunk>, SessionError> {
+    match engine_name {
+        "basic" => {
+            let m = ThreeWayMerge::new(BasicDiff);
+            Ok(m.merge(&refs(base), &refs(local), &refs(remote), anchors))
+        }
+        other => Err(SessionError::UnknownEngine(other.to_string())),
+    }
+}
+
+impl SessionStore {
+    pub fn new() -> Self { Self::default() }
+
+    fn alloc_id(&self) -> SessionId { self.next_id.fetch_add(1, Ordering::Relaxed) + 1 }
+
+    pub fn open_two_way(
+        &self,
+        a_text: &str,
+        b_text: &str,
+        engine: Option<String>,
+    ) -> Result<SessionId, SessionError> {
+        let engine = engine.unwrap_or_else(|| "basic".to_string());
+        let a_lines: Vec<String> = split_lines(a_text).into_iter().map(|s| s.to_string()).collect();
+        let b_lines: Vec<String> = split_lines(b_text).into_iter().map(|s| s.to_string()).collect();
+        let hunks = recompute_two_way(&engine, &a_lines, &b_lines, &[])?;
+        let id = self.alloc_id();
+        let s = DiffSession {
+            id, engine,
+            mode: SessionMode::TwoWay {
+                a_lines, b_lines, anchors: vec![], hunks, decisions: HashMap::new(),
+            },
+            manual_result: None,
+        };
+        self.sessions.lock().unwrap().insert(id, s);
+        Ok(id)
+    }
+
+    pub fn open_three_way(
+        &self,
+        base_text: &str,
+        local_text: &str,
+        remote_text: &str,
+        engine: Option<String>,
+    ) -> Result<SessionId, SessionError> {
+        let engine = engine.unwrap_or_else(|| "basic".to_string());
+        let base_lines: Vec<String> = split_lines(base_text).into_iter().map(|s| s.to_string()).collect();
+        let local_lines: Vec<String> = split_lines(local_text).into_iter().map(|s| s.to_string()).collect();
+        let remote_lines: Vec<String> = split_lines(remote_text).into_iter().map(|s| s.to_string()).collect();
+        let hunks = recompute_three_way(&engine, &base_lines, &local_lines, &remote_lines, &[])?;
+        let id = self.alloc_id();
+        let s = DiffSession {
+            id, engine,
+            mode: SessionMode::ThreeWay {
+                base_lines, local_lines, remote_lines, anchors: vec![], hunks, resolutions: HashMap::new(),
+            },
+            manual_result: None,
+        };
+        self.sessions.lock().unwrap().insert(id, s);
+        Ok(id)
+    }
+
+    pub fn with<F, R>(&self, id: SessionId, f: F) -> Result<R, SessionError>
+    where
+        F: FnOnce(&mut DiffSession) -> Result<R, SessionError>,
+    {
+        let mut g = self.sessions.lock().unwrap();
+        let s = g.get_mut(&id).ok_or(SessionError::UnknownSession(id))?;
+        f(s)
+    }
+
+    pub fn snapshot(&self, id: SessionId) -> Result<DiffSession, SessionError> {
+        let g = self.sessions.lock().unwrap();
+        let s = g.get(&id).ok_or(SessionError::UnknownSession(id))?;
+        Ok(s.clone())
+    }
+
+    pub fn add_anchor_two_way(&self, id: SessionId, anchor: Anchor) -> Result<(), SessionError> {
+        self.with(id, |s| {
+            let engine = s.engine.clone();
+            match &mut s.mode {
+                SessionMode::TwoWay { a_lines, b_lines, anchors, hunks, .. } => {
+                    let mut new_anchors = anchors.clone();
+                    new_anchors.push(anchor);
+                    new_anchors.sort_by_key(|a| (a.a, a.b));
+                    let new_hunks = recompute_two_way(&engine, a_lines, b_lines, &new_anchors)?;
+                    *anchors = new_anchors;
+                    *hunks = new_hunks;
+                    Ok(())
+                }
+                _ => Err(SessionError::WrongMode),
+            }
+        })
+    }
+
+    pub fn add_anchor_three_way(&self, id: SessionId, anchor: MergeAnchor) -> Result<(), SessionError> {
+        self.with(id, |s| {
+            let engine = s.engine.clone();
+            match &mut s.mode {
+                SessionMode::ThreeWay { base_lines, local_lines, remote_lines, anchors, hunks, .. } => {
+                    let mut new_anchors = anchors.clone();
+                    new_anchors.push(anchor);
+                    new_anchors.sort_by_key(|a| a.base);
+                    let new_hunks = recompute_three_way(&engine, base_lines, local_lines, remote_lines, &new_anchors)?;
+                    *anchors = new_anchors;
+                    *hunks = new_hunks;
+                    Ok(())
+                }
+                _ => Err(SessionError::WrongMode),
+            }
+        })
+    }
+
+    pub fn remove_anchor(&self, id: SessionId, idx: usize) -> Result<(), SessionError> {
+        self.with(id, |s| {
+            let engine = s.engine.clone();
+            match &mut s.mode {
+                SessionMode::TwoWay { a_lines, b_lines, anchors, hunks, .. } => {
+                    if idx >= anchors.len() { return Ok(()); }
+                    anchors.remove(idx);
+                    *hunks = recompute_two_way(&engine, a_lines, b_lines, anchors)?;
+                    Ok(())
+                }
+                SessionMode::ThreeWay { base_lines, local_lines, remote_lines, anchors, hunks, .. } => {
+                    if idx >= anchors.len() { return Ok(()); }
+                    anchors.remove(idx);
+                    *hunks = recompute_three_way(&engine, base_lines, local_lines, remote_lines, anchors)?;
+                    Ok(())
+                }
+            }
+        })
+    }
+
+    pub fn set_engine(&self, id: SessionId, engine: String) -> Result<(), SessionError> {
+        // Validate first
+        let _ = build_engine(&engine)?;
+        self.with(id, |s| {
+            s.engine = engine.clone();
+            match &mut s.mode {
+                SessionMode::TwoWay { a_lines, b_lines, anchors, hunks, .. } => {
+                    *hunks = recompute_two_way(&engine, a_lines, b_lines, anchors)?;
+                }
+                SessionMode::ThreeWay { base_lines, local_lines, remote_lines, anchors, hunks, .. } => {
+                    *hunks = recompute_three_way(&engine, base_lines, local_lines, remote_lines, anchors)?;
+                }
+            }
+            Ok(())
+        })
+    }
+
+    pub fn set_two_way_decision(&self, id: SessionId, hunk_id: u32, decision: HunkDecision) -> Result<(), SessionError> {
+        self.with(id, |s| match &mut s.mode {
+            SessionMode::TwoWay { decisions, .. } => {
+                decisions.insert(hunk_id, decision);
+                Ok(())
+            }
+            _ => Err(SessionError::WrongMode),
+        })
+    }
+
+    pub fn set_three_way_resolution(&self, id: SessionId, hunk_id: u32, resolution: Resolution) -> Result<(), SessionError> {
+        self.with(id, |s| match &mut s.mode {
+            SessionMode::ThreeWay { resolutions, .. } => {
+                resolutions.insert(hunk_id, resolution);
+                Ok(())
+            }
+            _ => Err(SessionError::WrongMode),
+        })
+    }
+
+    pub fn update_manual_result(&self, id: SessionId, text: String) -> Result<(), SessionError> {
+        self.with(id, |s| { s.manual_result = Some(text); Ok(()) })
+    }
+
+    pub fn compute_result(&self, id: SessionId) -> Result<String, SessionError> {
+        let snap = self.snapshot(id)?;
+        if let Some(t) = snap.manual_result.clone() {
+            return Ok(t);
+        }
+        match snap.mode {
+            SessionMode::TwoWay { hunks, decisions, .. } => {
+                Ok(apply_two_way_decisions(&hunks, &decisions))
+            }
+            SessionMode::ThreeWay { hunks, resolutions, .. } => {
+                Ok(apply_resolutions(&hunks, &resolutions))
+            }
+        }
+    }
+}
+
+/// Apply per-hunk decisions to a 2-way diff to produce the result text.
+/// Default if no decision: keep B (the "right" side) for change hunks; equal
+/// hunks always keep A (== B).
+pub fn apply_two_way_decisions(
+    hunks: &[Hunk],
+    decisions: &HashMap<u32, HunkDecision>,
+) -> String {
+    let mut out: Vec<String> = Vec::new();
+    for h in hunks {
+        let is_equal_hunk = h.ops.iter().all(|o| matches!(o, DiffOp::Equal { .. }));
+        if is_equal_hunk {
+            for op in &h.ops {
+                if let DiffOp::Equal { text, .. } = op {
+                    out.push(text.clone());
+                }
+            }
+            continue;
+        }
+        let dec = decisions.get(&h.id).cloned().unwrap_or(HunkDecision::AcceptB);
+        match dec {
+            HunkDecision::AcceptA => {
+                for op in &h.ops {
+                    match op {
+                        DiffOp::Equal { text, .. } | DiffOp::Delete { text, .. } => out.push(text.clone()),
+                        DiffOp::Insert { .. } => {}
+                    }
+                }
+            }
+            HunkDecision::AcceptB => {
+                for op in &h.ops {
+                    match op {
+                        DiffOp::Equal { text, .. } | DiffOp::Insert { text, .. } => out.push(text.clone()),
+                        DiffOp::Delete { .. } => {}
+                    }
+                }
+            }
+            HunkDecision::Both => {
+                for op in &h.ops {
+                    match op {
+                        DiffOp::Equal { text, .. }
+                        | DiffOp::Delete { text, .. }
+                        | DiffOp::Insert { text, .. } => out.push(text.clone()),
+                    }
+                }
+            }
+            HunkDecision::Neither => {
+                for op in &h.ops {
+                    if let DiffOp::Equal { text, .. } = op { out.push(text.clone()); }
+                }
+            }
+            HunkDecision::Custom { text } => {
+                out.extend(text);
+            }
+            HunkDecision::PerLine { keep } => {
+                for (op, k) in h.ops.iter().zip(keep.iter()) {
+                    if !*k { continue; }
+                    match op {
+                        DiffOp::Equal { text, .. }
+                        | DiffOp::Delete { text, .. }
+                        | DiffOp::Insert { text, .. } => out.push(text.clone()),
+                    }
+                }
+            }
+        }
+    }
+    out.join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn two_way_default_picks_b() {
+        let store = SessionStore::new();
+        let id = store.open_two_way("a\nb\nc\n", "a\nB\nc\n", None).unwrap();
+        let result = store.compute_result(id).unwrap();
+        assert_eq!(result, "a\nB\nc");
+    }
+
+    #[test]
+    fn two_way_accept_a() {
+        let store = SessionStore::new();
+        let id = store.open_two_way("a\nb\nc\n", "a\nB\nc\n", None).unwrap();
+        let snap = store.snapshot(id).unwrap();
+        let change_hunk_id = match &snap.mode {
+            SessionMode::TwoWay { hunks, .. } => hunks.iter().find_map(|h| {
+                if h.ops.iter().any(|o| !matches!(o, DiffOp::Equal { .. })) { Some(h.id) } else { None }
+            }).unwrap(),
+            _ => unreachable!(),
+        };
+        store.set_two_way_decision(id, change_hunk_id, HunkDecision::AcceptA).unwrap();
+        let result = store.compute_result(id).unwrap();
+        assert_eq!(result, "a\nb\nc");
+    }
+
+    #[test]
+    fn manual_result_overrides() {
+        let store = SessionStore::new();
+        let id = store.open_two_way("a\n", "b\n", None).unwrap();
+        store.update_manual_result(id, "custom".into()).unwrap();
+        assert_eq!(store.compute_result(id).unwrap(), "custom");
+    }
+
+    #[test]
+    fn three_way_round_trip() {
+        let store = SessionStore::new();
+        let id = store.open_three_way("a\nb\nc\n", "a\nL\nc\n", "a\nR\nc\n", None).unwrap();
+        let snap = store.snapshot(id).unwrap();
+        let conflict_id = match &snap.mode {
+            SessionMode::ThreeWay { hunks, .. } => hunks.iter().find_map(|h| match h {
+                MergeHunk::Conflict { id, .. } => Some(*id),
+                _ => None,
+            }).unwrap(),
+            _ => unreachable!(),
+        };
+        store.set_three_way_resolution(id, conflict_id, Resolution::Local).unwrap();
+        assert_eq!(store.compute_result(id).unwrap(), "a\nL\nc");
+    }
+}
