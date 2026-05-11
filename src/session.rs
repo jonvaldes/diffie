@@ -8,6 +8,13 @@ use crate::merge::{apply_resolutions, MergeAnchor, MergeHunk, Resolution, ThreeW
 
 pub type SessionId = u64;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TwoWaySide {
+    A,
+    B,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum HunkDecision {
@@ -206,6 +213,44 @@ impl SessionStore {
         let g = self.sessions.lock().unwrap();
         let s = g.get(&id).ok_or(SessionError::UnknownSession(id))?;
         Ok(s.clone())
+    }
+
+    /// Replace a single line of the underlying A or B file (1-based line
+    /// number) and recompute hunks. Used by the diff view's in-place row
+    /// editor in 2-way comparisons.
+    pub fn set_two_way_line(
+        &self,
+        id: SessionId,
+        side: TwoWaySide,
+        line_no: u32,
+        text: String,
+    ) -> Result<(), SessionError> {
+        self.with(id, |s| {
+            let engine = s.engine.clone();
+            match &mut s.mode {
+                SessionMode::TwoWay {
+                    a_lines,
+                    b_lines,
+                    anchors,
+                    hunks,
+                    ..
+                } => {
+                    let idx = (line_no as usize).checked_sub(1).unwrap_or(0);
+                    let target = match side {
+                        TwoWaySide::A => &mut *a_lines,
+                        TwoWaySide::B => &mut *b_lines,
+                    };
+                    if idx >= target.len() {
+                        return Err(SessionError::WrongMode);
+                    }
+                    target[idx] = text;
+                    let new_hunks = recompute_two_way(&engine, a_lines, b_lines, anchors)?;
+                    *hunks = new_hunks;
+                    Ok(())
+                }
+                _ => Err(SessionError::WrongMode),
+            }
+        })
     }
 
     pub fn add_anchor_two_way(&self, id: SessionId, anchor: Anchor) -> Result<(), SessionError> {

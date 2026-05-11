@@ -91,7 +91,7 @@ pub fn run() {
     event_loop.run_app(&mut app).expect("run event loop");
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TabMode {
     TwoWay,
     ThreeWay,
@@ -102,6 +102,12 @@ struct Tab {
     session_id: SessionId,
     label: String,
     mode: TabMode,
+    /// File paths in role order:
+    /// - 2-way: \[A, B]
+    /// - 3-way: \[base, local, remote]
+    /// Used so Save File A / Save File B / Save Result As can write back
+    /// without re-prompting.
+    paths: Vec<PathBuf>,
 }
 
 struct AppState {
@@ -475,10 +481,28 @@ fn menu_bar(ui: &imgui::Ui, state: &mut AppState) {
             }
             ui.separator();
             let has_session = state.active.is_some();
+            let is_two_way = active_mode(state) == Some(TabMode::TwoWay);
+            let is_three_way = active_mode(state) == Some(TabMode::ThreeWay);
+            if ui
+                .menu_item_config("Save File A")
+                .shortcut("Ctrl+S")
+                .enabled(is_two_way)
+                .build()
+            {
+                save_two_way_side(state, crate::session::TwoWaySide::A);
+            }
+            if ui
+                .menu_item_config("Save File B")
+                .shortcut("Ctrl+Shift+S")
+                .enabled(is_two_way)
+                .build()
+            {
+                save_two_way_side(state, crate::session::TwoWaySide::B);
+            }
             if ui
                 .menu_item_config("Save Result As…")
                 .shortcut("Ctrl+S")
-                .enabled(has_session)
+                .enabled(is_three_way)
                 .build()
             {
                 save_as(state);
@@ -607,8 +631,18 @@ fn keyboard_shortcuts(ui: &imgui::Ui, state: &mut AppState) {
             open_two_way(state);
         }
     }
-    if !shift && ui.is_key_pressed(Key::S) {
-        save_as(state);
+    if ui.is_key_pressed(Key::S) {
+        match active_mode(state) {
+            Some(TabMode::TwoWay) => {
+                if shift {
+                    save_two_way_side(state, crate::session::TwoWaySide::B);
+                } else {
+                    save_two_way_side(state, crate::session::TwoWaySide::A);
+                }
+            }
+            Some(TabMode::ThreeWay) if !shift => save_as(state),
+            _ => {}
+        }
     }
     if !shift && ui.is_key_pressed(Key::W) {
         close_active_tab(state);
@@ -896,6 +930,60 @@ fn toolbar(ui: &imgui::Ui, state: &mut AppState) {
     }
 }
 
+fn active_mode(state: &AppState) -> Option<TabMode> {
+    let id = state.active?;
+    state.tabs.iter().find(|t| t.session_id == id).map(|t| t.mode)
+}
+
+fn save_two_way_side(state: &mut AppState, side: crate::session::TwoWaySide) {
+    let Some(id) = state.active else {
+        return;
+    };
+    let Some(tab) = state.tabs.iter().find(|t| t.session_id == id) else {
+        return;
+    };
+    let idx = match side {
+        crate::session::TwoWaySide::A => 0,
+        crate::session::TwoWaySide::B => 1,
+    };
+    let Some(path) = tab.paths.get(idx).cloned() else {
+        state.status = "no file path stored for this side".into();
+        return;
+    };
+    let snap = match state.sessions.snapshot(id) {
+        Ok(s) => s,
+        Err(e) => {
+            state.status = format!("snapshot error: {e}");
+            return;
+        }
+    };
+    let crate::session::SessionMode::TwoWay { a_lines, b_lines, .. } = &snap.mode else {
+        state.status = "active session is not 2-way".into();
+        return;
+    };
+    let lines = match side {
+        crate::session::TwoWaySide::A => a_lines,
+        crate::session::TwoWaySide::B => b_lines,
+    };
+    let mut text = lines.join("\n");
+    if !text.is_empty() {
+        text.push('\n');
+    }
+    match fileio::write_text(&path, &text) {
+        Ok(()) => {
+            state.status = format!(
+                "saved {}: {}",
+                match side {
+                    crate::session::TwoWaySide::A => "A",
+                    crate::session::TwoWaySide::B => "B",
+                },
+                path.display()
+            );
+        }
+        Err(e) => state.status = format!("save error: {e}"),
+    }
+}
+
 fn save_as(state: &mut AppState) {
     let Some(id) = state.active else {
         return;
@@ -939,54 +1027,26 @@ fn current_session_summary(ui: &imgui::Ui, state: &mut AppState) {
         SessionMode::TwoWay { hunks, anchors, .. } => {
             anchor_bar_two_way(ui, &state.sessions, id, anchors, &mut state.status);
             ui.separator();
-            let avail = ui.content_region_avail();
-            let result_h = 200.0_f32.min(avail[1] * 0.4);
-            let diff_h = (avail[1] - result_h - 8.0).max(50.0);
-            {
-                let store = &state.sessions;
-                let status = &mut state.status;
-                let mono = state.mono_font;
-                let view_state = state.diff_views.entry(id).or_default();
-                let mut focus_request: Option<FocusedPane> = None;
-                ui.child_window("diff_area")
-                    .size([0.0, diff_h])
-                    .build(|| {
-                        diff_view::render(
-                            ui,
-                            store,
-                            id,
-                            hunks,
-                            anchors,
-                            status,
-                            view_state,
-                            mono,
-                            &mut focus_request,
-                        );
-                    });
-                if let Some(p) = focus_request {
-                    state.focused = Some((id, p));
-                }
-            }
-            {
-                let mono = state.mono_font;
-                let result = state.result_panes.entry(id).or_default();
-                let mut focus_request: Option<FocusedPane> = None;
-                ui.child_window("result_area")
-                    .size([0.0, 0.0])
-                    .border(true)
-                    .build(|| {
-                        result_pane::render(
-                            ui,
-                            &state.sessions,
-                            id,
-                            result,
-                            mono,
-                            &mut focus_request,
-                        );
-                    });
-                if let Some(p) = focus_request {
-                    state.focused = Some((id, p));
-                }
+            // 2-way edits the source files directly — there is no separate
+            // "result" so the diff fills the remaining vertical space.
+            let store = &state.sessions;
+            let status = &mut state.status;
+            let mono = state.mono_font;
+            let view_state = state.diff_views.entry(id).or_default();
+            let mut focus_request: Option<FocusedPane> = None;
+            diff_view::render(
+                ui,
+                store,
+                id,
+                hunks,
+                anchors,
+                status,
+                view_state,
+                mono,
+                &mut focus_request,
+            );
+            if let Some(p) = focus_request {
+                state.focused = Some((id, p));
             }
         }
         SessionMode::ThreeWay { hunks, anchors, .. } => {
@@ -1111,6 +1171,7 @@ fn open_two_way(state: &mut AppState) {
                 session_id: id,
                 label: label.clone(),
                 mode: TabMode::TwoWay,
+                paths: vec![a, b],
             });
             state.active = Some(id);
             state.status = format!("Opened 2-way: {label}");
@@ -1160,6 +1221,7 @@ fn open_three_way(state: &mut AppState) {
                 session_id: id,
                 label: label.clone(),
                 mode: TabMode::ThreeWay,
+                paths: vec![base, local, remote],
             });
             state.active = Some(id);
             state.status = format!("Opened 3-way: {label}");

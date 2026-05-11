@@ -43,6 +43,20 @@ pub struct DiffViewState {
     /// Active text selection. `side` is the pane the anchor was set in; the
     /// selection is always confined to that one pane.
     pub selection: Option<Selection>,
+    /// In-place row editor. While `Some`, the corresponding row is rendered
+    /// as an `input_text` widget; Enter commits, Escape cancels.
+    pub editing: Option<EditState>,
+}
+
+#[derive(Clone)]
+pub struct EditState {
+    pub side: Side,
+    pub row_idx: usize,
+    pub line_no: u32,
+    pub buffer: String,
+    /// First-frame flag so we only `set_keyboard_focus_here` once when the
+    /// editor becomes active.
+    pub just_started: bool,
 }
 
 #[derive(Clone)]
@@ -310,6 +324,8 @@ pub fn render(
     // Pane focus event from selection mouse-down. The right pane writes
     // here too — last wins, matching imgui's standard last-clicked focus.
     let focus_event: Cell<Option<crate::app::FocusedPane>> = Cell::new(None);
+    // (side, line_no, new_text) the row editor just produced.
+    let edit_commit: Cell<Option<(Side, u32, String)>> = Cell::new(None);
 
     let avail = ui.content_region_avail();
     let pane_w = ((avail[0] - CONNECTOR_W) * 0.5).max(80.0);
@@ -346,7 +362,9 @@ pub fn render(
                 &left_click,
                 mono_font,
                 &mut state.selection,
+                &mut state.editing,
                 &focus_event,
+                &edit_commit,
             );
         });
 
@@ -377,7 +395,9 @@ pub fn render(
                 &right_click,
                 mono_font,
                 &mut state.selection,
+                &mut state.editing,
                 &focus_event,
+                &edit_commit,
             );
         });
 
@@ -388,6 +408,17 @@ pub fn render(
     if !ui.is_mouse_down(imgui::MouseButton::Left) {
         if let Some(sel) = state.selection.as_mut() {
             sel.dragging = false;
+        }
+    }
+    // Apply any in-place row edit by writing back to the session's A/B
+    // file lines. The diff hunks get recomputed inside SessionStore.
+    if let Some((side, line_no, text)) = edit_commit.take() {
+        let side = match side {
+            Side::Left => crate::session::TwoWaySide::A,
+            Side::Right => crate::session::TwoWaySide::B,
+        };
+        if let Err(e) = store.set_two_way_line(session_id, side, line_no, text) {
+            *status = format!("edit error: {e}");
         }
     }
 
@@ -655,7 +686,9 @@ fn draw_pane(
     click_out: &Cell<Option<u32>>,
     mono_font: Option<FontId>,
     selection: &mut Option<Selection>,
+    editing: &mut Option<EditState>,
     focus_event: &Cell<Option<crate::app::FocusedPane>>,
+    edit_commit: &Cell<Option<(Side, u32, String)>>,
 ) {
     let total = rows.len() as i32;
     if total == 0 {
@@ -667,9 +700,19 @@ fn draw_pane(
     while clipper.step() {
         for i in clipper.display_start()..clipper.display_end() {
             let r = &rows[i as usize];
-            if let Some(clicked_line) =
-                draw_row(ui, r, side, i, anchored, mono_font, &hover, selection, focus_event)
-            {
+            if let Some(clicked_line) = draw_row(
+                ui,
+                r,
+                side,
+                i,
+                anchored,
+                mono_font,
+                &hover,
+                selection,
+                editing,
+                focus_event,
+                edit_commit,
+            ) {
                 click_out.set(Some(clicked_line));
             }
         }
@@ -758,7 +801,8 @@ fn apply_decision(
 
 /// Render a single row using invisible_button for hit-testing + draw list for
 /// visuals. Returns Some(line_no) if the row was right-clicked this frame
-/// (anchor pick). LMB drives selection instead.
+/// (anchor pick). LMB drives selection; double-click switches the row into
+/// an inline editor.
 #[allow(clippy::too_many_arguments)]
 fn draw_row(
     ui: &Ui,
@@ -769,19 +813,98 @@ fn draw_row(
     mono_font: Option<FontId>,
     hover_out: &Cell<Option<(u32, [f32; 2])>>,
     selection: &mut Option<Selection>,
+    editing: &mut Option<EditState>,
     focus_event: &Cell<Option<crate::app::FocusedPane>>,
+    edit_commit: &Cell<Option<(Side, u32, String)>>,
 ) -> Option<u32> {
     let p0 = ui.cursor_screen_pos();
     let row_w = ui.content_region_avail()[0];
     let p1 = [p0[0] + row_w, p0[1] + row_h()];
 
+    // Editing path: if the user is editing THIS row, render an input_text
+    // covering the text area and return early. Selection / hover decoration
+    // stays off this row so it isn't visually confusing.
+    let editing_this = editing
+        .as_ref()
+        .map_or(false, |e| e.side == side && e.row_idx == idx as usize);
+    if editing_this {
+        let _font_tok = mono_font.map(|f| ui.push_font(f));
+        let dl = ui.get_window_draw_list();
+        dl.add_rect(p0, p1, [0.18, 0.22, 0.30, 1.0]).filled(true).build();
+        // Gutter line number stays visible to the left of the editor.
+        let line_text = match row.line_no {
+            Some(n) => format!("{n:>4}"),
+            None => "    ".to_string(),
+        };
+        dl.add_text(
+            [p0[0] + 6.0, p0[1] + 3.0],
+            [0.55, 0.60, 0.70, 1.0],
+            &line_text,
+        );
+        let edit_state = editing.as_mut().unwrap();
+        if edit_state.just_started {
+            ui.set_keyboard_focus_here();
+            edit_state.just_started = false;
+        }
+        ui.set_cursor_screen_pos([p0[0] + gutter_w(), p0[1]]);
+        ui.set_next_item_width(row_w - gutter_w());
+        let _pad = ui.push_style_var(StyleVar::FramePadding([2.0, 1.0]));
+        let id_for_input = format!("##edit_{:?}_{idx}", side);
+        let changed = ui
+            .input_text(id_for_input, &mut edit_state.buffer)
+            .enter_returns_true(true)
+            .build();
+        let active = ui.is_item_active();
+        let deactivated = ui.is_item_deactivated();
+        drop(_pad);
+        drop(_font_tok);
+
+        if changed {
+            edit_commit.set(Some((side, edit_state.line_no, edit_state.buffer.clone())));
+            *editing = None;
+        } else if ui.is_key_pressed(imgui::Key::Escape) {
+            *editing = None;
+        } else if deactivated && !active {
+            // Lost focus without Enter: commit current buffer.
+            edit_commit.set(Some((side, edit_state.line_no, edit_state.buffer.clone())));
+            *editing = None;
+        }
+        // Pin cursor down by exactly row_h() so the layout math (used by
+        // the connector) stays consistent with the non-editing rows.
+        ui.set_cursor_screen_pos([p0[0], p0[1] + row_h()]);
+        return None;
+    }
+
     let id_str = format!("row_{:?}_{idx}", side);
     let _clicked_lmb = ui.invisible_button(id_str, [row_w, row_h()]);
     let hovered = ui.is_item_hovered();
     let activated = ui.is_item_activated();
+    let dbl_click = hovered && ui.is_mouse_double_clicked(imgui::MouseButton::Left);
     let rmb_anchor = hovered && ui.is_mouse_clicked(imgui::MouseButton::Right);
     if hovered && row.is_change {
         hover_out.set(Some((row.hunk_id, p0)));
+    }
+
+    // Double-click starts inline edit on rows that have a real source line.
+    // Equal rows on the left/right map to their respective a/b line; delete
+    // rows have only a; insert rows have only b. We allow editing any row
+    // with a `line_no`.
+    if dbl_click {
+        if let Some(ln) = row.line_no {
+            let text: String = row.segments.iter().map(|s| s.text.as_str()).collect();
+            *editing = Some(EditState {
+                side,
+                row_idx: idx as usize,
+                line_no: ln,
+                buffer: text,
+                just_started: true,
+            });
+            // Clear any in-progress selection so the editor takes over cleanly.
+            *selection = None;
+            focus_event.set(Some(side.as_focused_pane()));
+            // Skip selection-start handling for this frame.
+            return None;
+        }
     }
 
     // Push mono for both text rendering and column hit-testing. calc_text_size
