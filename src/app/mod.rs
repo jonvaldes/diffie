@@ -67,6 +67,9 @@ struct AppState {
     /// Pushed around the diff/merge code rows so columns align character by
     /// character.
     mono_font: Option<FontId>,
+    /// Set by the File > Quit menu / Ctrl+Q shortcut. The event-loop handler
+    /// checks this after each frame and calls `event_loop.exit()`.
+    quit_requested: bool,
 }
 
 impl Default for AppState {
@@ -80,6 +83,7 @@ impl Default for AppState {
             merge_views: HashMap::new(),
             result_panes: HashMap::new(),
             mono_font: None,
+            quit_requested: false,
         }
     }
 }
@@ -258,6 +262,9 @@ impl ApplicationHandler for App {
             }
             WindowEvent::RedrawRequested => {
                 render(gpu, &mut self.state);
+                if self.state.quit_requested {
+                    event_loop.exit();
+                }
             }
             _ => {}
         }
@@ -329,10 +336,21 @@ fn render(gpu: &mut Gpu, state: &mut AppState) {
 // --- UI -------------------------------------------------------------------
 
 fn frame_ui(ui: &imgui::Ui, state: &mut AppState) {
-    let display = ui.io().display_size;
+    keyboard_shortcuts(ui, state);
+    menu_bar(ui, state);
+
+    // Position the root window inside the viewport's "work area" so it sits
+    // below the main menu bar instead of overlapping it. Reading directly
+    // from the sys ImGuiViewport avoids depending on imgui-rs's wrapper
+    // re-export path.
+    let (work_pos, work_size) = unsafe {
+        let vp = imgui::sys::igGetMainViewport();
+        ([(*vp).WorkPos.x, (*vp).WorkPos.y], [(*vp).WorkSize.x, (*vp).WorkSize.y])
+    };
+
     ui.window("Diffie")
-        .position([0.0, 0.0], imgui::Condition::Always)
-        .size(display, imgui::Condition::Always)
+        .position(work_pos, imgui::Condition::Always)
+        .size(work_size, imgui::Condition::Always)
         .flags(
             imgui::WindowFlags::NO_DECORATION
                 | imgui::WindowFlags::NO_MOVE
@@ -346,6 +364,142 @@ fn frame_ui(ui: &imgui::Ui, state: &mut AppState) {
             ui.separator();
             current_session_summary(ui, state);
         });
+}
+
+fn menu_bar(ui: &imgui::Ui, state: &mut AppState) {
+    ui.main_menu_bar(|| {
+        ui.menu("File", || {
+            if ui
+                .menu_item_config("Open 2-way…")
+                .shortcut("Ctrl+O")
+                .build()
+            {
+                open_two_way(state);
+            }
+            if ui
+                .menu_item_config("Open 3-way…")
+                .shortcut("Ctrl+Shift+O")
+                .build()
+            {
+                open_three_way(state);
+            }
+            ui.separator();
+            let has_session = state.active.is_some();
+            if ui
+                .menu_item_config("Save Result As…")
+                .shortcut("Ctrl+S")
+                .enabled(has_session)
+                .build()
+            {
+                save_as(state);
+            }
+            if ui
+                .menu_item_config("Close Tab")
+                .shortcut("Ctrl+W")
+                .enabled(has_session)
+                .build()
+            {
+                close_active_tab(state);
+            }
+            ui.separator();
+            if ui
+                .menu_item_config("Quit")
+                .shortcut("Ctrl+Q")
+                .build()
+            {
+                state.quit_requested = true;
+            }
+        });
+        ui.menu("Edit", || {
+            // Phase 2+ will wire these up to selection/clipboard logic.
+            let _ = ui.menu_item_config("Cut").shortcut("Ctrl+X").enabled(false).build();
+            let _ = ui.menu_item_config("Copy").shortcut("Ctrl+C").enabled(false).build();
+            let _ = ui.menu_item_config("Paste").shortcut("Ctrl+V").enabled(false).build();
+            ui.separator();
+            let _ = ui.menu_item_config("Select All").shortcut("Ctrl+A").enabled(false).build();
+        });
+        ui.menu("View", || {
+            // Font zoom items land in the View-menu phase (atlas rebuild).
+            let _ = ui.menu_item_config("Increase Code Font").shortcut("Ctrl++").enabled(false).build();
+            let _ = ui.menu_item_config("Decrease Code Font").shortcut("Ctrl+-").enabled(false).build();
+            let _ = ui.menu_item_config("Reset Code Font").shortcut("Ctrl+0").enabled(false).build();
+            ui.separator();
+            let multi = state.tabs.len() > 1;
+            if ui
+                .menu_item_config("Next Tab")
+                .shortcut("Ctrl+Tab")
+                .enabled(multi)
+                .build()
+            {
+                cycle_tab(state, 1);
+            }
+            if ui
+                .menu_item_config("Previous Tab")
+                .shortcut("Ctrl+Shift+Tab")
+                .enabled(multi)
+                .build()
+            {
+                cycle_tab(state, -1);
+            }
+        });
+    });
+}
+
+fn keyboard_shortcuts(ui: &imgui::Ui, state: &mut AppState) {
+    use imgui::Key;
+    let io = ui.io();
+    let ctrl = io.key_ctrl;
+    let shift = io.key_shift;
+    if !ctrl {
+        return;
+    }
+    if ui.is_key_pressed(Key::O) {
+        if shift {
+            open_three_way(state);
+        } else {
+            open_two_way(state);
+        }
+    }
+    if !shift && ui.is_key_pressed(Key::S) {
+        save_as(state);
+    }
+    if !shift && ui.is_key_pressed(Key::W) {
+        close_active_tab(state);
+    }
+    if !shift && ui.is_key_pressed(Key::Q) {
+        state.quit_requested = true;
+    }
+    if ui.is_key_pressed(Key::Tab) {
+        cycle_tab(state, if shift { -1 } else { 1 });
+    }
+}
+
+fn close_active_tab(state: &mut AppState) {
+    let Some(id) = state.active else {
+        return;
+    };
+    let idx = state.tabs.iter().position(|t| t.session_id == id);
+    state.tabs.retain(|t| t.session_id != id);
+    state.diff_views.remove(&id);
+    state.merge_views.remove(&id);
+    state.result_panes.remove(&id);
+    state.active = idx
+        .and_then(|i| state.tabs.get(i.min(state.tabs.len().saturating_sub(1))))
+        .map(|t| t.session_id);
+    state.status = format!("closed tab (session {id})");
+}
+
+fn cycle_tab(state: &mut AppState, delta: i32) {
+    if state.tabs.is_empty() {
+        return;
+    }
+    let cur = state
+        .active
+        .and_then(|id| state.tabs.iter().position(|t| t.session_id == id))
+        .unwrap_or(0) as i32;
+    let len = state.tabs.len() as i32;
+    let next = ((cur + delta) % len + len) % len;
+    state.active = Some(state.tabs[next as usize].session_id);
 }
 
 fn tab_bar(ui: &imgui::Ui, state: &mut AppState) {
