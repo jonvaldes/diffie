@@ -27,6 +27,13 @@ gui = [
     "dep:earcutr",
     "dep:arboard",
     "dep:dirs",
+    "dep:undo",
+    "dep:tree-sitter",
+    "dep:tree-sitter-highlight",
+    "dep:tree-sitter-cpp",
+    "dep:tree-sitter-c-sharp",
+    "dep:tree-sitter-hlsl",
+    "dep:tree-sitter-rust",
 ]
 
 [dependencies]
@@ -49,3 +56,10 @@ aetna-fonts-roboto = { version = "0.1", optional = true }
 earcutr = { version = "0.4", optional = true }
 arboard = { version = "3", optional = true }
 dirs = { version = "6", optional = true }
+undo = { version = "0.52", optional = true }
+tree-sitter = { version = "0.26", optional = true }
+tree-sitter-highlight = { version = "0.26", optional = true }
+tree-sitter-cpp = { version = "0.23", optional = true }
+tree-sitter-c-sharp = { version = "0.23", optional = true }
+tree-sitter-hlsl = { version = "0.2", optional = true }
+tree-sitter-rust = { version = "0.24", optional = true }

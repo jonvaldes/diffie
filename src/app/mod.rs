@@ -29,6 +29,9 @@ mod diff_view;
 mod merge_view;
 mod recents;
 mod result_pane;
+mod syntax;
+mod theme;
+mod undo_stack;
 
 const INITIAL_WIDTH: u32 = 1400;
 const INITIAL_HEIGHT: u32 = 900;
@@ -140,6 +143,15 @@ struct AppState {
     /// Recently-opened comparisons (move-to-front, persisted to JSON in
     /// the platform's config dir). Populated from disk in `Default`.
     recents: Vec<recents::RecentEntry>,
+    /// Per-session undo/redo history. Every diff-view mutation
+    /// (line edits, Apply A↔B hunk replacements) is pushed onto the
+    /// matching tab's stack; Edit > Undo / Redo (Ctrl+Z / Ctrl+Shift+Z)
+    /// drive these.
+    undo_stacks: HashMap<SessionId, undo_stack::Stack>,
+    /// Tree-sitter parse cache. Per (SessionId, side) the parser holds onto
+    /// the last source hash + per-line highlight spans so unchanged buffers
+    /// don't re-parse every frame.
+    syntax: syntax::HighlightCache,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -179,6 +191,8 @@ impl Default for AppState {
             pending_keys: Vec::new(),
             font_rebuild_pending: false,
             recents: recents::load(),
+            undo_stacks: HashMap::new(),
+            syntax: syntax::HighlightCache::default(),
         }
     }
 }
@@ -264,6 +278,8 @@ impl ApplicationHandler for App {
         // --- imgui ----------------------------------------------------------
         let mut imgui = Context::create();
         imgui.set_ini_filename(None);
+        theme::apply(&mut imgui);
+        syntax::prime_tables();
         // Cross-platform clipboard via arboard so set/get_clipboard_text on
         // the Ui actually round-trips to the OS clipboard (winit-support
         // doesn't wire this up for us).
@@ -556,6 +572,28 @@ fn menu_bar(ui: &imgui::Ui, state: &mut AppState) {
             let result_focused = matches!(state.focused, Some((_, FocusedPane::Result)));
             let copy_ok = copy_enabled(state) || result_focused;
             let select_all_ok = state.focused.is_some();
+            let (can_undo, can_redo) = state
+                .active
+                .and_then(|id| state.undo_stacks.get(&id))
+                .map(|r| (r.can_undo(), r.can_redo()))
+                .unwrap_or((false, false));
+            if ui
+                .menu_item_config("Undo")
+                .shortcut("Ctrl+Z")
+                .enabled(can_undo)
+                .build()
+            {
+                do_undo(state);
+            }
+            if ui
+                .menu_item_config("Redo")
+                .shortcut("Ctrl+Shift+Z")
+                .enabled(can_redo)
+                .build()
+            {
+                do_redo(state);
+            }
+            ui.separator();
             if ui
                 .menu_item_config("Cut")
                 .shortcut("Ctrl+X")
@@ -716,6 +754,13 @@ fn keyboard_shortcuts(ui: &imgui::Ui, state: &mut AppState) {
         set_code_font_zoom(1.0);
         state.font_rebuild_pending = true;
     }
+    if ui.is_key_pressed(Key::Z) && !result_focused {
+        if shift {
+            do_redo(state);
+        } else {
+            do_undo(state);
+        }
+    }
 }
 
 fn copy_enabled(state: &AppState) -> bool {
@@ -806,6 +851,38 @@ fn inject_pending_key(io: &mut imgui::Io, key: PendingKey) {
     io.add_key_event(Key::ModCtrl, false);
 }
 
+fn do_undo(state: &mut AppState) {
+    let Some(id) = state.active else {
+        return;
+    };
+    let store = &mut state.sessions;
+    let Some(record) = state.undo_stacks.get_mut(&id) else {
+        return;
+    };
+    if record.can_undo() {
+        record.undo(store);
+        state.status = "undone".to_string();
+    } else {
+        state.status = "nothing to undo".to_string();
+    }
+}
+
+fn do_redo(state: &mut AppState) {
+    let Some(id) = state.active else {
+        return;
+    };
+    let store = &mut state.sessions;
+    let Some(record) = state.undo_stacks.get_mut(&id) else {
+        return;
+    };
+    if record.can_redo() {
+        record.redo(store);
+        state.status = "redone".to_string();
+    } else {
+        state.status = "nothing to redo".to_string();
+    }
+}
+
 fn do_select_all(state: &mut AppState) {
     let Some((sid, focused)) = state.focused else {
         return;
@@ -848,6 +925,7 @@ fn close_active_tab(state: &mut AppState) {
     state.diff_views.remove(&id);
     state.merge_views.remove(&id);
     state.result_panes.remove(&id);
+    state.undo_stacks.remove(&id);
     state.active = idx
         .and_then(|i| state.tabs.get(i.min(state.tabs.len().saturating_sub(1))))
         .map(|t| t.session_id);
@@ -882,7 +960,7 @@ fn tab_bar(ui: &imgui::Ui, state: &mut AppState) {
     for tab in &state.tabs {
         let active = state.active == Some(tab.session_id);
         let _col = if active {
-            Some(ui.push_style_color(imgui::StyleColor::Button, [0.30, 0.50, 0.80, 1.0]))
+            Some(ui.push_style_color(imgui::StyleColor::Button, theme::BLUE))
         } else {
             None
         };
@@ -912,6 +990,7 @@ fn tab_bar(ui: &imgui::Ui, state: &mut AppState) {
         state.diff_views.remove(&id);
         state.merge_views.remove(&id);
         state.result_panes.remove(&id);
+        state.undo_stacks.remove(&id);
         if state.active == Some(id) {
             state.active = idx
                 .and_then(|i| state.tabs.get(i.min(state.tabs.len().saturating_sub(1))))
@@ -1041,7 +1120,7 @@ fn current_session_summary(ui: &imgui::Ui, state: &mut AppState) {
         ui.text(format!("Tab: {} (id={})", t.label, t.session_id));
     }
     match &snap.mode {
-        SessionMode::TwoWay { hunks, anchors, .. } => {
+        SessionMode::TwoWay { hunks, anchors, a_lines, b_lines, .. } => {
             anchor_bar_two_way(ui, &state.sessions, id, anchors, &mut state.status);
             ui.separator();
             // 2-way edits the source files directly — there is no separate
@@ -1049,8 +1128,29 @@ fn current_session_summary(ui: &imgui::Ui, state: &mut AppState) {
             let store = &state.sessions;
             let status = &mut state.status;
             let mono = state.mono_font;
+            // Resolve per-side language from the tab's stored file paths,
+            // then compute (or reuse) per-line highlight spans via the
+            // tree-sitter cache.
+            let (a_lang, b_lang) = match tab {
+                Some(t) => (
+                    t.paths.first().and_then(|p| syntax::lang_for_path(p)),
+                    t.paths.get(1).and_then(|p| syntax::lang_for_path(p)),
+                ),
+                None => (None, None),
+            };
+            let a_key = id << 1;
+            let b_key = (id << 1) | 1;
+            let a_highlights = state
+                .syntax
+                .highlights(a_key, a_lang, a_lines)
+                .to_vec();
+            let b_highlights = state
+                .syntax
+                .highlights(b_key, b_lang, b_lines)
+                .to_vec();
             let view_state = state.diff_views.entry(id).or_default();
             let mut focus_request: Option<FocusedPane> = None;
+            let mut pending_edits: Vec<undo_stack::DiffEdit> = Vec::new();
             diff_view::render(
                 ui,
                 store,
@@ -1061,9 +1161,21 @@ fn current_session_summary(ui: &imgui::Ui, state: &mut AppState) {
                 view_state,
                 mono,
                 &mut focus_request,
+                &mut pending_edits,
+                &a_highlights,
+                &b_highlights,
             );
             if let Some(p) = focus_request {
                 state.focused = Some((id, p));
+            }
+            // Apply queued mutations via the per-session undo stack so each
+            // operation is reversible via Edit > Undo / Redo.
+            if !pending_edits.is_empty() {
+                let record = state.undo_stacks.entry(id).or_default();
+                for edit in pending_edits {
+                    record.edit(&mut state.sessions, edit);
+                }
+                state.status = "edited (Ctrl+Z to undo)".to_string();
             }
         }
         SessionMode::ThreeWay { hunks, anchors, .. } => {

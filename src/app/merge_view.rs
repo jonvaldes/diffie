@@ -10,6 +10,7 @@ use std::collections::HashMap;
 
 use imgui::{FontId, ListClipper, StyleVar, Ui};
 
+use super::theme;
 use crate::merge::{MergeAnchor, MergeHunk, Resolution};
 use crate::session::{SessionId, SessionStore};
 
@@ -508,15 +509,15 @@ fn draw_control_overlay(
     dl.add_rect(
         [panel_x, panel_y],
         [panel_x + panel_w, panel_y + panel_h],
-        [0.10, 0.13, 0.18, 0.95],
+        theme::with_alpha(theme::MANTLE, 0.95),
     )
     .filled(true)
     .rounding(4.0)
     .build();
     let border_color = match kind {
-        HunkKind::LocalOnly => [0.15, 0.45, 0.92, 1.0],
-        HunkKind::RemoteOnly => [0.50, 0.30, 0.85, 1.0],
-        HunkKind::Conflict => [0.85, 0.45, 0.15, 1.0],
+        HunkKind::LocalOnly => theme::BLUE,
+        HunkKind::RemoteOnly => theme::MAUVE,
+        HunkKind::Conflict => theme::PEACH,
     };
     dl.add_rect(
         [panel_x, panel_y],
@@ -661,9 +662,9 @@ fn draw_row(
     let bg = match row.cls {
         Cls::Equal => None,
         Cls::Stable => None,
-        Cls::LocalOnly => Some([0.15, 0.30, 0.60, 0.22]),
-        Cls::RemoteOnly => Some([0.40, 0.20, 0.55, 0.22]),
-        Cls::Conflict => Some([0.55, 0.34, 0.10, 0.30]),
+        Cls::LocalOnly => Some(theme::with_alpha(theme::BLUE, 0.22)),
+        Cls::RemoteOnly => Some(theme::with_alpha(theme::MAUVE, 0.22)),
+        Cls::Conflict => Some(theme::with_alpha(theme::PEACH, 0.30)),
     };
     if let Some(bg_rgba) = bg {
         dl.add_rect(p0, p1, bg_rgba).filled(true).build();
@@ -679,21 +680,25 @@ fn draw_row(
                 if r_col > l_col {
                     let sel_x0 = text_start_x + l_col as f32 * char_w;
                     let sel_x1 = text_start_x + r_col as f32 * char_w;
-                    dl.add_rect([sel_x0, p0[1]], [sel_x1, p1[1]], [0.26, 0.59, 0.98, 0.40])
-                        .filled(true)
-                        .build();
+                    dl.add_rect(
+                        [sel_x0, p0[1]],
+                        [sel_x1, p1[1]],
+                        theme::with_alpha(theme::BLUE, 0.40),
+                    )
+                    .filled(true)
+                    .build();
                 }
             }
         }
     }
     let line_text = format!("{:>4}", row.line_no);
     let text_y = p0[1] + 3.0;
-    dl.add_text([p0[0] + 6.0, text_y], [0.55, 0.60, 0.70, 1.0], &line_text);
+    dl.add_text([p0[0] + 6.0, text_y], theme::OVERLAY1, &line_text);
     let fg = match row.cls {
-        Cls::Equal | Cls::Stable => [0.90, 0.92, 0.96, 1.0],
-        Cls::LocalOnly => [0.78, 0.88, 1.0, 1.0],
-        Cls::RemoteOnly => [0.92, 0.80, 1.0, 1.0],
-        Cls::Conflict => [1.0, 0.84, 0.62, 1.0],
+        Cls::Equal | Cls::Stable => theme::TEXT,
+        Cls::LocalOnly => theme::SAPPHIRE,
+        Cls::RemoteOnly => theme::LAVENDER,
+        Cls::Conflict => theme::YELLOW,
     };
     let display = if row.text.is_empty() {
         " "
@@ -822,10 +827,10 @@ fn stroke_bezier_curve(
 
 fn ribbon_color(h: &MergeHunk) -> [f32; 4] {
     match h {
-        MergeHunk::Stable { .. } => [0.55, 0.60, 0.70, 0.10],
-        MergeHunk::LocalOnly { .. } => [0.15, 0.45, 0.92, 0.28],
-        MergeHunk::RemoteOnly { .. } => [0.50, 0.30, 0.85, 0.28],
-        MergeHunk::Conflict { .. } => [0.85, 0.45, 0.15, 0.32],
+        MergeHunk::Stable { .. } => theme::with_alpha(theme::OVERLAY1, 0.10),
+        MergeHunk::LocalOnly { .. } => theme::with_alpha(theme::BLUE, 0.28),
+        MergeHunk::RemoteOnly { .. } => theme::with_alpha(theme::MAUVE, 0.28),
+        MergeHunk::Conflict { .. } => theme::with_alpha(theme::PEACH, 0.32),
     }
 }
 
@@ -881,7 +886,7 @@ fn draw_connector(
             if (ly < band_top && ry < band_top) || (ly > band_bot && ry > band_bot) {
                 continue;
             }
-            stroke_bezier_curve(x_l, x_r, ly, ry, [0.0, 0.0, 0.0, 1.0], 3.0);
+            stroke_bezier_curve(x_l, x_r, ly, ry, theme::CRUST, 3.0);
         }
     });
     // dl is only used inside the closure for clipping; the path ops use

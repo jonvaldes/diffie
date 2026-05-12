@@ -10,6 +10,9 @@ use std::collections::{HashMap, HashSet};
 use imgui::{FontId, ListClipper, StyleVar, Ui};
 
 use super::char_diff::{char_diff, left_segments, right_segments, Segment};
+use super::syntax::LineSpans;
+use super::theme;
+use super::undo_stack::DiffEdit;
 use crate::diff::{Anchor, DiffOp, Hunk};
 use crate::session::{SessionId, SessionStore, TwoWaySide};
 
@@ -43,36 +46,100 @@ pub struct DiffViewState {
     /// Active text selection. `side` is the pane the anchor was set in; the
     /// selection is always confined to that one pane.
     pub selection: Option<Selection>,
-    /// In-place row editor. While `Some`, the corresponding row is rendered
-    /// as an `input_text` widget; Enter commits, Escape cancels.
-    pub editing: Option<EditState>,
+    /// In-progress LMB-down → drag → release. `Some` from the frame an LMB
+    /// press lands inside a pane until the button is released. The selection
+    /// is only created once the drag exceeds a threshold; a press+release
+    /// without movement is just a caret placement and leaves selection `None`.
+    drag: Option<DragState>,
+    /// Arrow-key focus request: when set, the row whose (side, line_no)
+    /// matches grabs keyboard focus on its next render. Driven by Up / Down
+    /// inside an active `input_text` row.
+    pub arrow_focus: Option<(Side, u32)>,
 }
 
-#[derive(Clone)]
-pub struct EditState {
-    pub side: Side,
-    pub row_idx: usize,
+/// One end of a selection. `line_no` is the source-line index on `side` of
+/// the pane that owns the selection (1-based, matching `Row::line_no`). Lines
+/// are stable across diff recomputes, so the selection survives unrelated
+/// edits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SelPoint {
     pub line_no: u32,
-    pub buffer: String,
-    /// First-frame flag so we only `set_keyboard_focus_here` once when the
-    /// editor becomes active.
-    pub just_started: bool,
+    pub col: usize,
 }
 
 #[derive(Clone)]
 pub struct Selection {
     pub side: Side,
-    pub anchor: (usize, usize),
-    pub caret: (usize, usize),
-    pub dragging: bool,
+    pub anchor: SelPoint,
+    pub caret: SelPoint,
 }
 
-pub fn normalize_selection(sel: &Selection) -> (usize, usize, usize, usize) {
+/// Tracks an LMB-held interaction inside a pane. The selection is only
+/// materialized (`state.selection = Some(...)`) once `threshold_passed` flips
+/// true, so a plain click → release never produces a selection.
+struct DragState {
+    side: Side,
+    anchor: SelPoint,
+    press_screen: [f32; 2],
+    threshold_passed: bool,
+}
+
+/// Build a `SpliceTwoWayLines` edit that deletes the text covered by `sel`
+/// from the corresponding source side. For a multi-line selection the
+/// boundary lines' kept-content is merged into a single replacement line, so
+/// `Delete` on the selection collapses the lines exactly the way a normal
+/// text editor would. Returns `None` if the selection is zero-width or refers
+/// to lines that no longer exist in the source.
+fn build_selection_splice(
+    snap: &crate::session::DiffSession,
+    sel: &Selection,
+    session_id: SessionId,
+) -> Option<DiffEdit> {
+    let crate::session::SessionMode::TwoWay { a_lines, b_lines, .. } = &snap.mode else {
+        return None;
+    };
+    let (lo, hi) = ordered_endpoints(sel);
+    let source = match sel.side {
+        Side::Left => a_lines,
+        Side::Right => b_lines,
+    };
+    let s_idx = lo.line_no.checked_sub(1)? as usize;
+    let e_idx = hi.line_no.checked_sub(1)? as usize;
+    if s_idx >= source.len() || e_idx >= source.len() {
+        return None;
+    }
+    let first_chars: Vec<char> = source[s_idx].chars().collect();
+    let last_chars: Vec<char> = source[e_idx].chars().collect();
+    let s_col = lo.col.min(first_chars.len());
+    let e_col = hi.col.min(last_chars.len());
+    if lo.line_no == hi.line_no && s_col == e_col {
+        return None;
+    }
+    let mut merged = String::new();
+    merged.extend(first_chars[..s_col].iter());
+    merged.extend(last_chars[e_col..].iter());
+    let two_way = match sel.side {
+        Side::Left => TwoWaySide::A,
+        Side::Right => TwoWaySide::B,
+    };
+    Some(DiffEdit::SpliceTwoWayLines {
+        session_id,
+        side: two_way,
+        start: s_idx,
+        end: e_idx + 1,
+        replacement: vec![merged],
+        old_target_lines: None,
+    })
+}
+
+/// Return the selection's endpoints in document order (top-most, then
+/// bottom-most). For a single-line selection ties break by column.
+pub fn ordered_endpoints(sel: &Selection) -> (SelPoint, SelPoint) {
     let (a, b) = (sel.anchor, sel.caret);
-    if a.0 < b.0 || (a.0 == b.0 && a.1 <= b.1) {
-        (a.0, a.1, b.0, b.1)
+    if a.line_no < b.line_no || (a.line_no == b.line_no && a.col <= b.col) {
+        (a, b)
     } else {
-        (b.0, b.1, a.0, a.1)
+        (b, a)
     }
 }
 
@@ -85,57 +152,56 @@ impl Side {
     }
 }
 
-/// Build the pane's text for `sel.side` and slice out the selected range.
-/// Returns an empty string if the session isn't 2-way or the selection
-/// references rows that no longer exist (e.g. after a hunk recompute).
+/// Build the source text for `sel.side` and slice out the selected range
+/// directly from the line vector (no row mapping needed — line_no is the key).
 pub fn extract_selection_text(snap: &crate::session::DiffSession, sel: &Selection) -> String {
-    let crate::session::SessionMode::TwoWay { hunks, .. } = &snap.mode else {
+    let crate::session::SessionMode::TwoWay { a_lines, b_lines, .. } = &snap.mode else {
         return String::new();
     };
-    let pane = build_pane(hunks, sel.side);
-    if pane.rows.is_empty() {
+    let source = match sel.side {
+        Side::Left => a_lines,
+        Side::Right => b_lines,
+    };
+    if source.is_empty() {
         return String::new();
     }
-    let (s_row, s_col, e_row, e_col) = normalize_selection(sel);
-    let last = pane.rows.len() - 1;
-    let s_row = s_row.min(last);
-    let e_row = e_row.min(last);
+    let (lo, hi) = ordered_endpoints(sel);
+    let s_idx = (lo.line_no.saturating_sub(1) as usize).min(source.len() - 1);
+    let e_idx = (hi.line_no.saturating_sub(1) as usize).min(source.len() - 1);
     let mut out = String::new();
-    for r in s_row..=e_row {
-        let row = &pane.rows[r];
-        let line: String = row.segments.iter().map(|s| s.text.as_str()).collect();
-        let chars: Vec<char> = line.chars().collect();
-        let l = if r == s_row { s_col } else { 0 }.min(chars.len());
-        let h = if r == e_row { e_col } else { chars.len() }.min(chars.len());
+    for i in s_idx..=e_idx {
+        let chars: Vec<char> = source[i].chars().collect();
+        let l = if i == s_idx { lo.col } else { 0 }.min(chars.len());
+        let h = if i == e_idx { hi.col } else { chars.len() }.min(chars.len());
         out.extend(chars[l..h].iter());
-        if r < e_row {
+        if i < e_idx {
             out.push('\n');
         }
     }
     out
 }
 
-/// Select all rows on `side` for the active diff session. Returns a
-/// `Selection` the caller can drop into `DiffViewState.selection`.
+/// Select all of `side` in the active diff session.
 pub fn select_all(snap: &crate::session::DiffSession, side: Side) -> Option<Selection> {
-    let crate::session::SessionMode::TwoWay { hunks, .. } = &snap.mode else {
+    let crate::session::SessionMode::TwoWay { a_lines, b_lines, .. } = &snap.mode else {
         return None;
     };
-    let pane = build_pane(hunks, side);
-    if pane.rows.is_empty() {
+    let source = match side {
+        Side::Left => a_lines,
+        Side::Right => b_lines,
+    };
+    if source.is_empty() {
         return None;
     }
-    let last_idx = pane.rows.len() - 1;
-    let last_chars: usize = pane.rows[last_idx]
-        .segments
-        .iter()
-        .map(|s| s.text.chars().count())
-        .sum();
+    let last_idx = source.len() - 1;
+    let last_chars = source[last_idx].chars().count();
     Some(Selection {
         side,
-        anchor: (0, 0),
-        caret: (last_idx, last_chars),
-        dragging: false,
+        anchor: SelPoint { line_no: 1, col: 0 },
+        caret: SelPoint {
+            line_no: (last_idx as u32) + 1,
+            col: last_chars,
+        },
     })
 }
 
@@ -309,6 +375,7 @@ fn build_pane(hunks: &[Hunk], side: Side) -> Pane {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 pub fn render(
     ui: &Ui,
     store: &SessionStore,
@@ -319,6 +386,9 @@ pub fn render(
     state: &mut DiffViewState,
     mono_font: Option<FontId>,
     focus_request: &mut Option<crate::app::FocusedPane>,
+    pending_edits: &mut Vec<DiffEdit>,
+    a_highlights: &[LineSpans],
+    b_highlights: &[LineSpans],
 ) {
     let left = build_pane(hunks, Side::Left);
     let right = build_pane(hunks, Side::Right);
@@ -334,8 +404,14 @@ pub fn render(
     // Pane focus event from selection mouse-down. The right pane writes
     // here too — last wins, matching imgui's standard last-clicked focus.
     let focus_event: Cell<Option<crate::app::FocusedPane>> = Cell::new(None);
-    // (side, line_no, new_text) the row editor just produced.
-    let edit_commit: Cell<Option<(Side, u32, String)>> = Cell::new(None);
+    // Structural-line request from the inline editor (Backspace/Delete on an
+    // empty buffer ⇒ remove that line). Drained into `pending_edits` after
+    // both panes render.
+    let line_remove: Cell<Option<DiffEdit>> = Cell::new(None);
+    // Up/Down arrow focus handoff between row input_texts. Seeded from
+    // `state.arrow_focus` so a request set last frame survives; consumed by
+    // whichever row matches and re-set by an active row that sees Up/Down.
+    let arrow_focus_cell: Cell<Option<(Side, u32)>> = Cell::new(state.arrow_focus.take());
 
     let avail = ui.content_region_avail();
     let pane_w = ((avail[0] - CONNECTOR_W) * 0.5).max(80.0);
@@ -346,18 +422,87 @@ pub fn render(
     let right_origin = Cell::new([0.0_f32, 0.0_f32]);
     let left_visible = Cell::new(avail[1]);
     let right_visible = Cell::new(avail[1]);
+    // First row's `calc_text_size("m")` under the mono font lands here; the
+    // central selection handler needs it to map mouse x to a column.
+    let char_w_cell: Cell<f32> = Cell::new(0.0);
 
-    let apply_left = state.pending_left.take();
-    let apply_right = state.pending_right.take();
+    let drag_active_side = state.drag.as_ref().map(|d| d.side);
 
+    let frame_selection = state.selection.clone();
+
+    // Same-frame scroll sync. The mouse-wheel input is normally consumed by
+    // imgui's NewFrame and applied to the hovered child window's `Scroll`
+    // field. We pre-compute the resulting scroll for the driver pane, run
+    // `target_scroll` to derive the follower's matching position, then
+    // push both via `igSetNextWindowScroll` — which is consumed during
+    // each child's `Begin` *this* frame, so the two panes land in sync
+    // without the one-frame lag the old `pending_X` → `set_scroll_y`-inside-
+    // closure round-trip produced. Non-wheel scroll changes (scrollbar
+    // drag, programmatic) still go through the existing `pending_X` path
+    // and incur the same one-frame delay they always have.
+    let panes_origin = ui.cursor_screen_pos();
+    let left_x0 = panes_origin[0];
+    let left_x1 = left_x0 + pane_w;
+    let right_x0 = left_x1 + CONNECTOR_W;
+    let right_x1 = right_x0 + pane_w;
+    let pane_top = panes_origin[1];
+    let pane_bot = panes_origin[1] + avail[1];
+    let mouse_pos = ui.io().mouse_pos;
+    let wheel = ui.io().mouse_wheel;
+    let wheel_step = ui.text_line_height_with_spacing() * 5.0;
+    let max_left = (left.rows.len() as f32 * row_h() - avail[1]).max(0.0);
+    let max_right = (right.rows.len() as f32 * row_h() - avail[1]).max(0.0);
+
+    let in_left = mouse_pos[0] >= left_x0
+        && mouse_pos[0] < left_x1
+        && mouse_pos[1] >= pane_top
+        && mouse_pos[1] < pane_bot;
+    let in_right = mouse_pos[0] >= right_x0
+        && mouse_pos[0] < right_x1
+        && mouse_pos[1] >= pane_top
+        && mouse_pos[1] < pane_bot;
+
+    let (wheel_left_target, wheel_right_target): (Option<f32>, Option<f32>) =
+        if wheel.abs() > 1e-3 && in_left {
+            let new_left = (state.last_left - wheel * wheel_step).clamp(0.0, max_left);
+            let t_right = target_scroll(
+                new_left,
+                avail[1],
+                avail[1],
+                &left.ranges,
+                &right.ranges,
+            )
+            .map(|t| t.clamp(0.0, max_right));
+            (Some(new_left), t_right)
+        } else if wheel.abs() > 1e-3 && in_right {
+            let new_right = (state.last_right - wheel * wheel_step).clamp(0.0, max_right);
+            let t_left = target_scroll(
+                new_right,
+                avail[1],
+                avail[1],
+                &right.ranges,
+                &left.ranges,
+            )
+            .map(|t| t.clamp(0.0, max_left));
+            (t_left, Some(new_right))
+        } else {
+            (None, None)
+        };
+
+    // Wheel overrides pending; pending applies for non-wheel-driven syncs.
+    let apply_left = wheel_left_target.or_else(|| state.pending_left.take());
+    let apply_right = wheel_right_target.or_else(|| state.pending_right.take());
+
+    if let Some(y) = apply_left {
+        unsafe {
+            imgui::sys::igSetNextWindowScroll(imgui::sys::ImVec2 { x: -1.0, y });
+        }
+        state.written_left = Some(y);
+    }
     ui.child_window("diffie_left")
         .size([pane_w, avail[1]])
         .border(true)
         .build(|| {
-            if let Some(y) = apply_left {
-                ui.set_scroll_y(y);
-                state.written_left = Some(y);
-            }
             left_scroll.set(ui.scroll_y());
             left_origin.set(ui.cursor_screen_pos());
             left_visible.set(ui.content_region_avail()[1]);
@@ -365,16 +510,18 @@ pub fn render(
                 ui,
                 &left.rows,
                 Side::Left,
-                store,
                 session_id,
-                status,
                 &anchored_a,
                 &left_click,
                 mono_font,
-                &mut state.selection,
-                &mut state.editing,
+                frame_selection.as_ref(),
                 &focus_event,
-                &edit_commit,
+                &line_remove,
+                pending_edits,
+                &arrow_focus_cell,
+                drag_active_side,
+                &char_w_cell,
+                a_highlights,
             );
         });
 
@@ -383,14 +530,16 @@ pub fn render(
     ui.dummy([CONNECTOR_W, avail[1]]);
     ui.same_line_with_spacing(0.0, 0.0);
 
+    if let Some(y) = apply_right {
+        unsafe {
+            imgui::sys::igSetNextWindowScroll(imgui::sys::ImVec2 { x: -1.0, y });
+        }
+        state.written_right = Some(y);
+    }
     ui.child_window("diffie_right")
         .size([pane_w, avail[1]])
         .border(true)
         .build(|| {
-            if let Some(y) = apply_right {
-                ui.set_scroll_y(y);
-                state.written_right = Some(y);
-            }
             right_scroll.set(ui.scroll_y());
             right_origin.set(ui.cursor_screen_pos());
             right_visible.set(ui.content_region_avail()[1]);
@@ -398,38 +547,93 @@ pub fn render(
                 ui,
                 &right.rows,
                 Side::Right,
-                store,
                 session_id,
-                status,
                 &anchored_b,
                 &right_click,
                 mono_font,
-                &mut state.selection,
-                &mut state.editing,
+                frame_selection.as_ref(),
                 &focus_event,
-                &edit_commit,
+                &line_remove,
+                pending_edits,
+                &arrow_focus_cell,
+                drag_active_side,
+                &char_w_cell,
+                b_highlights,
             );
         });
 
     if let Some(p) = focus_event.get() {
         *focus_request = Some(p);
     }
-    // Clear drag flag once the mouse button is released anywhere.
-    if !ui.is_mouse_down(imgui::MouseButton::Left) {
-        if let Some(sel) = state.selection.as_mut() {
-            sel.dragging = false;
+    // Persist any unconsumed arrow-focus request for the next frame (the
+    // target row may not have been visible this frame).
+    state.arrow_focus = arrow_focus_cell.take();
+    if let Some(edit) = line_remove.take() {
+        pending_edits.push(edit);
+    }
+
+    update_selection(
+        ui,
+        state,
+        &left,
+        &right,
+        left_origin.get(),
+        right_origin.get(),
+        left_visible.get(),
+        right_visible.get(),
+        pane_w,
+        char_w_cell.get(),
+        focus_request,
+    );
+
+    // Selection + Delete/Backspace ⇒ splice the selected range out of the
+    // source side. We bypass `want_capture_keyboard` so a focused row's
+    // input_text doesn't swallow Delete when a multi-line selection exists.
+    //
+    // The focused row's input_text will have *already* processed the same
+    // Backspace this frame, queuing its own `SetTwoWayLine` for line 1 (the
+    // active row) into `pending_edits`. That edit refers to a line we're
+    // about to splice out, so we drop it before pushing the Splice — this
+    // collapses the deletion into a single undo entry whose snapshot
+    // reflects the true pre-keystroke state.
+    let key_pressed = ui.is_key_pressed(imgui::Key::Delete)
+        || ui.is_key_pressed(imgui::Key::Backspace);
+    if key_pressed {
+        if let Some(sel) = state.selection.as_ref().cloned() {
+            if let Ok(snap) = store.snapshot(session_id) {
+                if let Some(edit) = build_selection_splice(&snap, &sel, session_id) {
+                    let (lo, hi) = ordered_endpoints(&sel);
+                    let sel_side: TwoWaySide = match sel.side {
+                        Side::Left => TwoWaySide::A,
+                        Side::Right => TwoWaySide::B,
+                    };
+                    pending_edits.retain(|e| match e {
+                        DiffEdit::SetTwoWayLine {
+                            session_id: e_sid,
+                            side: e_side,
+                            line_no,
+                            ..
+                        } => !(*e_sid == session_id
+                            && *e_side == sel_side
+                            && *line_no >= lo.line_no
+                            && *line_no <= hi.line_no),
+                        _ => true,
+                    });
+                    pending_edits.push(edit);
+                    state.selection = None;
+                }
+            }
         }
     }
-    // Apply any in-place row edit by writing back to the session's A/B
-    // file lines. The diff hunks get recomputed inside SessionStore.
-    if let Some((side, line_no, text)) = edit_commit.take() {
-        let side = match side {
-            Side::Left => crate::session::TwoWaySide::A,
-            Side::Right => crate::session::TwoWaySide::B,
-        };
-        if let Err(e) = store.set_two_way_line(session_id, side, line_no, text) {
-            *status = format!("edit error: {e}");
-        }
+
+    // Any structural edit invalidates line numbers the selection refers to.
+    if pending_edits.iter().any(|e| {
+        matches!(
+            e,
+            DiffEdit::SpliceTwoWayLines { .. } | DiffEdit::ReplaceHunkSide { .. }
+        )
+    }) {
+        state.selection = None;
     }
 
     handle_anchor_clicks(
@@ -463,6 +667,165 @@ pub fn render(
     );
 }
 
+/// Single owner of the selection state machine. Reads frame-global mouse
+/// events plus the captured pane geometry and decides what `state.selection`
+/// and `state.drag` look like at the end of this frame.
+///
+/// Transitions:
+/// - LMB-just-clicked inside a pane: clear selection (or extend if Shift+click
+///   matches existing selection's side) and arm a `DragState`.
+/// - LMB-just-clicked outside both panes: clear selection and disarm.
+/// - LMB-held with `DragState` armed: once the move exceeds 4 px, materialize
+///   the selection. Every subsequent frame re-computes the caret from the
+///   current mouse position (clamped to the drag-side pane's visible band).
+/// - LMB-released: disarm `DragState` (selection persists).
+#[allow(clippy::too_many_arguments)]
+fn update_selection(
+    ui: &Ui,
+    state: &mut DiffViewState,
+    left: &Pane,
+    right: &Pane,
+    left_origin: [f32; 2],
+    right_origin: [f32; 2],
+    left_visible_h: f32,
+    right_visible_h: f32,
+    pane_w: f32,
+    char_w: f32,
+    focus_request: &mut Option<crate::app::FocusedPane>,
+) {
+    if char_w <= 0.0 {
+        // No rows rendered this frame — nothing to do (and we couldn't compute
+        // a column anyway).
+        return;
+    }
+    let pane_bounds = |side: Side| -> ([f32; 2], f32) {
+        match side {
+            Side::Left => (left_origin, left_visible_h),
+            Side::Right => (right_origin, right_visible_h),
+        }
+    };
+    let rows_for = |side: Side| -> &[Row] {
+        match side {
+            Side::Left => &left.rows,
+            Side::Right => &right.rows,
+        }
+    };
+
+    // `origin[1]` is the screen y of content_y=0 *after* scroll, so the
+    // visible band on screen is [origin[1], origin[1] + visible_h). Any mouse
+    // position inside (origin[0]..origin[0]+pane_w, origin[1]..origin[1]+visible_h)
+    // maps to a row via `(mouse_y - origin[1]) / row_h()`.
+    let locate = |pos: [f32; 2]| -> Option<(Side, SelPoint)> {
+        for side in [Side::Left, Side::Right] {
+            let (origin, visible_h) = pane_bounds(side);
+            if pos[0] < origin[0] || pos[0] >= origin[0] + pane_w {
+                continue;
+            }
+            let dy = pos[1] - origin[1];
+            if dy < 0.0 || dy >= visible_h {
+                continue;
+            }
+            let rows = rows_for(side);
+            let row_idx = (dy / row_h()) as usize;
+            if row_idx >= rows.len() {
+                continue;
+            }
+            let row = &rows[row_idx];
+            let line_no = row.line_no?;
+            let char_count: usize = row.segments.iter().map(|s| s.text.chars().count()).sum();
+            let text_x0 = origin[0] + gutter_w();
+            let raw = ((pos[0] - text_x0) / char_w).round();
+            let col = raw.clamp(0.0, char_count as f32) as usize;
+            return Some((side, SelPoint { line_no, col }));
+        }
+        None
+    };
+
+    let lmb_clicked = ui.is_mouse_clicked(imgui::MouseButton::Left);
+    let lmb_held = ui.is_mouse_down(imgui::MouseButton::Left);
+
+    if lmb_clicked {
+        let press = ui.io().mouse_pos;
+        match locate(press) {
+            Some((side, point)) => {
+                let shift = ui.io().key_shift;
+                let extend = shift
+                    && state
+                        .selection
+                        .as_ref()
+                        .map_or(false, |s| s.side == side);
+                if extend {
+                    let sel = state.selection.as_mut().unwrap();
+                    sel.caret = point;
+                    state.drag = Some(DragState {
+                        side,
+                        anchor: sel.anchor,
+                        press_screen: press,
+                        threshold_passed: true,
+                    });
+                } else {
+                    state.selection = None;
+                    state.drag = Some(DragState {
+                        side,
+                        anchor: point,
+                        press_screen: press,
+                        threshold_passed: false,
+                    });
+                }
+                *focus_request = Some(side.as_focused_pane());
+            }
+            None => {
+                state.selection = None;
+                state.drag = None;
+            }
+        }
+    }
+
+    // Drag tick: extend the caret to the current mouse position while held.
+    if let Some(drag) = state.drag.as_mut() {
+        if !lmb_held {
+            state.drag = None;
+        } else {
+            let pos = ui.io().mouse_pos;
+            if !drag.threshold_passed {
+                let dx = pos[0] - drag.press_screen[0];
+                let dy = pos[1] - drag.press_screen[1];
+                if (dx * dx + dy * dy).sqrt() >= 4.0 {
+                    drag.threshold_passed = true;
+                }
+            }
+            if drag.threshold_passed {
+                let side = drag.side;
+                let (origin, visible_h) = pane_bounds(side);
+                let rows = rows_for(side);
+                if !rows.is_empty() {
+                    // Clamp the mouse to the drag-side pane so the caret keeps
+                    // tracking even when the mouse leaves the pane.
+                    let clamped_x = pos[0].clamp(origin[0] + gutter_w(), origin[0] + pane_w - 1.0);
+                    let clamped_y = pos[1]
+                        .clamp(origin[1], origin[1] + visible_h - 1.0)
+                        .max(origin[1]);
+                    let row_idx = ((clamped_y - origin[1]) / row_h()) as usize;
+                    let row_idx = row_idx.min(rows.len() - 1);
+                    let row = &rows[row_idx];
+                    if let Some(line_no) = row.line_no {
+                        let char_count: usize =
+                            row.segments.iter().map(|s| s.text.chars().count()).sum();
+                        let raw = ((clamped_x - (origin[0] + gutter_w())) / char_w).round();
+                        let col = raw.clamp(0.0, char_count as f32) as usize;
+                        let caret = SelPoint { line_no, col };
+                        state.selection = Some(Selection {
+                            side,
+                            anchor: drag.anchor,
+                            caret,
+                        });
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn handle_anchor_clicks(
     store: &SessionStore,
     session_id: SessionId,
@@ -491,9 +854,9 @@ fn handle_anchor_clicks(
 
 fn ribbon_color(is_change: bool) -> [f32; 4] {
     if is_change {
-        [0.42, 0.66, 1.0, 0.28]
+        theme::with_alpha(theme::BLUE, 0.28)
     } else {
-        [0.55, 0.60, 0.70, 0.10]
+        theme::with_alpha(theme::OVERLAY1, 0.10)
     }
 }
 
@@ -679,7 +1042,7 @@ fn draw_connector(
             if (ly < band_top && ry < band_top) || (ly > band_bot && ry > band_bot) {
                 continue;
             }
-            stroke_bezier_curve(x_l, x_r, ly, ry, [0.0, 0.0, 0.0, 1.0], 3.0);
+            stroke_bezier_curve(x_l, x_r, ly, ry, theme::CRUST, 3.0);
         }
     });
 }
@@ -689,16 +1052,18 @@ fn draw_pane(
     ui: &Ui,
     rows: &[Row],
     side: Side,
-    store: &SessionStore,
     session_id: SessionId,
-    status: &mut String,
     anchored: &HashSet<u32>,
     click_out: &Cell<Option<u32>>,
     mono_font: Option<FontId>,
-    selection: &mut Option<Selection>,
-    editing: &mut Option<EditState>,
+    selection: Option<&Selection>,
     focus_event: &Cell<Option<crate::app::FocusedPane>>,
-    edit_commit: &Cell<Option<(Side, u32, String)>>,
+    line_remove: &Cell<Option<DiffEdit>>,
+    pending_edits: &mut Vec<DiffEdit>,
+    arrow_focus: &Cell<Option<(Side, u32)>>,
+    drag_active: Option<Side>,
+    char_w_out: &Cell<f32>,
+    highlights: &[LineSpans],
 ) {
     let total = rows.len() as i32;
     if total == 0 {
@@ -717,18 +1082,27 @@ fn draw_pane(
     while clipper.step() {
         for i in clipper.display_start()..clipper.display_end() {
             let r = &rows[i as usize];
+            let line_hl = r
+                .line_no
+                .and_then(|ln| highlights.get((ln as usize).saturating_sub(1)))
+                .map(|v| v.as_slice())
+                .unwrap_or(&[]);
             if let Some(clicked_line) = draw_row(
                 ui,
                 r,
                 side,
                 i,
+                session_id,
                 anchored,
                 mono_font,
                 &hover,
                 selection,
-                editing,
                 focus_event,
-                edit_commit,
+                line_remove,
+                pending_edits,
+                arrow_focus,
+                char_w_out,
+                line_hl,
             ) {
                 click_out.set(Some(clicked_line));
             }
@@ -736,56 +1110,33 @@ fn draw_pane(
     }
     drop(_spacing);
 
-    // Drag auto-scroll: while LMB is held and the mouse is past the pane's
-    // visible band, scroll proportionally and extend the caret to the new
-    // boundary so the selection keeps tracking the mouse.
-    if let Some(sel) = selection.as_mut() {
-        if sel.dragging
-            && sel.side == side
-            && ui.is_mouse_down(imgui::MouseButton::Left)
-        {
-            let mouse_y = ui.io().mouse_pos[1];
-            let pane_top = pane_origin[1] + cur_scroll;
-            let pane_bot = pane_top + visible_h;
-            let max_scroll = (rows.len() as f32 * row_h() - visible_h).max(0.0);
-            let new_scroll = if mouse_y < pane_top {
-                let dist = (pane_top - mouse_y).min(160.0);
-                let speed = 8.0 + dist * 0.5;
-                Some((cur_scroll - speed).max(0.0))
-            } else if mouse_y > pane_bot {
-                let dist = (mouse_y - pane_bot).min(160.0);
-                let speed = 8.0 + dist * 0.5;
-                Some((cur_scroll + speed).min(max_scroll))
-            } else {
-                None
-            };
-            if let Some(s) = new_scroll {
-                ui.set_scroll_y(s);
-                // Snap the caret to the row that will be at the relevant edge
-                // after scrolling, with column 0 going up and end-of-line
-                // going down — mirrors how text editors extend selection
-                // during edge-drag.
-                if mouse_y < pane_top {
-                    let row_idx = ((s / row_h()) as usize).min(rows.len().saturating_sub(1));
-                    sel.caret = (row_idx, 0);
-                } else {
-                    let bot_content = s + visible_h;
-                    let row_idx = ((bot_content / row_h()) as usize)
-                        .saturating_sub(1)
-                        .min(rows.len().saturating_sub(1));
-                    let last_col: usize = rows[row_idx]
-                        .segments
-                        .iter()
-                        .map(|seg| seg.text.chars().count())
-                        .sum();
-                    sel.caret = (row_idx, last_col);
-                }
-            }
+    // Drag auto-scroll: while a drag is live on this side and the mouse is
+    // past the pane's visible band, scroll proportionally. The selection
+    // caret advances on its own via `update_selection`, which clamps the
+    // mouse to the visible band and re-computes the caret each frame.
+    if drag_active == Some(side) && ui.is_mouse_down(imgui::MouseButton::Left) {
+        let mouse_y = ui.io().mouse_pos[1];
+        let pane_top = pane_origin[1] + cur_scroll;
+        let pane_bot = pane_top + visible_h;
+        let max_scroll = (rows.len() as f32 * row_h() - visible_h).max(0.0);
+        let new_scroll = if mouse_y < pane_top {
+            let dist = (pane_top - mouse_y).min(160.0);
+            let speed = 8.0 + dist * 0.5;
+            Some((cur_scroll - speed).max(0.0))
+        } else if mouse_y > pane_bot {
+            let dist = (mouse_y - pane_bot).min(160.0);
+            let speed = 8.0 + dist * 0.5;
+            Some((cur_scroll + speed).min(max_scroll))
+        } else {
+            None
+        };
+        if let Some(s) = new_scroll {
+            ui.set_scroll_y(s);
         }
     }
 
     if let Some((hunk_id, pos)) = hover.get() {
-        draw_control_overlay(ui, store, session_id, hunk_id, status, pos);
+        draw_control_overlay(ui, session_id, hunk_id, pos, pending_edits);
     }
 }
 
@@ -794,11 +1145,10 @@ fn draw_pane(
 /// to an absolute screen position and we ignore the cursor advance afterwards.
 fn draw_control_overlay(
     ui: &Ui,
-    store: &SessionStore,
     session_id: SessionId,
     hunk_id: u32,
-    status: &mut String,
     pos: [f32; 2],
+    pending_edits: &mut Vec<DiffEdit>,
 ) {
     let _pad = ui.push_style_var(StyleVar::FramePadding([6.0, 2.0]));
     let _spacing = ui.push_style_var(StyleVar::ItemSpacing([4.0, 0.0]));
@@ -812,7 +1162,7 @@ fn draw_control_overlay(
     dl.add_rect(
         [panel_x, panel_y],
         [panel_x + panel_w, panel_y + panel_h],
-        [0.10, 0.13, 0.18, 0.95],
+        theme::with_alpha(theme::MANTLE, 0.95),
     )
     .filled(true)
     .rounding(4.0)
@@ -820,7 +1170,7 @@ fn draw_control_overlay(
     dl.add_rect(
         [panel_x, panel_y],
         [panel_x + panel_w, panel_y + panel_h],
-        [0.42, 0.66, 1.0, 1.0],
+        theme::BLUE,
     )
     .rounding(4.0)
     .thickness(1.0)
@@ -828,125 +1178,133 @@ fn draw_control_overlay(
 
     ui.set_cursor_screen_pos([panel_x + 6.0, panel_y + 3.0]);
     // 2-way edit mode: these copy this hunk's content from one side to the
-    // other, directly modifying the underlying file lines.
+    // other. Queued onto the undo stack so the operation is reversible.
     if ui.small_button(format!("Apply A → B##ov{hunk_id}_atob")) {
-        apply_replace(store, session_id, hunk_id, TwoWaySide::B, status);
+        pending_edits.push(DiffEdit::ReplaceHunkSide {
+            session_id,
+            hunk_id,
+            target: TwoWaySide::B,
+            old_target_lines: None,
+        });
     }
     ui.same_line();
     if ui.small_button(format!("B → A##ov{hunk_id}_btoa")) {
-        apply_replace(store, session_id, hunk_id, TwoWaySide::A, status);
+        pending_edits.push(DiffEdit::ReplaceHunkSide {
+            session_id,
+            hunk_id,
+            target: TwoWaySide::A,
+            old_target_lines: None,
+        });
     }
 }
 
-fn apply_replace(
-    store: &SessionStore,
-    session_id: SessionId,
-    hunk_id: u32,
-    target: TwoWaySide,
-    status: &mut String,
+/// Render a single row. The text area is an always-live `input_text` so
+/// Paint a row's text via the draw list, picking foreground colors from the
+/// startup-computed `ColorTable` for the right background. Char positions
+/// covered by a `seg.hl=true` segment on a Delete/Insert row use the
+/// red/green table; everything else uses the normal table.
+///
+/// Adjacent chars that resolve to the same color are coalesced into a single
+/// `add_text` call so unchanged stretches don't pay per-char overhead.
+fn paint_row_text(
+    dl: &imgui::DrawListMut<'_>,
+    segments: &[Segment],
+    origin: [f32; 2],
+    char_w: f32,
+    spans: &[super::syntax::LineSpan],
+    row_cls: Cls,
 ) {
-    let label = match target {
-        TwoWaySide::A => "A ← B",
-        TwoWaySide::B => "A → B",
-    };
-    match store.replace_hunk_side(session_id, hunk_id, target) {
-        Ok(()) => *status = format!("hunk {hunk_id}: {label}"),
-        Err(e) => *status = format!("hunk {hunk_id}: {e}"),
+    // Flatten segments into char buffer + parallel hl mask.
+    let mut chars: Vec<char> = Vec::new();
+    let mut hl_mask: Vec<bool> = Vec::new();
+    for seg in segments {
+        for c in seg.text.chars() {
+            chars.push(c);
+            hl_mask.push(seg.hl);
+        }
     }
+    let n = chars.len();
+    if n == 0 {
+        return;
+    }
+
+    // Per-char syntax kind, filled from spans (non-overlapping, sorted).
+    let mut kind_at: Vec<Option<super::syntax::SyntaxKind>> = vec![None; n];
+    for s in spans {
+        let start = s.start_col.min(n);
+        let end = s.end_col.min(n).max(start);
+        for c in start..end {
+            kind_at[c] = Some(s.kind);
+        }
+    }
+
+    let table_at = |c: usize| -> &'static super::syntax::ColorTable {
+        let bg = match (row_cls, hl_mask[c]) {
+            (Cls::Equal, _) => super::syntax::HlBg::None,
+            (Cls::Delete, false) => super::syntax::HlBg::DeleteRow,
+            (Cls::Delete, true) => super::syntax::HlBg::DeleteHl,
+            (Cls::Insert, false) => super::syntax::HlBg::InsertRow,
+            (Cls::Insert, true) => super::syntax::HlBg::InsertHl,
+        };
+        super::syntax::table_for(bg)
+    };
+
+    let pick = |c: usize| -> [f32; 4] { table_at(c).get(kind_at[c]) };
+
+    // Coalesce contiguous same-color runs.
+    let mut run_start = 0usize;
+    let mut run_color = pick(0);
+    for c in 1..n {
+        let color = pick(c);
+        if color != run_color {
+            let chunk: String = chars[run_start..c].iter().collect();
+            let pos = [origin[0] + run_start as f32 * char_w, origin[1]];
+            dl.add_text(pos, run_color, &chunk);
+            run_start = c;
+            run_color = color;
+        }
+    }
+    let chunk: String = chars[run_start..].iter().collect();
+    let pos = [origin[0] + run_start as f32 * char_w, origin[1]];
+    dl.add_text(pos, run_color, &chunk);
 }
 
-/// Render a single row using invisible_button for hit-testing + draw list for
-/// visuals. Returns Some(line_no) if the row was right-clicked this frame
-/// (anchor pick). LMB drives selection; double-click switches the row into
-/// an inline editor.
+/// clicks place the caret directly and every keystroke commits — the diff
+/// re-runs every frame the buffer changes. Mouse-driven selection transitions
+/// live in `update_selection`; this function is read-only with respect to
+/// `selection`. Returns `Some(line_no)` if the row was right-clicked this
+/// frame (anchor pick).
 #[allow(clippy::too_many_arguments)]
 fn draw_row(
     ui: &Ui,
     row: &Row,
     side: Side,
     idx: i32,
+    session_id: SessionId,
     anchored: &HashSet<u32>,
     mono_font: Option<FontId>,
     hover_out: &Cell<Option<(u32, [f32; 2])>>,
-    selection: &mut Option<Selection>,
-    editing: &mut Option<EditState>,
+    selection: Option<&Selection>,
     focus_event: &Cell<Option<crate::app::FocusedPane>>,
-    edit_commit: &Cell<Option<(Side, u32, String)>>,
+    line_remove: &Cell<Option<DiffEdit>>,
+    pending_edits: &mut Vec<DiffEdit>,
+    arrow_focus: &Cell<Option<(Side, u32)>>,
+    char_w_out: &Cell<f32>,
+    line_hl: &[super::syntax::LineSpan],
 ) -> Option<u32> {
     let p0 = ui.cursor_screen_pos();
     let row_w = ui.content_region_avail()[0];
     let p1 = [p0[0] + row_w, p0[1] + row_h()];
 
-    // Editing path: if the user is editing THIS row, render an input_text
-    // covering the text area and return early. Selection / hover decoration
-    // stays off this row so it isn't visually confusing.
-    let editing_this = editing
-        .as_ref()
-        .map_or(false, |e| e.side == side && e.row_idx == idx as usize);
-    if editing_this {
-        let _font_tok = mono_font.map(|f| ui.push_font(f));
-        let dl = ui.get_window_draw_list();
-        dl.add_rect(p0, p1, [0.18, 0.22, 0.30, 1.0]).filled(true).build();
-        // Gutter line number stays visible to the left of the editor.
-        let line_text = match row.line_no {
-            Some(n) => format!("{n:>4}"),
-            None => "    ".to_string(),
-        };
-        dl.add_text(
-            [p0[0] + 6.0, p0[1] + 3.0],
-            [0.55, 0.60, 0.70, 1.0],
-            &line_text,
-        );
-        let edit_state = editing.as_mut().unwrap();
-        if edit_state.just_started {
-            ui.set_keyboard_focus_here();
-            edit_state.just_started = false;
-        }
-        ui.set_cursor_screen_pos([p0[0] + gutter_w(), p0[1]]);
-        ui.set_next_item_width(row_w - gutter_w());
-        let _pad = ui.push_style_var(StyleVar::FramePadding([2.0, 1.0]));
-        let id_for_input = format!("##edit_{:?}_{idx}", side);
-        let changed = ui
-            .input_text(id_for_input, &mut edit_state.buffer)
-            .enter_returns_true(true)
-            .build();
-        let active = ui.is_item_active();
-        let deactivated = ui.is_item_deactivated();
-        drop(_pad);
-        drop(_font_tok);
+    // Gutter rect — used only for RMB anchor picking. LMB on the gutter is
+    // handled by the central click handler like any other in-pane click.
+    let gutter_p1 = [p0[0] + gutter_w(), p1[1]];
+    let gutter_hovered = ui.is_mouse_hovering_rect(p0, gutter_p1);
+    let rmb_anchor = gutter_hovered && ui.is_mouse_clicked(imgui::MouseButton::Right);
 
-        if changed {
-            edit_commit.set(Some((side, edit_state.line_no, edit_state.buffer.clone())));
-            *editing = None;
-        } else if ui.is_key_pressed(imgui::Key::Escape) {
-            *editing = None;
-        } else if deactivated && !active {
-            // Lost focus without Enter: commit current buffer.
-            edit_commit.set(Some((side, edit_state.line_no, edit_state.buffer.clone())));
-            *editing = None;
-        }
-        // Pin cursor down by exactly row_h() so the layout math (used by
-        // the connector) stays consistent with the non-editing rows.
-        ui.set_cursor_screen_pos([p0[0], p0[1] + row_h()]);
-        return None;
-    }
-
-    let id_str = format!("row_{:?}_{idx}", side);
-    let _clicked_lmb = ui.invisible_button(id_str, [row_w, row_h()]);
-    // `is_item_hovered` returns false for any row that isn't the active item
-    // while a drag is in progress (imgui blocks hover for non-active items).
-    // For drag-extend-selection we need a pure-positional hover check, so we
-    // use `is_mouse_hovering_rect` (clipped by the child window).
+    // Positional hover for the full row, independent of any active widget.
     let mouse_in_row = ui.is_mouse_hovering_rect(p0, p1);
-    let hovered = ui.is_item_hovered();
-    let activated = ui.is_item_activated();
-    let dbl_click = hovered && ui.is_mouse_double_clicked(imgui::MouseButton::Left);
-    let rmb_anchor = hovered && ui.is_mouse_clicked(imgui::MouseButton::Right);
-    if hovered && row.is_change {
-        // Anchor the hover overlay at the first row of the hunk (so it
-        // doesn't follow the cursor row-by-row). If that first row has
-        // scrolled above the visible band, clamp to the band's top so the
-        // overlay always shows for a hunk the user is inside of.
+    if mouse_in_row && row.is_change {
         let pane_origin_y = p0[1] - (idx as f32) * row_h();
         let pane_visible_top = pane_origin_y + ui.scroll_y();
         let first_row_y = pane_origin_y + (row.hunk_first_row as f32) * row_h();
@@ -954,81 +1312,15 @@ fn draw_row(
         hover_out.set(Some((row.hunk_id, [p0[0], anchor_y])));
     }
 
-    // Double-click starts inline edit on rows that have a real source line.
-    // Equal rows on the left/right map to their respective a/b line; delete
-    // rows have only a; insert rows have only b. We allow editing any row
-    // with a `line_no`.
-    if dbl_click {
-        if let Some(ln) = row.line_no {
-            let text: String = row.segments.iter().map(|s| s.text.as_str()).collect();
-            *editing = Some(EditState {
-                side,
-                row_idx: idx as usize,
-                line_no: ln,
-                buffer: text,
-                just_started: true,
-            });
-            // Clear any in-progress selection so the editor takes over cleanly.
-            *selection = None;
-            focus_event.set(Some(side.as_focused_pane()));
-            // Skip selection-start handling for this frame.
-            return None;
-        }
-    }
-
-    // Push mono for both text rendering and column hit-testing. calc_text_size
-    // and the per-character width inferred from it both depend on the active
-    // font, so they must be measured under the same push.
     let _font_tok = mono_font.map(|f| ui.push_font(f));
     let char_w = ui.calc_text_size("m")[0].max(1.0);
+    char_w_out.set(char_w);
     let text_start_x = p0[0] + gutter_w();
     let char_count: usize = row.segments.iter().map(|s| s.text.chars().count()).sum();
 
-    // For drag-extend selection we want the column under the mouse even when
-    // another row holds the active state, so use the positional `mouse_in_row`
-    // check rather than imgui's hover (which is blocked during drag).
-    let col_at_mouse = if mouse_in_row {
-        let mx = ui.io().mouse_pos[0];
-        let raw = ((mx - text_start_x) / char_w).round();
-        Some(raw.clamp(0.0, char_count as f32) as usize)
-    } else {
-        None
-    };
-
-    // --- Selection events ---
-    if activated {
-        let col = col_at_mouse.unwrap_or(0);
-        let row_idx = idx as usize;
-        let shift = ui.io().key_shift;
-        if shift && selection.as_ref().map_or(false, |s| s.side == side) {
-            let sel = selection.as_mut().unwrap();
-            sel.caret = (row_idx, col);
-            sel.dragging = true;
-        } else {
-            *selection = Some(Selection {
-                side,
-                anchor: (row_idx, col),
-                caret: (row_idx, col),
-                dragging: true,
-            });
-        }
-        focus_event.set(Some(side.as_focused_pane()));
-    }
-    if mouse_in_row {
-        if let Some(sel) = selection.as_mut() {
-            if sel.dragging
-                && sel.side == side
-                && ui.is_mouse_down(imgui::MouseButton::Left)
-            {
-                if let Some(col) = col_at_mouse {
-                    sel.caret = (idx as usize, col);
-                }
-            }
-        }
-    }
-
     let dl = ui.get_window_draw_list();
 
+    // ---- backgrounds: hunk color → hover tint → selection ----
     let bg = match row.cls {
         Cls::Equal => None,
         Cls::Delete => Some([0.55, 0.18, 0.18, 0.30]),
@@ -1037,47 +1329,39 @@ fn draw_row(
     if let Some(bg_rgba) = bg {
         dl.add_rect(p0, p1, bg_rgba).filled(true).build();
     }
-    if hovered {
-        dl.add_rect(p0, p1, [1.0, 1.0, 1.0, 0.05])
+    if mouse_in_row {
+        dl.add_rect(p0, p1, theme::with_alpha(theme::TEXT, 0.04))
             .filled(true)
             .build();
     }
-
-    // Selection background — drawn after hunk bg / hover so it overrides them,
-    // but before text so glyphs remain readable.
-    if let Some(sel) = selection.as_ref() {
+    if let (Some(sel), Some(ln)) = (selection, row.line_no) {
         if sel.side == side {
-            let (s_row, s_col, e_row, e_col) = normalize_selection(sel);
-            let row_idx = idx as usize;
-            if row_idx >= s_row && row_idx <= e_row {
-                let l_col = if row_idx == s_row { s_col } else { 0 };
-                let r_col = if row_idx == e_row { e_col } else { char_count };
+            let (lo, hi) = ordered_endpoints(sel);
+            if ln >= lo.line_no && ln <= hi.line_no {
+                let l_col = if ln == lo.line_no { lo.col } else { 0 };
+                let r_col = if ln == hi.line_no { hi.col } else { char_count };
+                let l_col = l_col.min(char_count);
+                let r_col = r_col.min(char_count);
                 if r_col > l_col {
                     let sel_x0 = text_start_x + l_col as f32 * char_w;
                     let sel_x1 = text_start_x + r_col as f32 * char_w;
-                    dl.add_rect([sel_x0, p0[1]], [sel_x1, p1[1]], [0.26, 0.59, 0.98, 0.40])
-                        .filled(true)
-                        .build();
+                    dl.add_rect(
+                        [sel_x0, p0[1]],
+                        [sel_x1, p1[1]],
+                        theme::with_alpha(theme::BLUE, 0.40),
+                    )
+                    .filled(true)
+                    .build();
                 }
             }
         }
     }
+    let _ = focus_event;
 
-    let line_text = match row.line_no {
-        Some(n) => format!("{n:>4}"),
-        None => "    ".to_string(),
-    };
-    let text_y = p0[1] + 3.0;
-    dl.add_text([p0[0] + 6.0, text_y], [0.55, 0.60, 0.70, 1.0], &line_text);
-
-    let fg = match row.cls {
-        Cls::Equal => [0.90, 0.92, 0.96, 1.0],
-        Cls::Delete => [1.0, 0.65, 0.62, 1.0],
-        Cls::Insert => [0.72, 1.0, 0.78, 1.0],
-    };
+    // ---- char-level highlight rects (red/green tint under changed chars) ----
     let hl_bg = match row.cls {
-        Cls::Delete => [0.85, 0.18, 0.18, 0.55],
-        Cls::Insert => [0.18, 0.70, 0.30, 0.55],
+        Cls::Delete => [0.85, 0.18, 0.18, 0.20],
+        Cls::Insert => [0.18, 0.70, 0.30, 0.20],
         Cls::Equal => [0.0, 0.0, 0.0, 0.0],
     };
     let mut x = text_start_x;
@@ -1087,34 +1371,152 @@ fn draw_row(
         }
         let w = ui.calc_text_size(&seg.text)[0];
         if seg.hl {
-            dl.add_rect(
-                [x, p0[1] + 2.0],
-                [x + w, p0[1] + row_h() - 2.0],
-                hl_bg,
-            )
-            .filled(true)
-            .build();
+            dl.add_rect([x, p0[1] + 2.0], [x + w, p0[1] + row_h() - 2.0], hl_bg)
+                .filled(true)
+                .build();
         }
-        dl.add_text([x, text_y], fg, &seg.text);
         x += w;
     }
-    drop(_font_tok);
 
+    // ---- gutter line number ----
+    let line_text = match row.line_no {
+        Some(n) => format!("{n:>4}"),
+        None => "    ".to_string(),
+    };
+    dl.add_text([p0[0] + 6.0, p0[1] + 3.0], theme::OVERLAY1, &line_text);
+
+    // ---- anchored row marker ----
     if let Some(ln) = row.line_no {
         if anchored.contains(&ln) {
-            // Black left edge marker.
-            dl.add_rect(p0, [p0[0] + 3.0, p1[1]], [0.0, 0.0, 0.0, 1.0])
+            dl.add_rect(p0, [p0[0] + 3.0, p1[1]], theme::LAVENDER)
                 .filled(true)
                 .build();
         }
     }
 
-    if rmb_anchor {
-        row.line_no
-    } else {
-        None
+    // ---- syntax-colored text rendering ----
+    //
+    // We paint the row text directly via the draw list (before input_text
+    // builds) so per-token colors land. The `input_text` widget that follows
+    // gets its Text style color set to transparent — it still owns the
+    // caret, selection-bg, and keyboard input, but doesn't draw its own
+    // (un-highlighted) copy on top of ours.
+    //
+    // Syntax spans apply on every row regardless of hunk class; the red/green
+    // *background* tints (row bg + per-char hl rects) continue to mark
+    // Delete/Insert visually, but the text itself stays readable in
+    // palette colors.
+    let mut buf: String = row.segments.iter().map(|s| s.text.as_str()).collect();
+    let was_empty = buf.is_empty();
+    paint_row_text(
+        &dl,
+        &row.segments,
+        [text_start_x, p0[1] + 3.0],
+        char_w,
+        line_hl,
+        row.cls,
+    );
+    let _frame_bg = ui.push_style_color(imgui::StyleColor::FrameBg, [0.0, 0.0, 0.0, 0.0]);
+    let _frame_bg_hov = ui.push_style_color(imgui::StyleColor::FrameBgHovered, [0.0, 0.0, 0.0, 0.0]);
+    let _frame_bg_act = ui.push_style_color(imgui::StyleColor::FrameBgActive, [0.0, 0.0, 0.0, 0.0]);
+    // Transparent text so input_text doesn't double-draw on top of the
+    // colored spans we just painted via `paint_row_text`.
+    let _text_color = ui.push_style_color(imgui::StyleColor::Text, [0.0, 0.0, 0.0, 0.0]);
+    let _pad = ui.push_style_var(StyleVar::FramePadding([2.0, 2.0]));
+    let _border = ui.push_style_var(StyleVar::FrameBorderSize(0.0));
+    ui.set_cursor_screen_pos([text_start_x, p0[1]]);
+    ui.set_next_item_width(row_w - gutter_w());
+    let input_id = match row.line_no {
+        Some(n) => format!("##rowedit_{:?}_{n}", side),
+        None => format!("##rowedit_{:?}_idx_{idx}", side),
+    };
+    // If a previous frame's Up/Down arrow asked us to focus this row, claim
+    // keyboard focus right before the input_text builds.
+    if let (Some((req_side, req_ln)), Some(ln)) = (arrow_focus.get(), row.line_no) {
+        if req_side == side && req_ln == ln {
+            ui.set_keyboard_focus_here();
+            arrow_focus.set(None);
+        }
     }
+    let changed = ui.input_text(input_id, &mut buf).build();
+    let input_active = ui.is_item_active();
+    // Up/Down inside an active row: hand keyboard focus to the adjacent
+    // source-line row on the same side. Consumed by the matching row on the
+    // next frame via `arrow_focus`.
+    if input_active {
+        if let Some(ln) = row.line_no {
+            if ui.is_key_pressed(imgui::Key::UpArrow) && ln > 1 {
+                arrow_focus.set(Some((side, ln - 1)));
+            } else if ui.is_key_pressed(imgui::Key::DownArrow) {
+                arrow_focus.set(Some((side, ln + 1)));
+            }
+        }
+    }
+    drop(_pad);
+    drop(_border);
+    drop(_text_color);
+    drop(_frame_bg_act);
+    drop(_frame_bg_hov);
+    drop(_frame_bg);
+
+    // Live commit: any change pushes a `SetTwoWayLine` onto the undo stack,
+    // and the next frame's diff reflects it. Equivalent edits on the same
+    // line coalesce via `DiffEdit::merge` so the undo stack stays compact.
+    if changed {
+        if let Some(ln) = row.line_no {
+            let two_way_side = match side {
+                Side::Left => TwoWaySide::A,
+                Side::Right => TwoWaySide::B,
+            };
+            pending_edits.push(DiffEdit::SetTwoWayLine {
+                session_id,
+                side: two_way_side,
+                line_no: ln,
+                new_text: buf,
+                old_text: None,
+            });
+        }
+    } else if input_active
+        && was_empty
+        && (ui.is_key_pressed(imgui::Key::Backspace) || ui.is_key_pressed(imgui::Key::Delete))
+    {
+        // Backspace/Delete on an already-empty input: remove the underlying
+        // source line. (Single-char + Backspace deletes the char only; the
+        // `was_empty` guard prevents the same keystroke from also removing
+        // the line.)
+        if let Some(ln) = row.line_no {
+            let two_way_side = match side {
+                Side::Left => TwoWaySide::A,
+                Side::Right => TwoWaySide::B,
+            };
+            let line_idx = (ln as usize).saturating_sub(1);
+            line_remove.set(Some(DiffEdit::SpliceTwoWayLines {
+                session_id,
+                side: two_way_side,
+                start: line_idx,
+                end: line_idx + 1,
+                replacement: Vec::new(),
+                old_target_lines: None,
+            }));
+        }
+    }
+
+    if input_active {
+        focus_event.set(Some(side.as_focused_pane()));
+    }
+
+    drop(_font_tok);
+
+    // Pin layout cursor exactly one row_h() down, regardless of input_text
+    // height jitter, so the connector's content-y model stays accurate.
+    ui.set_cursor_screen_pos([p0[0], p0[1] + row_h()]);
+
+    if rmb_anchor {
+        return row.line_no;
+    }
+    None
 }
+
 
 const ECHO_TOLERANCE: f32 = 0.5;
 

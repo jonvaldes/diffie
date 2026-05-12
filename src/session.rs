@@ -289,6 +289,81 @@ impl SessionStore {
         })
     }
 
+    /// Replace `target_side[range]` with `replacement` and recompute hunks.
+    /// The unified "structural edit" used by line deletes, line inserts, and
+    /// range deletions of selected text.
+    pub fn splice_two_way_lines(
+        &self,
+        id: SessionId,
+        side: TwoWaySide,
+        range: std::ops::Range<usize>,
+        replacement: Vec<String>,
+    ) -> Result<(), SessionError> {
+        self.with(id, |s| {
+            let engine = s.engine.clone();
+            match &mut s.mode {
+                SessionMode::TwoWay {
+                    a_lines,
+                    b_lines,
+                    anchors,
+                    hunks,
+                    ..
+                } => {
+                    let target_len = match side {
+                        TwoWaySide::A => a_lines.len(),
+                        TwoWaySide::B => b_lines.len(),
+                    };
+                    let start = range.start.min(target_len);
+                    let end = range.end.min(target_len).max(start);
+                    match side {
+                        TwoWaySide::A => {
+                            a_lines.splice(start..end, replacement.into_iter());
+                        }
+                        TwoWaySide::B => {
+                            b_lines.splice(start..end, replacement.into_iter());
+                        }
+                    }
+                    let new_hunks = recompute_two_way(&engine, a_lines, b_lines, anchors)?;
+                    *hunks = new_hunks;
+                    Ok(())
+                }
+                _ => Err(SessionError::WrongMode),
+            }
+        })
+    }
+
+    /// Replace the entire contents of one side of a 2-way session and
+    /// recompute hunks. Used by undo to restore a whole-buffer snapshot
+    /// after `replace_hunk_side`.
+    pub fn set_two_way_lines(
+        &self,
+        id: SessionId,
+        side: TwoWaySide,
+        new_lines: Vec<String>,
+    ) -> Result<(), SessionError> {
+        self.with(id, |s| {
+            let engine = s.engine.clone();
+            match &mut s.mode {
+                SessionMode::TwoWay {
+                    a_lines,
+                    b_lines,
+                    anchors,
+                    hunks,
+                    ..
+                } => {
+                    match side {
+                        TwoWaySide::A => *a_lines = new_lines,
+                        TwoWaySide::B => *b_lines = new_lines,
+                    }
+                    let new_hunks = recompute_two_way(&engine, a_lines, b_lines, anchors)?;
+                    *hunks = new_hunks;
+                    Ok(())
+                }
+                _ => Err(SessionError::WrongMode),
+            }
+        })
+    }
+
     /// Replace a single line of the underlying A or B file (1-based line
     /// number) and recompute hunks. Used by the diff view's in-place row
     /// editor in 2-way comparisons.
