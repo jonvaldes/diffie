@@ -69,14 +69,21 @@ pub struct DiffViewState {
     /// stale write was the root cause of "undo immediately reapplies the
     /// edit" loops while the row had focus.
     pub input_epoch: u32,
-    /// Horizontal scroll pin applied for the two frames following a
+    /// Horizontal scroll pin applied for several frames following a
     /// selection-delete splice. The splice queues `arrow_focus` to refocus
     /// the surviving row; on the next frame `set_keyboard_focus_here`
-    /// fires and imgui's nav system writes a `ScrollTarget` to bring the
-    /// wide input_text widget into view. `ScrollTarget` is consumed one
-    /// frame later at `Begin()`, so we pre-empt it by pushing
-    /// `igSetNextWindowScroll` (which writes `Scroll.x` directly and
-    /// clears `ScrollTarget.x`) on both that frame and the next.
+    /// fires and imgui's nav system writes a `ScrollTarget.x = gutter_w`
+    /// to bring the wide input_text widget into view, which would shift
+    /// the pane horizontally by `gutter_w` pixels. We pre-empt that by
+    /// pushing `igSetNextWindowScroll` each frame the pin is live;
+    /// `igSetNextWindowScroll` writes `Scroll.x` directly at `Begin()`
+    /// AND clears any pending `ScrollTarget.x`. The countdown is
+    /// empirically tuned: 2 frames is not enough (imgui keeps re-setting
+    /// `ScrollTarget` across multiple frames as the widget activates
+    /// over its 2-frame activation cycle); 3 is the minimum that holds,
+    /// 4 gives a 1-frame safety margin. The cost of running longer is
+    /// that user-initiated horizontal scroll is blocked for those
+    /// frames after a splice — ~67ms, brief and only after a Delete.
     /// `u8` is a frame countdown decremented each render entry.
     pin_scroll_x_after_splice: Option<(Side, f32, u8)>,
     /// Last frame's per-pane horizontal scroll. Written at end of `render`.
@@ -461,8 +468,7 @@ pub fn render(
 
     // Read the splice-induced scroll-x pin (if any) and decrement its
     // frame counter. We re-push it via `igSetNextWindowScroll` for the
-    // matching pane each frame the counter is live — see the field doc
-    // for why two frames are needed.
+    // matching pane each frame the counter is live.
     let pin_scroll_x: Option<(Side, f32)> = state
         .pin_scroll_x_after_splice
         .as_ref()
@@ -865,7 +871,7 @@ pub fn render(
                         Side::Left => left_scroll_x.get(),
                         Side::Right => right_scroll_x.get(),
                     };
-                    state.pin_scroll_x_after_splice = Some((sel.side, cur_scroll_x, 2));
+                    state.pin_scroll_x_after_splice = Some((sel.side, cur_scroll_x, 4));
                     state.selection = None;
                 }
             }
@@ -2128,7 +2134,7 @@ mod headless_tests {
             .expect("pin should be set after splice");
         assert_eq!(side, Side::Left);
         assert_eq!(x, 0.0); // scroll_x was 0 going in
-        assert_eq!(frames, 2);
+        assert_eq!(frames, 4);
     }
 
     /// Apply a queued `DiffEdit` to the store the same way the real app
@@ -2332,7 +2338,7 @@ mod headless_tests {
             .pin_scroll_x_after_splice
             .expect("pin should be set after splice");
         assert_eq!(pin.0, Side::Left);
-        assert_eq!(pin.2, 2);
+        assert_eq!(pin.2, 4);
         assert!(
             (pin.1 - baseline_x).abs() < 1e-3,
             "pinned x ({}) should match this frame's captured scroll_x ({})",
@@ -2355,20 +2361,21 @@ mod headless_tests {
             "frame 2: scroll_x drifted from baseline {baseline_x} to {} (>{MAX_DRIFT}px)",
             view_state.last_left_scroll_x,
         );
+        // Countdown decrements; specific value isn't material here.
         assert!(matches!(
             view_state.pin_scroll_x_after_splice,
-            Some((Side::Left, _, 1))
+            Some((Side::Left, _, _))
         ));
 
-        // Frame 3 (pin frame 2 of 2): catches nav's ScrollTarget queued
-        // on Frame 2 that would otherwise be consumed at this frame's
-        // Begin().
-        run_frame(&mut ctx, &store, id, &mut view_state, FrameInput::default());
-        assert!(
-            (view_state.last_left_scroll_x - baseline_x).abs() < MAX_DRIFT,
-            "frame 3: scroll_x drifted from baseline {baseline_x} to {} (>{MAX_DRIFT}px)",
-            view_state.last_left_scroll_x,
-        );
+        // Run enough idle frames to exhaust the countdown (max=4 today).
+        for _ in 0..5 {
+            run_frame(&mut ctx, &store, id, &mut view_state, FrameInput::default());
+            assert!(
+                (view_state.last_left_scroll_x - baseline_x).abs() < MAX_DRIFT,
+                "scroll_x drifted from baseline {baseline_x} to {} (>{MAX_DRIFT}px)",
+                view_state.last_left_scroll_x,
+            );
+        }
         assert!(view_state.pin_scroll_x_after_splice.is_none());
 
         // Frame 4 (idle): pin has expired; scroll_x must still hold.
@@ -2518,41 +2525,28 @@ mod headless_tests {
         }
     }
 
-    /// Real-renderer end-to-end: same scenario as
-    /// `headless_splice_preserves_scroll_x_across_pin_window` but with
-    /// imgui-wgpu rendering each frame to an offscreen target.
+    /// Real-renderer end-to-end: drives the full imgui → wgpu pipeline
+    /// per frame (ctx.render → CommandEncoder → render_pass →
+    /// Renderer::render → queue.submit, against an offscreen target),
+    /// then asserts that across the pin window scroll_x stays at the
+    /// post-splice baseline.
     ///
-    /// **Empirical finding documented inline:** running this with the
-    /// pin push disabled (replace the `pin_scroll_x` capture at the top
-    /// of `render` with `None`) produces the same end-state as with the
-    /// pin enabled — both leave scroll_x at ~60px from baseline 0
-    /// (matches gutter_w; an artifact of imgui's natural settling once
-    /// an input_text is active, not the original bug). The live-app bug
-    /// drives scroll_x by thousands of pixels, which we never see here.
+    /// **This test does catch the original bug.** With the pin push
+    /// disabled (replace the `pin_scroll_x` capture at the top of
+    /// `render` with `None`), scroll_x drifts from 0 to gutter_w (~60px)
+    /// — exactly the live-app symptom — and the test fails. With the
+    /// pin active, scroll_x stays at the baseline.
     ///
-    /// Conclusion: even with imgui-wgpu actually rendering each frame
-    /// to a real GPU target via the full render pipeline, the headless
-    /// setup is missing whatever context the live app provides that
-    /// makes `set_keyboard_focus_here` fire imgui's nav-scroll. Things
-    /// tried and ruled out:
-    ///   - Renderer-in-the-loop (this test).
-    ///   - `NAV_ENABLE_KEYBOARD` config flag.
-    ///   - Click + release injection to engage NavWindow.
-    ///   - Per-frame `delta_time` updates.
-    ///
-    /// Plausible remaining differences: a longer interaction history
-    /// that establishes a stable `ActiveId` + `g.NavId` lifecycle, the
-    /// imgui-winit-support `prepare_frame`/`prepare_render` calls that
-    /// flush windowing state into Io, or font-atlas characteristics
-    /// (the default atlas here is much smaller than the loaded fonts
-    /// in the real app, possibly affecting widget bboxes used in nav).
-    /// Pursuing this further is a Dear ImGui Test Engine job.
-    ///
-    /// What this test DOES catch: state-machine regressions (splice
-    /// queued, pin set with correct side + countdown, edit applied,
-    /// countdown decremented), plus the full imgui-wgpu rendering
-    /// pipeline shape — if a future refactor breaks rendering compat
-    /// (e.g., `RendererConfig` API change), this test fails.
+    /// Notes:
+    ///   - The wgpu device + queue is required: without rendering
+    ///     submission, imgui's nav-scroll pipeline doesn't fully trip.
+    ///   - `NAV_ENABLE_KEYBOARD` config flag is required (sets up the
+    ///     nav system so set_keyboard_focus_here engages it).
+    ///   - The pin countdown must be ≥3 frames to outlast imgui's
+    ///     widget-activation cycle; we use 4 for safety.
+    ///   - This test takes ~1.5s due to wgpu init + per-frame texture
+    ///     allocation; the in-memory variant covers state-machine
+    ///     regressions in ~20ms.
     #[test]
     fn headless_wgpu_splice_preserves_scroll_x() {
         let _guard = imgui_lock();
@@ -2620,32 +2614,22 @@ mod headless_tests {
         let baseline_x = view_state.last_left_scroll_x;
         assert!(matches!(
             view_state.pin_scroll_x_after_splice,
-            Some((Side::Left, _, 2))
+            Some((Side::Left, _, _))
         ));
 
-        // Pin frame 1.
-        run_frame_with_wgpu(
-            &mut ctx, &mut renderer, &device, &queue, target_format,
-            &store, id, &mut view_state, FrameInput::default(),
-        );
-        // Pin frame 2.
-        run_frame_with_wgpu(
-            &mut ctx, &mut renderer, &device, &queue, target_format,
-            &store, id, &mut view_state, FrameInput::default(),
-        );
-        // Idle.
-        run_frame_with_wgpu(
-            &mut ctx, &mut renderer, &device, &queue, target_format,
-            &store, id, &mut view_state, FrameInput::default(),
-        );
+        // Run many idle frames — enough to outlast any pin countdown.
+        for _ in 0..15 {
+            run_frame_with_wgpu(
+                &mut ctx, &mut renderer, &device, &queue, target_format,
+                &store, id, &mut view_state, FrameInput::default(),
+            );
+        }
 
-        // Tight drift bound: the original bug, when it fires, pushes
-        // scroll_x by ~content_w (thousands of pixels). With the pin in
-        // place we expect ~60px of natural drift from the active widget
-        // settling (matches gutter_w); without the pin in this headless
-        // setup we ALSO see ~60px, not the thousands the live bug
-        // produces. See the caveat docstring below.
-        const MAX_DRIFT: f32 = 200.0;
+        // The live-app bug shifts scroll_x by exactly gutter_w (60 px
+        // at code_font_zoom=1.0). A 10-px bound catches that with margin
+        // for any sub-pixel float drift but is way below imgui's
+        // bug-magnitude scroll.
+        const MAX_DRIFT: f32 = 10.0;
         assert!(
             (view_state.last_left_scroll_x - baseline_x).abs() < MAX_DRIFT,
             "scroll_x drifted from baseline {baseline_x} to {} (>{MAX_DRIFT}px) — pin failed",
