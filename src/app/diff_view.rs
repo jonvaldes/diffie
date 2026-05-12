@@ -69,13 +69,16 @@ pub struct DiffViewState {
     /// stale write was the root cause of "undo immediately reapplies the
     /// edit" loops while the row had focus.
     pub input_epoch: u32,
-    /// One-shot horizontal scroll pin applied on the frame right after a
-    /// multi-line selection splice. The splice queues `arrow_focus` to
-    /// refocus the surviving row, which triggers imgui's nav-scroll to
-    /// bring the focused (wide) input_text widget into view — yanking the
-    /// pane horizontally. We snapshot scroll_x at splice time and re-apply
-    /// it inside the next frame's child render, after nav-scroll has run.
-    pin_scroll_x_after_splice: Option<(Side, f32)>,
+    /// Horizontal scroll pin applied for the two frames following a
+    /// selection-delete splice. The splice queues `arrow_focus` to refocus
+    /// the surviving row; on the next frame `set_keyboard_focus_here`
+    /// fires and imgui's nav system writes a `ScrollTarget` to bring the
+    /// wide input_text widget into view. `ScrollTarget` is consumed one
+    /// frame later at `Begin()`, so we pre-empt it by pushing
+    /// `igSetNextWindowScroll` (which writes `Scroll.x` directly and
+    /// clears `ScrollTarget.x`) on both that frame and the next.
+    /// `u8` is a frame countdown decremented each render entry.
+    pin_scroll_x_after_splice: Option<(Side, f32, u8)>,
 }
 
 /// One end of a selection. `line_no` is the source-line index on `side` of
@@ -451,11 +454,20 @@ pub fn render(
     let left_visible = Cell::new(avail[1]);
     let right_visible = Cell::new(avail[1]);
 
-    // Consume the one-shot scroll-x pin from the previous frame's splice
-    // (if any). The matching pane's child callback re-applies it after
-    // `draw_pane`, overriding imgui's nav-scroll triggered by the
-    // arrow_focus → set_keyboard_focus_here chain.
-    let pin_scroll_x = state.pin_scroll_x_after_splice.take();
+    // Read the splice-induced scroll-x pin (if any) and decrement its
+    // frame counter. We re-push it via `igSetNextWindowScroll` for the
+    // matching pane each frame the counter is live — see the field doc
+    // for why two frames are needed.
+    let pin_scroll_x: Option<(Side, f32)> = state
+        .pin_scroll_x_after_splice
+        .as_ref()
+        .map(|(s, x, _)| (*s, *x));
+    if let Some((_, _, n)) = state.pin_scroll_x_after_splice.as_mut() {
+        *n = n.saturating_sub(1);
+        if *n == 0 {
+            state.pin_scroll_x_after_splice = None;
+        }
+    }
     // First row's `calc_text_size("m")` under the mono font lands here; the
     // central selection handler needs it to map mouse x to a column.
     let char_w_cell: Cell<f32> = Cell::new(0.0);
@@ -515,11 +527,21 @@ pub fn render(
     if right_first {
         // --- right is driver: render right first ---
         ui.set_cursor_screen_pos(right_pos);
-        if let Some(y) = state.pending_right.take() {
-            unsafe {
-                imgui::sys::igSetNextWindowScroll(imgui::sys::ImVec2 { x: -1.0, y });
+        {
+            let y_to_apply = state.pending_right.take();
+            let x_to_apply = pin_scroll_x
+                .filter(|(s, _)| *s == Side::Right)
+                .map(|(_, x)| x);
+            if y_to_apply.is_some() || x_to_apply.is_some() {
+                let x = x_to_apply.unwrap_or(-1.0);
+                let y = y_to_apply.unwrap_or(-1.0);
+                unsafe {
+                    imgui::sys::igSetNextWindowScroll(imgui::sys::ImVec2 { x, y });
+                }
+                if let Some(y) = y_to_apply {
+                    state.written_right = Some(y);
+                }
             }
-            state.written_right = Some(y);
         }
         ui.child_window("diffie_right")
             .size([pane_w, avail[1]])
@@ -551,11 +573,6 @@ pub fn render(
                     b_highlights,
                     content_w_right,
                 );
-                if let Some((s, x)) = pin_scroll_x {
-                    if s == Side::Right {
-                        ui.set_scroll_x(x);
-                    }
-                }
             });
 
         // Right pane has applied its wheel-induced scroll — derive matching
@@ -584,11 +601,20 @@ pub fn render(
         let apply_left = left_override.or(pending_consumed);
 
         ui.set_cursor_screen_pos(left_pos);
-        if let Some(y) = apply_left {
-            unsafe {
-                imgui::sys::igSetNextWindowScroll(imgui::sys::ImVec2 { x: -1.0, y });
+        {
+            let x_to_apply = pin_scroll_x
+                .filter(|(s, _)| *s == Side::Left)
+                .map(|(_, x)| x);
+            if apply_left.is_some() || x_to_apply.is_some() {
+                let x = x_to_apply.unwrap_or(-1.0);
+                let y = apply_left.unwrap_or(-1.0);
+                unsafe {
+                    imgui::sys::igSetNextWindowScroll(imgui::sys::ImVec2 { x, y });
+                }
+                if let Some(y) = apply_left {
+                    state.written_left = Some(y);
+                }
             }
-            state.written_left = Some(y);
         }
         ui.child_window("diffie_left")
             .size([pane_w, avail[1]])
@@ -620,11 +646,6 @@ pub fn render(
                     a_highlights,
                     content_w_left,
                 );
-                if let Some((s, x)) = pin_scroll_x {
-                    if s == Side::Left {
-                        ui.set_scroll_x(x);
-                    }
-                }
             });
 
         // Stamp `written_X` with the actually-rendered scroll values, not
@@ -639,11 +660,21 @@ pub fn render(
     } else {
         // --- left is driver (or no wheel): render left first ---
         ui.set_cursor_screen_pos(left_pos);
-        if let Some(y) = state.pending_left.take() {
-            unsafe {
-                imgui::sys::igSetNextWindowScroll(imgui::sys::ImVec2 { x: -1.0, y });
+        {
+            let y_to_apply = state.pending_left.take();
+            let x_to_apply = pin_scroll_x
+                .filter(|(s, _)| *s == Side::Left)
+                .map(|(_, x)| x);
+            if y_to_apply.is_some() || x_to_apply.is_some() {
+                let x = x_to_apply.unwrap_or(-1.0);
+                let y = y_to_apply.unwrap_or(-1.0);
+                unsafe {
+                    imgui::sys::igSetNextWindowScroll(imgui::sys::ImVec2 { x, y });
+                }
+                if let Some(y) = y_to_apply {
+                    state.written_left = Some(y);
+                }
             }
-            state.written_left = Some(y);
         }
         ui.child_window("diffie_left")
             .size([pane_w, avail[1]])
@@ -675,11 +706,6 @@ pub fn render(
                     a_highlights,
                     content_w_left,
                 );
-                if let Some((s, x)) = pin_scroll_x {
-                    if s == Side::Left {
-                        ui.set_scroll_x(x);
-                    }
-                }
             });
 
         let cur_left_for_sync = left_scroll.get();
@@ -704,11 +730,20 @@ pub fn render(
         let apply_right = right_override.or(pending_consumed);
 
         ui.set_cursor_screen_pos(right_pos);
-        if let Some(y) = apply_right {
-            unsafe {
-                imgui::sys::igSetNextWindowScroll(imgui::sys::ImVec2 { x: -1.0, y });
+        {
+            let x_to_apply = pin_scroll_x
+                .filter(|(s, _)| *s == Side::Right)
+                .map(|(_, x)| x);
+            if apply_right.is_some() || x_to_apply.is_some() {
+                let x = x_to_apply.unwrap_or(-1.0);
+                let y = apply_right.unwrap_or(-1.0);
+                unsafe {
+                    imgui::sys::igSetNextWindowScroll(imgui::sys::ImVec2 { x, y });
+                }
+                if let Some(y) = apply_right {
+                    state.written_right = Some(y);
+                }
             }
-            state.written_right = Some(y);
         }
         ui.child_window("diffie_right")
             .size([pane_w, avail[1]])
@@ -740,11 +775,6 @@ pub fn render(
                     b_highlights,
                     content_w_right,
                 );
-                if let Some((s, x)) = pin_scroll_x {
-                    if s == Side::Right {
-                        ui.set_scroll_x(x);
-                    }
-                }
             });
 
         // Mirror of the right_first branch — see comment there. Store the
@@ -830,7 +860,7 @@ pub fn render(
                         Side::Left => left_scroll_x.get(),
                         Side::Right => right_scroll_x.get(),
                     };
-                    state.pin_scroll_x_after_splice = Some((sel.side, cur_scroll_x));
+                    state.pin_scroll_x_after_splice = Some((sel.side, cur_scroll_x, 2));
                     state.selection = None;
                 }
             }
