@@ -5,3 +5,7 @@ pub mod io;
 
 #[cfg(feature = "gui")]
 pub mod app;
+
+// Pure input types and functions (no imgui/gui dependency).
+#[cfg(feature = "gui")]
+pub use app::input;
