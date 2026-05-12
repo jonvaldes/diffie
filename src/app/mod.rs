@@ -232,9 +232,9 @@ impl ApplicationHandler for App {
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
 
         // --- wgpu -----------------------------------------------------------
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::PRIMARY,
-            ..Default::default()
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
         });
         let surface = instance
             .create_surface(window.clone())
@@ -252,6 +252,7 @@ impl ApplicationHandler for App {
             required_limits: wgpu::Limits::default(),
             memory_hints: wgpu::MemoryHints::default(),
             trace: wgpu::Trace::default(),
+            experimental_features: wgpu::ExperimentalFeatures::default(),
         }))
         .expect("request device");
 
@@ -380,11 +381,12 @@ fn render(gpu: &mut Gpu, state: &mut AppState) {
     gpu.last_frame = now;
 
     let frame = match gpu.surface.get_current_texture() {
-        Ok(f) => f,
-        Err(_) => {
+        wgpu::CurrentSurfaceTexture::Success(f) | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
+        wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
             gpu.surface.configure(&gpu.device, &gpu.surface_config);
             return;
         }
+        _ => return,
     };
     let view = frame
         .texture
@@ -428,6 +430,7 @@ fn render(gpu: &mut Gpu, state: &mut AppState) {
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: &view,
                 resolve_target: None,
+                depth_slice: None,
                 ops: wgpu::Operations {
                     load: wgpu::LoadOp::Clear(wgpu::Color {
                         r: 0.06,
@@ -440,6 +443,7 @@ fn render(gpu: &mut Gpu, state: &mut AppState) {
             })],
             depth_stencil_attachment: None,
             timestamp_writes: None,
+            multiview_mask: None,
             occlusion_query_set: None,
         });
         gpu.renderer
