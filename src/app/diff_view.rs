@@ -855,11 +855,12 @@ fn update_selection(
     char_w: f32,
     focus_request: &mut Option<crate::app::FocusedPane>,
 ) {
+    use super::input::{self, InputFrame};
+
     if char_w <= 0.0 {
-        // No rows rendered this frame — nothing to do (and we couldn't compute
-        // a column anyway).
         return;
     }
+
     let pane_bounds = |side: Side| -> ([f32; 2], f32) {
         match side {
             Side::Left => (left_origin, left_visible_h),
@@ -873,118 +874,98 @@ fn update_selection(
         }
     };
 
-    // `origin[1]` is the screen y of content_y=0 *after* scroll, so the
-    // visible band on screen is [origin[1], origin[1] + visible_h). Any mouse
-    // position inside (origin[0]..origin[0]+pane_w, origin[1]..origin[1]+visible_h)
-    // maps to a row via `(mouse_y - origin[1]) / row_h()`.
-    let locate = |pos: [f32; 2]| -> Option<(Side, SelPoint)> {
+    // Strict hit-test for the initial press.
+    let locate = |pos: [f32; 2]| -> Option<(input::Side, input::SelPoint)> {
         for side in [Side::Left, Side::Right] {
             let (origin, visible_h) = pane_bounds(side);
-            if pos[0] < origin[0] || pos[0] >= origin[0] + pane_w {
-                continue;
-            }
+            if pos[0] < origin[0] || pos[0] >= origin[0] + pane_w { continue; }
             let dy = pos[1] - origin[1];
-            if dy < 0.0 || dy >= visible_h {
-                continue;
-            }
+            if dy < 0.0 || dy >= visible_h { continue; }
             let rows = rows_for(side);
             let row_idx = (dy / row_h()) as usize;
-            if row_idx >= rows.len() {
-                continue;
-            }
+            if row_idx >= rows.len() { continue; }
             let row = &rows[row_idx];
             let line_no = row.line_no?;
             let char_count: usize = row.segments.iter().map(|s| s.text.chars().count()).sum();
             let text_x0 = origin[0] + gutter_w();
             let raw = ((pos[0] - text_x0) / char_w).round();
             let col = raw.clamp(0.0, char_count as f32) as usize;
-            return Some((side, SelPoint { line_no, col }));
+            return Some((side_to_input(side), input::SelPoint { line_no, col: col as u32 }));
         }
         None
     };
 
-    let lmb_clicked = ui.is_mouse_clicked(imgui::MouseButton::Left);
-    let lmb_held = ui.is_mouse_down(imgui::MouseButton::Left);
-
-    if lmb_clicked {
-        let press = ui.io().mouse_pos;
-        match locate(press) {
-            Some((side, point)) => {
-                let shift = ui.io().key_shift;
-                let extend = shift
-                    && state
-                        .selection
-                        .as_ref()
-                        .map_or(false, |s| s.side == side);
-                if extend {
-                    let sel = state.selection.as_mut().unwrap();
-                    sel.caret = point;
-                    state.drag = Some(DragState {
-                        side,
-                        anchor: sel.anchor,
-                        press_screen: press,
-                        threshold_passed: true,
-                    });
-                } else {
-                    state.selection = None;
-                    state.drag = Some(DragState {
-                        side,
-                        anchor: point,
-                        press_screen: press,
-                        threshold_passed: false,
-                    });
-                }
-                *focus_request = Some(side.as_focused_pane());
-            }
-            None => {
-                state.selection = None;
-                state.drag = None;
-            }
+    // Clamped locate for the drag tick — preserves the existing behavior
+    // where dragging off the pane still extends to the last reachable
+    // row/column on the active side.
+    let locate_clamped = |side: input::Side, pos: [f32; 2]| -> Option<input::SelPoint> {
+        let side = side_from_input(side);
+        let (origin, visible_h) = pane_bounds(side);
+        let rows = rows_for(side);
+        if rows.is_empty() {
+            return None;
         }
+        let clamped_x = pos[0].clamp(origin[0] + gutter_w(), origin[0] + pane_w - 1.0);
+        let clamped_y = pos[1]
+            .clamp(origin[1], origin[1] + visible_h - 1.0)
+            .max(origin[1]);
+        let row_idx = ((clamped_y - origin[1]) / row_h()) as usize;
+        let row_idx = row_idx.min(rows.len() - 1);
+        let row = &rows[row_idx];
+        let line_no = row.line_no?;
+        let char_count: usize = row.segments.iter().map(|s| s.text.chars().count()).sum();
+        let raw = ((clamped_x - (origin[0] + gutter_w())) / char_w).round();
+        let col = raw.clamp(0.0, char_count as f32) as usize;
+        Some(input::SelPoint { line_no, col: col as u32 })
+    };
+
+    let frame = InputFrame::from_ui(ui);
+
+    let prior_sel = state.selection.as_ref().map(|s| input::Selection {
+        side: side_to_input(s.side),
+        anchor: input::SelPoint { line_no: s.anchor.line_no, col: s.anchor.col as u32 },
+        caret: input::SelPoint { line_no: s.caret.line_no, col: s.caret.col as u32 },
+    });
+    let prior_drag = state.drag.as_ref().map(|d| input::DragState {
+        side: side_to_input(d.side),
+        anchor: input::SelPoint { line_no: d.anchor.line_no, col: d.anchor.col as u32 },
+        press_screen: d.press_screen,
+        threshold_passed: d.threshold_passed,
+    });
+
+    let step = input::selection_step(&frame, prior_sel, prior_drag, locate, locate_clamped);
+
+    if let Some(new_sel) = step.set_selection {
+        state.selection = new_sel.map(|s| Selection {
+            side: side_from_input(s.side),
+            anchor: SelPoint { line_no: s.anchor.line_no, col: s.anchor.col as usize },
+            caret: SelPoint { line_no: s.caret.line_no, col: s.caret.col as usize },
+        });
     }
+    if let Some(new_drag) = step.set_drag {
+        state.drag = new_drag.map(|d| DragState {
+            side: side_from_input(d.side),
+            anchor: SelPoint { line_no: d.anchor.line_no, col: d.anchor.col as usize },
+            press_screen: d.press_screen,
+            threshold_passed: d.threshold_passed,
+        });
+    }
+    if let Some(side) = step.focus_request {
+        *focus_request = Some(side_from_input(side).as_focused_pane());
+    }
+}
 
-    // Drag tick: extend the caret to the current mouse position while held.
-    if let Some(drag) = state.drag.as_mut() {
-        if !lmb_held {
-            state.drag = None;
-        } else {
-            let pos = ui.io().mouse_pos;
-            if !drag.threshold_passed {
-                let dx = pos[0] - drag.press_screen[0];
-                let dy = pos[1] - drag.press_screen[1];
-                if (dx * dx + dy * dy).sqrt() >= 4.0 {
-                    drag.threshold_passed = true;
-                }
-            }
-            if drag.threshold_passed {
-                let side = drag.side;
-                let (origin, visible_h) = pane_bounds(side);
-                let rows = rows_for(side);
-                if !rows.is_empty() {
-                    // Clamp the mouse to the drag-side pane so the caret keeps
-                    // tracking even when the mouse leaves the pane.
-                    let clamped_x = pos[0].clamp(origin[0] + gutter_w(), origin[0] + pane_w - 1.0);
-                    let clamped_y = pos[1]
-                        .clamp(origin[1], origin[1] + visible_h - 1.0)
-                        .max(origin[1]);
-                    let row_idx = ((clamped_y - origin[1]) / row_h()) as usize;
-                    let row_idx = row_idx.min(rows.len() - 1);
-                    let row = &rows[row_idx];
-                    if let Some(line_no) = row.line_no {
-                        let char_count: usize =
-                            row.segments.iter().map(|s| s.text.chars().count()).sum();
-                        let raw = ((clamped_x - (origin[0] + gutter_w())) / char_w).round();
-                        let col = raw.clamp(0.0, char_count as f32) as usize;
-                        let caret = SelPoint { line_no, col };
-                        state.selection = Some(Selection {
-                            side,
-                            anchor: drag.anchor,
-                            caret,
-                        });
-                    }
-                }
-            }
-        }
+fn side_to_input(s: Side) -> super::input::Side {
+    match s {
+        Side::Left => super::input::Side::Left,
+        Side::Right => super::input::Side::Right,
+    }
+}
+
+fn side_from_input(s: super::input::Side) -> Side {
+    match s {
+        super::input::Side::Left => Side::Left,
+        super::input::Side::Right => Side::Right,
     }
 }
 
