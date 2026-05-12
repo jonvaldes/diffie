@@ -230,7 +230,15 @@ pub fn selection_step(
                         threshold_passed: true,
                     }));
                 } else {
-                    step.set_selection = Some(None);
+                    // Place a collapsed selection at the click point so a
+                    // following shift-click can extend from here. The drag
+                    // tick will overwrite this if the user actually drags
+                    // past the threshold.
+                    step.set_selection = Some(Some(Selection {
+                        side,
+                        anchor: point,
+                        caret: point,
+                    }));
                     step.set_drag = Some(Some(DragState {
                         side,
                         anchor: point,
@@ -332,7 +340,10 @@ mod selection_tests {
     fn click_in_pane_starts_drag_unset_threshold() {
         let f = frame([16.0, 10.0], true, true, false);
         let step = selection_step(&f, None, None, locate_left, locate_clamped_left);
-        assert_eq!(step.set_selection, Some(None));
+        let sel = step.set_selection.unwrap().unwrap();
+        assert_eq!(sel.side, Side::Left);
+        assert_eq!(sel.anchor, SelPoint { line_no: 2, col: 2 });
+        assert_eq!(sel.caret, SelPoint { line_no: 2, col: 2 });
         assert_eq!(step.focus_request, Some(Side::Left));
         let d = step.set_drag.unwrap().unwrap();
         assert_eq!(d.side, Side::Left);
@@ -360,9 +371,49 @@ mod selection_tests {
     fn shift_click_without_prior_selection_acts_like_plain_click() {
         let f = frame([24.0, 30.0], true, true, true);
         let step = selection_step(&f, None, None, locate_left, locate_clamped_left);
-        assert_eq!(step.set_selection, Some(None));
+        // Plain-click semantics: collapsed selection at the hit point, drag
+        // armed with threshold not yet passed.
+        let sel = step.set_selection.unwrap().unwrap();
+        assert_eq!(sel.anchor, SelPoint { line_no: 4, col: 3 });
+        assert_eq!(sel.caret, SelPoint { line_no: 4, col: 3 });
         let d = step.set_drag.unwrap().unwrap();
         assert!(!d.threshold_passed);
+    }
+
+    #[test]
+    fn click_then_shift_click_extends() {
+        // Regression: a plain click followed by shift-click should extend
+        // the selection from the click point to the shift-click point, even
+        // though no prior selection existed and no drag occurred between.
+
+        // Frame 1: plain LMB click at (16, 10) → row 2, col 2.
+        let f1 = frame([16.0, 10.0], true, true, false);
+        let step1 = selection_step(&f1, None, None, locate_left, locate_clamped_left);
+        let sel_after_click = step1.set_selection.unwrap().unwrap();
+        assert_eq!(sel_after_click.anchor, SelPoint { line_no: 2, col: 2 });
+        assert_eq!(sel_after_click.caret, SelPoint { line_no: 2, col: 2 });
+
+        // Simulate the next frame: mouse released, no drag past threshold.
+        // Apply step1 to a fake state, then release.
+        let prior_sel = Some(sel_after_click);
+        let prior_drag = step1.set_drag.unwrap();
+        let f_release = frame([16.0, 10.0], false, false, false);
+        let step_release =
+            selection_step(&f_release, prior_sel, prior_drag, locate_left, locate_clamped_left);
+        // Release should not touch the selection — it should just clear the drag.
+        assert!(step_release.set_selection.is_none());
+        assert_eq!(step_release.set_drag, Some(None));
+
+        // Frame 3: shift-click at (40, 40) → row 5, col 5. Selection should
+        // extend: anchor stays at (2, 2), caret moves to (5, 5).
+        let f2 = frame([40.0, 40.0], true, true, true);
+        let step2 = selection_step(&f2, prior_sel, None, locate_left, locate_clamped_left);
+        let sel_after_shift = step2.set_selection.unwrap().unwrap();
+        assert_eq!(sel_after_shift.side, Side::Left);
+        assert_eq!(sel_after_shift.anchor, SelPoint { line_no: 2, col: 2 });
+        assert_eq!(sel_after_shift.caret, SelPoint { line_no: 5, col: 5 });
+        let d = step2.set_drag.unwrap().unwrap();
+        assert!(d.threshold_passed);
     }
 
     #[test]
