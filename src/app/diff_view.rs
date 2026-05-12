@@ -185,6 +185,121 @@ pub fn ordered_endpoints(sel: &Selection) -> (SelPoint, SelPoint) {
     }
 }
 
+/// Class of a character for double-click word-select. ImGui's input_text
+/// only treats whitespace as a word boundary, so double-clicking on `=`
+/// in `target_arch = "x"` selects `#[cfg(target_arch ` (everything from
+/// the previous space to the next one). We override with the standard
+/// text-editor heuristic: word chars cluster, whitespace clusters, and
+/// each individual punct char is its own "word".
+#[derive(Eq, PartialEq, Copy, Clone, Debug)]
+enum CharClass {
+    Word,
+    Whitespace,
+    Punct,
+}
+
+fn char_class(c: char) -> CharClass {
+    if c.is_alphanumeric() || c == '_' {
+        CharClass::Word
+    } else if c.is_whitespace() {
+        CharClass::Whitespace
+    } else {
+        CharClass::Punct
+    }
+}
+
+/// Return the byte range of the "word" containing `byte_idx` in `s`,
+/// where "word" is defined by `char_class`: a run of word chars, a run
+/// of whitespace, or a single punct char. Returns `(0, 0)` for an empty
+/// string and clamps `byte_idx` into range. Handles UTF-8.
+fn double_click_word_bounds(s: &str, byte_idx: usize) -> (usize, usize) {
+    if s.is_empty() {
+        return (0, 0);
+    }
+    let positions: Vec<(usize, char)> = s.char_indices().collect();
+    // Find the char whose byte range contains byte_idx (clamp to last).
+    let mut target = positions.len() - 1;
+    for (i, (start, _)) in positions.iter().enumerate() {
+        if *start > byte_idx {
+            target = i.saturating_sub(1);
+            break;
+        }
+    }
+    let (target_start, target_char) = positions[target];
+    let class = char_class(target_char);
+    if class == CharClass::Punct {
+        return (target_start, target_start + target_char.len_utf8());
+    }
+    let mut lo = target;
+    while lo > 0 && char_class(positions[lo - 1].1) == class {
+        lo -= 1;
+    }
+    let mut hi = target + 1;
+    while hi < positions.len() && char_class(positions[hi].1) == class {
+        hi += 1;
+    }
+    let start_byte = positions[lo].0;
+    let end_byte = if hi < positions.len() {
+        positions[hi].0
+    } else {
+        s.len()
+    };
+    (start_byte, end_byte)
+}
+
+#[cfg(test)]
+mod word_bounds_tests {
+    use super::*;
+
+    #[test]
+    fn word_run() {
+        let s = "alpha beta gamma";
+        // Click at any char of "beta" → selects "beta".
+        assert_eq!(double_click_word_bounds(s, 6), (6, 10));
+        assert_eq!(double_click_word_bounds(s, 7), (6, 10));
+        assert_eq!(double_click_word_bounds(s, 9), (6, 10));
+    }
+
+    #[test]
+    fn punct_is_single_char() {
+        let s = "#[cfg(target_arch = \"wasm32\")]";
+        // '=' is at index 18.
+        assert_eq!(double_click_word_bounds(s, 18), (18, 19));
+        // '#' at index 0.
+        assert_eq!(double_click_word_bounds(s, 0), (0, 1));
+        // ')' at index 28.
+        assert_eq!(double_click_word_bounds(s, 28), (28, 29));
+    }
+
+    #[test]
+    fn whitespace_run() {
+        let s = "a   b";
+        assert_eq!(double_click_word_bounds(s, 2), (1, 4));
+    }
+
+    #[test]
+    fn underscore_is_word() {
+        let s = "target_arch";
+        assert_eq!(double_click_word_bounds(s, 6), (0, 11));
+    }
+
+    #[test]
+    fn empty_and_out_of_bounds() {
+        assert_eq!(double_click_word_bounds("", 0), (0, 0));
+        // Clamps high byte_idx to last char.
+        assert_eq!(double_click_word_bounds("ab", 100), (0, 2));
+    }
+
+    #[test]
+    fn utf8() {
+        // 'café': 'c','a','f','é'. 'é' is 2 bytes (0xC3 0xA9).
+        let s = "café word";
+        // 'é' starts at byte 3, len 2.
+        assert_eq!(double_click_word_bounds(s, 3), (0, 5)); // selects "café"
+        assert_eq!(double_click_word_bounds(s, 6), (6, 10)); // selects "word"
+    }
+}
+
 impl Side {
     pub fn as_focused_pane(self) -> crate::app::FocusedPane {
         match self {
@@ -1730,6 +1845,37 @@ fn draw_row(
         }
         None => -1,
     };
+    // Detect a double-click that lands inside this row's input_text and
+    // pre-compute the desired byte range. ImGui's native double-click
+    // selects from the previous space to the next space — too greedy for
+    // punctuation. Our override narrows to the standard text-editor
+    // word-class run; the CaretCapture callback applies it after imgui's
+    // word-select has run.
+    let dbl_click_override: Option<(usize, usize)> = if ui
+        .is_mouse_double_clicked(imgui::MouseButton::Left)
+    {
+        let click_pos = ui.io().mouse_pos;
+        let widget_x0 = text_start_x;
+        let widget_x1 = text_start_x + (content_w - gutter_w()).max(1.0);
+        if click_pos[0] >= widget_x0
+            && click_pos[0] < widget_x1
+            && click_pos[1] >= p0[1]
+            && click_pos[1] < p1[1]
+        {
+            let raw_col = ((click_pos[0] - widget_x0) / char_w).floor().max(0.0);
+            let char_col = raw_col as usize;
+            let byte_idx = buf
+                .char_indices()
+                .nth(char_col)
+                .map(|(b, _)| b)
+                .unwrap_or(buf.len());
+            Some(double_click_word_bounds(&buf, byte_idx))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     // Capture imgui's internal cursor position via the ALWAYS callback so we
     // can paint the caret ourselves below — imgui's own caret uses the Text
     // color, which we forced to transparent to avoid double-drawing. We also
@@ -1761,6 +1907,7 @@ fn draw_row(
         clear_selection: bool,
         seed_byte: i32,
         suppress_imgui_selection: bool,
+        dbl_click_override: Option<(usize, usize)>,
     }
     impl<'a> imgui::InputTextCallbackHandler for CaretCapture<'a> {
         fn on_always(&mut self, mut data: imgui::TextCallbackData) {
@@ -1775,6 +1922,11 @@ fn draw_row(
                 let pos = data.cursor_pos() as i32;
                 *data.selection_start_mut() = pos;
                 *data.selection_end_mut() = pos;
+            } else if let Some((s, e)) = self.dbl_click_override {
+                // Replace imgui's overly-greedy word selection.
+                data.set_cursor_pos(e);
+                *data.selection_start_mut() = s as i32;
+                *data.selection_end_mut() = e as i32;
             }
             self.out.set(data.cursor_pos() as i32);
             // Capture the post-mutation selection so tests can observe
@@ -1801,6 +1953,7 @@ fn draw_row(
                 clear_selection: arrow_match,
                 seed_byte,
                 suppress_imgui_selection: drag_on_this_side_past_threshold,
+                dbl_click_override,
             },
         )
         .build();
@@ -2691,6 +2844,104 @@ mod headless_tests {
         assert!(
             ["alpha", "beta", "gamma"].contains(&selected),
             "expected a whole-word selection (alpha/beta/gamma); got bytes {start}..{end} = {selected:?}",
+        );
+    }
+
+    /// Double-clicking on a punctuation character must select only that
+    /// character, not the wider run imgui's native WORDLEFT/WORDRIGHT
+    /// grabs. ImGui treats whitespace as the only word boundary, so for
+    /// non-space punct runs (which appear constantly in code: `==`, `=>`,
+    /// `::`, `target_arch=value` inside cfg attributes, etc.) it selects
+    /// the whole run when the user wants just one character.
+    ///
+    /// Test design: use a row of pure punct (`===`) so any click position
+    /// inside the rendered text lands on a `=`. ImGui's default selects
+    /// all three; our override selects exactly one. The character class
+    /// fix is the substance — calibrating the precise click x in
+    /// headless mode is brittle because the default font is proportional,
+    /// so the test only requires landing somewhere in the text run.
+    #[test]
+    fn headless_wgpu_double_click_punct_selects_single_char() {
+        let _guard = imgui_lock();
+        let Some((device, queue)) = try_init_wgpu() else {
+            eprintln!("skipping: no wgpu adapter available");
+            return;
+        };
+
+        // Three punct chars, no spaces: imgui's default WORDLEFT walks
+        // to start, WORDRIGHT walks to end → selects all 3. The fix
+        // narrows to 1.
+        let line = "===";
+        let text = format!("{line}\n");
+        let store = SessionStore::new();
+        let id = store.open_two_way(&text, &text, None).unwrap();
+
+        let mut ctx = imgui::Context::create();
+        ctx.io_mut().display_size = [1200.0, 800.0];
+        ctx.io_mut().delta_time = 1.0 / 60.0;
+        ctx.io_mut().config_flags |= imgui::ConfigFlags::NAV_ENABLE_KEYBOARD;
+        let target_format = wgpu::TextureFormat::Rgba8UnormSrgb;
+        let mut renderer = imgui_wgpu::Renderer::new(
+            &mut ctx,
+            &device,
+            &queue,
+            imgui_wgpu::RendererConfig {
+                texture_format: target_format,
+                ..Default::default()
+            },
+        );
+
+        // Click somewhere in the rendered text. From earlier traces:
+        // widget_x0 ≈ 76. The 3 `=` chars span ~30px (the actual width
+        // doesn't matter for this test — any click inside the run
+        // lands on a `=`).
+        let click_pos = [90.0, 40.0];
+        let mut view_state = DiffViewState::default();
+
+        run_frame_with_wgpu(
+            &mut ctx, &mut renderer, &device, &queue, target_format,
+            &store, id, &mut view_state,
+            FrameInput {
+                mouse_pos: Some(click_pos),
+                left_button: Some(true),
+                ..Default::default()
+            },
+        );
+        run_frame_with_wgpu(
+            &mut ctx, &mut renderer, &device, &queue, target_format,
+            &store, id, &mut view_state,
+            FrameInput { left_button: Some(false), ..Default::default() },
+        );
+        run_frame_with_wgpu(
+            &mut ctx, &mut renderer, &device, &queue, target_format,
+            &store, id, &mut view_state,
+            FrameInput {
+                mouse_pos: Some(click_pos),
+                left_button: Some(true),
+                ..Default::default()
+            },
+        );
+        run_frame_with_wgpu(
+            &mut ctx, &mut renderer, &device, &queue, target_format,
+            &store, id, &mut view_state,
+            FrameInput { left_button: Some(false), ..Default::default() },
+        );
+        for _ in 0..2 {
+            run_frame_with_wgpu(
+                &mut ctx, &mut renderer, &device, &queue, target_format,
+                &store, id, &mut view_state, FrameInput::default(),
+            );
+        }
+
+        let (_, ln, start, end) = view_state
+            .last_active_input_selection
+            .expect("imgui input_text should have a selection after double-click");
+        assert_eq!(ln, 1);
+        let selected = &line[start..end];
+        // With the fix: single `=`. Without: "===".
+        assert_eq!(
+            selected, "=",
+            "expected single '=' to be selected; got bytes {start}..{end} = {selected:?}",
         );
     }
 
