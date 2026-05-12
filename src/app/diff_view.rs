@@ -2165,18 +2165,33 @@ mod headless_tests {
         }
     }
 
-    /// Run one render frame: snapshot the session, optionally inject a
-    /// Backspace press, build a Ui, call `render` inside a window, then
-    /// apply any queued `pending_edits` back to the store. Mirrors the
+    #[derive(Default)]
+    struct FrameInput {
+        backspace: bool,
+        /// Place the mouse at this screen position before NewFrame.
+        mouse_pos: Option<[f32; 2]>,
+        /// Press or release the left mouse button.
+        left_button: Option<bool>,
+    }
+
+    /// Run one render frame: snapshot the session, inject queued input
+    /// events into imgui, build a Ui, call `render` inside a window,
+    /// then apply queued `pending_edits` back to the store. Mirrors the
     /// per-frame flow `app::mod::frame_ui` runs in the real app.
     fn run_frame(
         ctx: &mut imgui::Context,
         store: &SessionStore,
         id: crate::session::SessionId,
         view_state: &mut DiffViewState,
-        inject_backspace: bool,
+        input: FrameInput,
     ) {
-        if inject_backspace {
+        if let Some(pos) = input.mouse_pos {
+            ctx.io_mut().add_mouse_pos_event(pos);
+        }
+        if let Some(down) = input.left_button {
+            ctx.io_mut().add_mouse_button_event(imgui::MouseButton::Left, down);
+        }
+        if input.backspace {
             ctx.io_mut().add_key_event(imgui::Key::Backspace, true);
         }
         let snap = store.snapshot(id).unwrap();
@@ -2225,15 +2240,22 @@ mod headless_tests {
     ///     baseline across the pin window.
     ///
     /// **Caveat — does NOT prove the pin prevents imgui's nav-scroll.**
-    /// In headless mode imgui's `set_keyboard_focus_here` → nav-scroll
-    /// pipeline doesn't fire the way it does in the live app (verified
-    /// empirically by temporarily disabling the pin push: the test still
-    /// passes). Driving that path requires more nav state than a bare
-    /// `Context::create()` provides — likely a renderer-in-the-loop and
-    /// a real input flow that establishes `NavWindow`. This test catches
-    /// regressions in the state-machine wiring (the pin field's setup,
-    /// countdown, and clearing); the imgui-side override behavior is
-    /// only verified manually in the live GUI.
+    /// Verified empirically: temporarily replacing the pin push with
+    /// `let pin_scroll_x: Option<(Side, f32)> = None;` at the top of
+    /// `render` does NOT make this test fail. Things attempted to engage
+    /// imgui's nav-scroll pipeline in headless mode:
+    ///   - `ConfigFlags::NAV_ENABLE_KEYBOARD` set on `Io`.
+    ///   - A click + release sequence injected via `add_mouse_pos_event`
+    ///     and `add_mouse_button_event` to establish `NavWindow` and
+    ///     activate the input_text widget before the splice.
+    /// Neither makes imgui's `set_keyboard_focus_here` actually scroll
+    /// the child window the way it does in the live app. The pipeline
+    /// likely needs the renderer in the loop (or a full nav-state warmup
+    /// across many frames with a stable `ActiveId` lifecycle) that a
+    /// `Context::create()` + `new_frame()` loop doesn't reproduce. This
+    /// test catches regressions in the state-machine wiring (the pin
+    /// field's setup, countdown, and clearing); the imgui-side override
+    /// behavior is only verified manually in the live GUI.
     #[test]
     fn headless_splice_preserves_scroll_x_across_pin_window() {
         let _guard = imgui_lock();
@@ -2250,12 +2272,54 @@ mod headless_tests {
             caret: SelPoint { line_no: 1, col: 5 },
         });
 
+        // Frame 0 (engage nav): click somewhere inside the left pane so
+        // imgui sets `NavWindow` and activates the row's input_text. The
+        // bug's trigger (`set_keyboard_focus_here` → nav-scroll) requires
+        // an engaged nav system; without this click the headless context
+        // never enters that code path. Position is chosen to land on a
+        // visible row well inside the pane; exact value isn't critical.
+        run_frame(
+            &mut ctx,
+            &store,
+            id,
+            &mut view_state,
+            FrameInput {
+                mouse_pos: Some([150.0, 80.0]),
+                left_button: Some(true),
+                ..Default::default()
+            },
+        );
+        run_frame(
+            &mut ctx,
+            &store,
+            id,
+            &mut view_state,
+            FrameInput {
+                left_button: Some(false),
+                ..Default::default()
+            },
+        );
+        // Restore the synthetic selection the click cleared. We're not
+        // testing the click-then-shift-click extension path here, just
+        // the splice path, so this is fine.
+        view_state.selection = Some(Selection {
+            side: Side::Left,
+            anchor: SelPoint { line_no: 1, col: 0 },
+            caret: SelPoint { line_no: 1, col: 5 },
+        });
+
         // Frame 1 (splice frame): Backspace pressed. Splice edit queued
         // and applied; pin is set with countdown=2. ImGui's per-frame
         // bookkeeping (active-widget tracking, layout) makes scroll_x
         // settle to a non-zero baseline whose exact value depends on
         // imgui internals — we just capture it as the reference.
-        run_frame(&mut ctx, &store, id, &mut view_state, true);
+        run_frame(
+            &mut ctx,
+            &store,
+            id,
+            &mut view_state,
+            FrameInput { backspace: true, ..Default::default() },
+        );
         let snap = store.snapshot(id).unwrap();
         if let SessionMode::TwoWay { a_lines, .. } = &snap.mode {
             // "hello world" with "hello" removed becomes " world".
@@ -2280,7 +2344,7 @@ mod headless_tests {
         // fires here and would, absent the pin, queue a nav-scroll that
         // pushes scroll_x toward (content_w - viewport_w) — i.e., several
         // thousand pixels. The pin holds it at baseline.
-        run_frame(&mut ctx, &store, id, &mut view_state, false);
+        run_frame(&mut ctx, &store, id, &mut view_state, FrameInput::default());
         // The original bug pushed scroll_x to roughly (content_w - pane_w),
         // which is several thousand pixels for our 500-char long line. A
         // tolerance well below that — but loose enough to ignore imgui's
@@ -2299,7 +2363,7 @@ mod headless_tests {
         // Frame 3 (pin frame 2 of 2): catches nav's ScrollTarget queued
         // on Frame 2 that would otherwise be consumed at this frame's
         // Begin().
-        run_frame(&mut ctx, &store, id, &mut view_state, false);
+        run_frame(&mut ctx, &store, id, &mut view_state, FrameInput::default());
         assert!(
             (view_state.last_left_scroll_x - baseline_x).abs() < MAX_DRIFT,
             "frame 3: scroll_x drifted from baseline {baseline_x} to {} (>{MAX_DRIFT}px)",
@@ -2308,7 +2372,7 @@ mod headless_tests {
         assert!(view_state.pin_scroll_x_after_splice.is_none());
 
         // Frame 4 (idle): pin has expired; scroll_x must still hold.
-        run_frame(&mut ctx, &store, id, &mut view_state, false);
+        run_frame(&mut ctx, &store, id, &mut view_state, FrameInput::default());
         assert!(
             (view_state.last_left_scroll_x - baseline_x).abs() < MAX_DRIFT,
             "frame 4: scroll_x drifted from baseline {baseline_x} to {} (>{MAX_DRIFT}px)",
