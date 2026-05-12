@@ -79,6 +79,11 @@ pub struct DiffViewState {
     /// clears `ScrollTarget.x`) on both that frame and the next.
     /// `u8` is a frame countdown decremented each render entry.
     pin_scroll_x_after_splice: Option<(Side, f32, u8)>,
+    /// Last frame's per-pane horizontal scroll. Written at end of `render`.
+    /// Currently used only by the headless test harness to inspect scroll
+    /// position after a frame. Cheap to maintain (one `f32` per pane).
+    pub last_left_scroll_x: f32,
+    pub last_right_scroll_x: f32,
 }
 
 /// One end of a selection. `line_no` is the source-line index on `side` of
@@ -891,6 +896,8 @@ pub fn render(
     let l_view = left_visible.get();
     let r_view = right_visible.get();
     sync_scrolls(state, l, r, l_view, r_view, &left.ranges, &right.ranges);
+    state.last_left_scroll_x = left_scroll_x.get();
+    state.last_right_scroll_x = right_scroll_x.get();
 
     draw_connector(
         ui,
@@ -1943,4 +1950,180 @@ fn locate_hunk(ranges: &[(u32, f32, f32)], y: f32) -> Option<(u32, f32)> {
         let span = (b.2 - b.1).max(1.0);
         (b.0, ((y - b.1) / span).clamp(0.0, 1.0))
     })
+}
+
+// ---------------------------------------------------------------------------
+// Headless test harness
+// ---------------------------------------------------------------------------
+//
+// Spike: drive `diff_view::render` inside a manually-constructed imgui
+// context (no winit, no wgpu, no real window) so tests can observe scroll
+// position and other post-frame state without running the GUI.
+//
+// What works: imgui's layout/widget code runs in process; setting
+// `io.display_size` and building the default font atlas is enough for child
+// windows, text-width calculations, hit-tests and scroll bookkeeping. Tests
+// read `state.last_left_scroll_x` / `state.last_right_scroll_x` after the
+// frame returns.
+//
+// What this does NOT yet do: drive the multi-frame splice scenario
+// end-to-end. That needs applying the `pending_edits` between frames via
+// `SessionStore` methods, then re-snapshotting and re-rendering. The shape
+// is straightforward to extend; this spike just proves the harness.
+
+#[cfg(test)]
+mod headless_tests {
+    use super::*;
+    use crate::session::{SessionMode, SessionStore};
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    /// `imgui::Context` is a process-global singleton. `cargo test` runs
+    /// tests in parallel by default, so we serialize through a static
+    /// mutex. Holding the guard for the lifetime of the context guarantees
+    /// at most one active context across the process.
+    fn imgui_lock() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        // Recover from poisoning: a panicked test shouldn't block others.
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn build_ui_context() -> imgui::Context {
+        let mut ctx = imgui::Context::create();
+        ctx.io_mut().display_size = [1200.0, 800.0];
+        ctx.io_mut().delta_time = 1.0 / 60.0;
+        // Materialize the default font atlas so layouts can measure text.
+        let _atlas = ctx.fonts().build_rgba32_texture();
+        ctx
+    }
+
+    /// One render frame with no input: scroll_x should be at 0 and no pin
+    /// should be queued. Confirms the harness wiring is sound (font atlas
+    /// resolves, child windows lay out, the render fn writes back its
+    /// per-frame scroll fields).
+    #[test]
+    fn headless_render_reads_scroll_x_at_zero() {
+        let _guard = imgui_lock();
+        let store = SessionStore::new();
+        // Make one side wide enough that content_w > pane_w. Without this,
+        // horizontal scroll is permanently 0 regardless of any bug.
+        let long = "x".repeat(500);
+        let text = format!("short\n{long}\ntail\n");
+        let id = store.open_two_way(&text, &text, None).unwrap();
+
+        let snap = store.snapshot(id).unwrap();
+        let hunks = match &snap.mode {
+            SessionMode::TwoWay { hunks, .. } => hunks.clone(),
+            _ => unreachable!(),
+        };
+
+        let mut ctx = build_ui_context();
+        let ui = ctx.new_frame();
+
+        let mut view_state = DiffViewState::default();
+        let mut status = String::new();
+        let mut focus_request: Option<crate::app::FocusedPane> = None;
+        let mut pending_edits: Vec<DiffEdit> = Vec::new();
+
+        ui.window("test")
+            .size([1000.0, 600.0], imgui::Condition::Always)
+            .position([0.0, 0.0], imgui::Condition::Always)
+            .build(|| {
+                render(
+                    ui,
+                    &store,
+                    id,
+                    &hunks,
+                    &[],
+                    &mut status,
+                    &mut view_state,
+                    None,
+                    &mut focus_request,
+                    &mut pending_edits,
+                    &[],
+                    &[],
+                );
+            });
+        let _draw = ctx.render();
+
+        assert_eq!(view_state.last_left_scroll_x, 0.0);
+        assert_eq!(view_state.last_right_scroll_x, 0.0);
+        assert!(view_state.pin_scroll_x_after_splice.is_none());
+        // No keys pressed, no splice; no edits should be queued.
+        assert!(pending_edits.is_empty());
+    }
+
+    /// Pre-seed a selection on the short first line, inject Backspace via
+    /// `io.add_key_event`, render once, and verify the splice fired and
+    /// queued the scroll-x pin. Stops short of multi-frame application —
+    /// the next iteration would apply the splice edit via
+    /// `store.splice_two_way_lines`, render two more frames, and assert
+    /// `last_left_scroll_x` stayed at 0.
+    #[test]
+    fn headless_splice_sets_pin() {
+        let _guard = imgui_lock();
+        let store = SessionStore::new();
+        let long = "x".repeat(500);
+        let text = format!("hello world\n{long}\n");
+        let id = store.open_two_way(&text, &text, None).unwrap();
+
+        let snap = store.snapshot(id).unwrap();
+        let hunks = match &snap.mode {
+            SessionMode::TwoWay { hunks, .. } => hunks.clone(),
+            _ => unreachable!(),
+        };
+
+        let mut ctx = build_ui_context();
+        // Inject Backspace press for this frame.
+        ctx.io_mut().add_key_event(imgui::Key::Backspace, true);
+
+        let ui = ctx.new_frame();
+        let mut view_state = DiffViewState::default();
+        // Select "hello" on line 1 of side A.
+        view_state.selection = Some(Selection {
+            side: Side::Left,
+            anchor: SelPoint { line_no: 1, col: 0 },
+            caret: SelPoint { line_no: 1, col: 5 },
+        });
+        let mut status = String::new();
+        let mut focus_request: Option<crate::app::FocusedPane> = None;
+        let mut pending_edits: Vec<DiffEdit> = Vec::new();
+
+        ui.window("test")
+            .size([1000.0, 600.0], imgui::Condition::Always)
+            .position([0.0, 0.0], imgui::Condition::Always)
+            .build(|| {
+                render(
+                    ui,
+                    &store,
+                    id,
+                    &hunks,
+                    &[],
+                    &mut status,
+                    &mut view_state,
+                    None,
+                    &mut focus_request,
+                    &mut pending_edits,
+                    &[],
+                    &[],
+                );
+            });
+        let _draw = ctx.render();
+
+        // Splice path fired: edit queued, arrow_focus parked, pin set.
+        assert!(
+            pending_edits
+                .iter()
+                .any(|e| matches!(e, DiffEdit::SpliceTwoWayLines { .. })),
+            "expected a SpliceTwoWayLines edit to be queued",
+        );
+        assert!(view_state.selection.is_none(), "selection should be cleared after splice");
+        let (side, x, frames) = view_state
+            .pin_scroll_x_after_splice
+            .expect("pin should be set after splice");
+        assert_eq!(side, Side::Left);
+        assert_eq!(x, 0.0); // scroll_x was 0 going in
+        assert_eq!(frames, 2);
+    }
 }
