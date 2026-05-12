@@ -432,6 +432,27 @@ pub fn render(
     let max_left = (left.rows.len() as f32 * row_h() - avail[1]).max(0.0);
     let max_right = (right.rows.len() as f32 * row_h() - avail[1]).max(0.0);
 
+    // Per-side content widths — drive horizontal scrolling. Push the mono
+    // font briefly so `calc_text_size` measures the same font the rows
+    // render with, then walk each side's rows to find the widest line.
+    // A small trailing padding keeps the caret visible past the last
+    // character without immediately overflowing the scrollbar.
+    let char_w_global = {
+        let _tok = mono_font.map(|f| ui.push_font(f));
+        ui.calc_text_size("m")[0].max(1.0)
+    };
+    let max_chars = |rows: &[Row]| -> usize {
+        rows.iter()
+            .map(|r| r.segments.iter().map(|s| s.text.chars().count()).sum::<usize>())
+            .max()
+            .unwrap_or(0)
+    };
+    let content_w_for = |rows: &[Row]| -> f32 {
+        gutter_w() + (max_chars(rows) as f32) * char_w_global + 16.0
+    };
+    let content_w_left = content_w_for(&left.rows);
+    let content_w_right = content_w_for(&right.rows);
+
     // Pane geometry, computed before any child renders so we can flip the
     // render order without losing the visual layout. `set_cursor_screen_pos`
     // positions each child explicitly; `connector_origin` is derived from
@@ -469,6 +490,8 @@ pub fn render(
         ui.child_window("diffie_right")
             .size([pane_w, avail[1]])
             .border(true)
+            .horizontal_scrollbar(true)
+            .content_size([content_w_right, 0.0])
             .build(|| {
                 right_scroll.set(ui.scroll_y());
                 right_origin.set(ui.cursor_screen_pos());
@@ -489,6 +512,7 @@ pub fn render(
                     drag_active_side,
                     &char_w_cell,
                     b_highlights,
+                    content_w_right,
                 );
             });
 
@@ -527,6 +551,8 @@ pub fn render(
         ui.child_window("diffie_left")
             .size([pane_w, avail[1]])
             .border(true)
+            .horizontal_scrollbar(true)
+            .content_size([content_w_left, 0.0])
             .build(|| {
                 left_scroll.set(ui.scroll_y());
                 left_origin.set(ui.cursor_screen_pos());
@@ -547,6 +573,7 @@ pub fn render(
                     drag_active_side,
                     &char_w_cell,
                     a_highlights,
+                    content_w_left,
                 );
             });
 
@@ -571,6 +598,8 @@ pub fn render(
         ui.child_window("diffie_left")
             .size([pane_w, avail[1]])
             .border(true)
+            .horizontal_scrollbar(true)
+            .content_size([content_w_left, 0.0])
             .build(|| {
                 left_scroll.set(ui.scroll_y());
                 left_origin.set(ui.cursor_screen_pos());
@@ -591,6 +620,7 @@ pub fn render(
                     drag_active_side,
                     &char_w_cell,
                     a_highlights,
+                    content_w_left,
                 );
             });
 
@@ -625,6 +655,8 @@ pub fn render(
         ui.child_window("diffie_right")
             .size([pane_w, avail[1]])
             .border(true)
+            .horizontal_scrollbar(true)
+            .content_size([content_w_right, 0.0])
             .build(|| {
                 right_scroll.set(ui.scroll_y());
                 right_origin.set(ui.cursor_screen_pos());
@@ -645,6 +677,7 @@ pub fn render(
                     drag_active_side,
                     &char_w_cell,
                     b_highlights,
+                    content_w_right,
                 );
             });
 
@@ -1159,6 +1192,7 @@ fn draw_pane(
     drag_active: Option<Side>,
     char_w_out: &Cell<f32>,
     highlights: &[LineSpans],
+    content_w: f32,
 ) {
     let total = rows.len() as i32;
     if total == 0 {
@@ -1198,6 +1232,7 @@ fn draw_pane(
                 arrow_focus,
                 char_w_out,
                 line_hl,
+                content_w,
             ) {
                 click_out.set(Some(clicked_line));
             }
@@ -1386,6 +1421,7 @@ fn draw_row(
     arrow_focus: &Cell<Option<(Side, u32)>>,
     char_w_out: &Cell<f32>,
     line_hl: &[super::syntax::LineSpan],
+    content_w: f32,
 ) -> Option<u32> {
     let p0 = ui.cursor_screen_pos();
     let row_w = ui.content_region_avail()[0];
@@ -1520,7 +1556,10 @@ fn draw_row(
     let _pad = ui.push_style_var(StyleVar::FramePadding([2.0, 2.0]));
     let _border = ui.push_style_var(StyleVar::FrameBorderSize(0.0));
     ui.set_cursor_screen_pos([text_start_x, p0[1]]);
-    ui.set_next_item_width(row_w - gutter_w());
+    // Match the parent window's content width so the input_text spans the
+    // whole row; otherwise imgui's input_text would horizontally scroll its
+    // *own* contents on long lines, fighting the parent's scroll position.
+    ui.set_next_item_width((content_w - gutter_w()).max(1.0));
     let input_id = match row.line_no {
         Some(n) => format!("##rowedit_{:?}_{n}", side),
         None => format!("##rowedit_{:?}_idx_{idx}", side),

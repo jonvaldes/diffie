@@ -6,15 +6,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Diffie is a native desktop code diffing & 3-way merge app written in Rust.
 
-**Stack migration in progress.** The original Tauri 2 + Svelte 5 frontend has been removed; the GUI is being rebuilt natively using `imgui-rs` rendered via `wgpu`. The core diff/merge/session logic (this entire repo today, minus the deleted UI shell) is the stable foundation the new UI layer will be wired onto.
+Native GUI built with `imgui-rs` + `wgpu` + `winit`. GUI deps are gated behind the `gui` Cargo feature, which is **on by default**. The core diff/merge/session library is engine-agnostic and remains testable without GUI deps.
 
 ## Commands
 
-- `cargo test --lib` — run the core library's unit tests (no GUI dependencies).
-- `cargo build` — builds the lib and the (currently stub) binary.
-- `cargo run` — prints a placeholder message; the GUI is not yet wired.
-
-Once the GUI is added, GUI deps will live behind a `gui` Cargo feature so `cargo test --no-default-features --lib` stays cheap to run.
+- `cargo test --no-default-features --lib` — fast core-only unit tests (no GUI deps).
+- `cargo test --lib` — same tests with GUI deps compiled (slower).
+- `cargo build` / `cargo run` — builds and launches the GUI app.
+- `cargo build --no-default-features` — core library only.
 
 ## Architecture
 
@@ -36,8 +35,16 @@ Once the GUI is added, GUI deps will live behind a `gui` Cargo feature so `cargo
 - Two-way state uses `HunkDecision` (AcceptA/AcceptB/Both/Neither/Custom/PerLine). Three-way state uses `Resolution` (Local/Remote/Base/Custom). Don't conflate the two enums.
 - DTO enums serialize with `#[serde(tag = "kind", rename_all = "snake_case")]` (or `"lowercase"` for `DiffOp`) — preserved for potential state-persistence even though IPC is gone.
 
-### Planned GUI layer (not yet present)
+### GUI layer (`src/app/`)
 
-Renderer: `wgpu` + `imgui-rs` + `winit`. Result editor: `imgui-text-edit-rs`. File dialogs: `rfd`. Tabs are session-scoped (no persistence). Hunk-control buttons stay inline within their change-hunk row range.
+Renderer: `wgpu` + `imgui-rs` + `winit`. File dialogs: `rfd`. Clipboard: `arboard`. Recents persisted via `dirs` to AppData. Syntax highlighting via `tree-sitter` (rust/cpp/c#/hlsl). Undo/redo via the `undo` crate.
 
-Module layout to come under `src/app/`: `mod.rs` (App state, tab list, status), `diff_view.rs`, `merge_view.rs`, `connector.rs` (bezier ribbons + anchor lines via `ImDrawList`), `result_pane.rs`, `layout.rs` (precomputed row-y for virtualization via `ImGuiListClipper`), `char_diff.rs` (LCS character-level diff), `scroll_sync.rs` (center-anchored, last-written echo guard), `file_dialog.rs`.
+- `mod.rs` — `App`/`AppState`, tabs, menu bar, keyboard shortcuts, font loading, GPU setup. Tabs are session-scoped (no session persistence).
+- `diff_view.rs` — 2-way view. Files are **edited in place** (no result pane); bezier ribbons, hover overlay (Apply A/B), inline hunk buttons, center-anchored same-frame scroll sync via `SetNextWindowScroll`, multiline drag-selection with auto-scroll, syntax highlighting.
+- `merge_view.rs` — 3-way view; uses `result_pane.rs` for the editable merged buffer (backed by `session.manual_result`).
+- `char_diff.rs` — LCS character-level diff for paired delete/insert lines.
+- `syntax.rs`, `theme.rs` — tree-sitter highlighting + color theme.
+- `undo_stack.rs` — per-buffer undo/redo.
+- `recents.rs` — recent-files list persisted to disk.
+
+Note: 2-way no longer has a result pane (commit 25c0ead). Only 3-way uses `manual_result`.
