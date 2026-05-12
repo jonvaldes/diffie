@@ -1993,6 +1993,10 @@ mod headless_tests {
         let mut ctx = imgui::Context::create();
         ctx.io_mut().display_size = [1200.0, 800.0];
         ctx.io_mut().delta_time = 1.0 / 60.0;
+        // Enable keyboard nav so `set_keyboard_focus_here` actually engages
+        // imgui's nav system (which is what triggers `ScrollToBringRectIntoView`
+        // — the behavior we're testing for).
+        ctx.io_mut().config_flags |= imgui::ConfigFlags::NAV_ENABLE_KEYBOARD;
         // Materialize the default font atlas so layouts can measure text.
         let _atlas = ctx.fonts().build_rgba32_texture();
         ctx
@@ -2125,5 +2129,191 @@ mod headless_tests {
         assert_eq!(side, Side::Left);
         assert_eq!(x, 0.0); // scroll_x was 0 going in
         assert_eq!(frames, 2);
+    }
+
+    /// Apply a queued `DiffEdit` to the store the same way the real app
+    /// would, bypassing the undo stack (we don't care about undo in tests).
+    fn apply_edit(store: &SessionStore, edit: DiffEdit) {
+        match edit {
+            DiffEdit::SpliceTwoWayLines {
+                session_id,
+                side,
+                start,
+                end,
+                replacement,
+                ..
+            } => {
+                let _ = store.splice_two_way_lines(session_id, side, start..end, replacement);
+            }
+            DiffEdit::SetTwoWayLine {
+                session_id,
+                side,
+                line_no,
+                new_text,
+                ..
+            } => {
+                let _ = store.set_two_way_line(session_id, side, line_no, new_text);
+            }
+            DiffEdit::ReplaceHunkSide {
+                session_id,
+                hunk_id,
+                target,
+                ..
+            } => {
+                let _ = store.replace_hunk_side(session_id, hunk_id, target);
+            }
+        }
+    }
+
+    /// Run one render frame: snapshot the session, optionally inject a
+    /// Backspace press, build a Ui, call `render` inside a window, then
+    /// apply any queued `pending_edits` back to the store. Mirrors the
+    /// per-frame flow `app::mod::frame_ui` runs in the real app.
+    fn run_frame(
+        ctx: &mut imgui::Context,
+        store: &SessionStore,
+        id: crate::session::SessionId,
+        view_state: &mut DiffViewState,
+        inject_backspace: bool,
+    ) {
+        if inject_backspace {
+            ctx.io_mut().add_key_event(imgui::Key::Backspace, true);
+        }
+        let snap = store.snapshot(id).unwrap();
+        let hunks = match &snap.mode {
+            SessionMode::TwoWay { hunks, .. } => hunks.clone(),
+            _ => unreachable!(),
+        };
+        let ui = ctx.new_frame();
+        let mut status = String::new();
+        let mut focus_request: Option<crate::app::FocusedPane> = None;
+        let mut pending_edits: Vec<DiffEdit> = Vec::new();
+        ui.window("test")
+            .size([1000.0, 600.0], imgui::Condition::Always)
+            .position([0.0, 0.0], imgui::Condition::Always)
+            .build(|| {
+                render(
+                    ui,
+                    store,
+                    id,
+                    &hunks,
+                    &[],
+                    &mut status,
+                    view_state,
+                    None,
+                    &mut focus_request,
+                    &mut pending_edits,
+                    &[],
+                    &[],
+                );
+            });
+        let _draw = ctx.render();
+        for edit in pending_edits {
+            apply_edit(store, edit);
+        }
+    }
+
+    /// End-to-end state flow: pre-seed an in-line selection, press
+    /// Backspace, render four frames (splice frame + the two frames the
+    /// pin covers + an idle frame), applying queued edits to the store
+    /// between frames. Asserts:
+    ///   - the splice executed (line 1 was shortened);
+    ///   - `pin_scroll_x_after_splice` was set with countdown=2 and the
+    ///     captured x matches the splice-frame scroll_x;
+    ///   - the countdown decremented (2 → 1 → cleared);
+    ///   - scroll_x did not drift catastrophically from the splice-frame
+    ///     baseline across the pin window.
+    ///
+    /// **Caveat — does NOT prove the pin prevents imgui's nav-scroll.**
+    /// In headless mode imgui's `set_keyboard_focus_here` → nav-scroll
+    /// pipeline doesn't fire the way it does in the live app (verified
+    /// empirically by temporarily disabling the pin push: the test still
+    /// passes). Driving that path requires more nav state than a bare
+    /// `Context::create()` provides — likely a renderer-in-the-loop and
+    /// a real input flow that establishes `NavWindow`. This test catches
+    /// regressions in the state-machine wiring (the pin field's setup,
+    /// countdown, and clearing); the imgui-side override behavior is
+    /// only verified manually in the live GUI.
+    #[test]
+    fn headless_splice_preserves_scroll_x_across_pin_window() {
+        let _guard = imgui_lock();
+        let store = SessionStore::new();
+        let long = "x".repeat(500);
+        let text = format!("hello world\n{long}\n");
+        let id = store.open_two_way(&text, &text, None).unwrap();
+
+        let mut ctx = build_ui_context();
+        let mut view_state = DiffViewState::default();
+        view_state.selection = Some(Selection {
+            side: Side::Left,
+            anchor: SelPoint { line_no: 1, col: 0 },
+            caret: SelPoint { line_no: 1, col: 5 },
+        });
+
+        // Frame 1 (splice frame): Backspace pressed. Splice edit queued
+        // and applied; pin is set with countdown=2. ImGui's per-frame
+        // bookkeeping (active-widget tracking, layout) makes scroll_x
+        // settle to a non-zero baseline whose exact value depends on
+        // imgui internals — we just capture it as the reference.
+        run_frame(&mut ctx, &store, id, &mut view_state, true);
+        let snap = store.snapshot(id).unwrap();
+        if let SessionMode::TwoWay { a_lines, .. } = &snap.mode {
+            // "hello world" with "hello" removed becomes " world".
+            assert_eq!(a_lines[0], " world", "splice should have shortened line 1");
+        } else {
+            unreachable!();
+        }
+        let baseline_x = view_state.last_left_scroll_x;
+        let pin = view_state
+            .pin_scroll_x_after_splice
+            .expect("pin should be set after splice");
+        assert_eq!(pin.0, Side::Left);
+        assert_eq!(pin.2, 2);
+        assert!(
+            (pin.1 - baseline_x).abs() < 1e-3,
+            "pinned x ({}) should match this frame's captured scroll_x ({})",
+            pin.1,
+            baseline_x,
+        );
+
+        // Frame 2 (pin frame 1 of 2): the merged row's set_keyboard_focus_here
+        // fires here and would, absent the pin, queue a nav-scroll that
+        // pushes scroll_x toward (content_w - viewport_w) — i.e., several
+        // thousand pixels. The pin holds it at baseline.
+        run_frame(&mut ctx, &store, id, &mut view_state, false);
+        // The original bug pushed scroll_x to roughly (content_w - pane_w),
+        // which is several thousand pixels for our 500-char long line. A
+        // tolerance well below that — but loose enough to ignore imgui's
+        // own small per-frame layout adjustments — catches the regression.
+        const MAX_DRIFT: f32 = 200.0;
+        assert!(
+            (view_state.last_left_scroll_x - baseline_x).abs() < MAX_DRIFT,
+            "frame 2: scroll_x drifted from baseline {baseline_x} to {} (>{MAX_DRIFT}px)",
+            view_state.last_left_scroll_x,
+        );
+        assert!(matches!(
+            view_state.pin_scroll_x_after_splice,
+            Some((Side::Left, _, 1))
+        ));
+
+        // Frame 3 (pin frame 2 of 2): catches nav's ScrollTarget queued
+        // on Frame 2 that would otherwise be consumed at this frame's
+        // Begin().
+        run_frame(&mut ctx, &store, id, &mut view_state, false);
+        assert!(
+            (view_state.last_left_scroll_x - baseline_x).abs() < MAX_DRIFT,
+            "frame 3: scroll_x drifted from baseline {baseline_x} to {} (>{MAX_DRIFT}px)",
+            view_state.last_left_scroll_x,
+        );
+        assert!(view_state.pin_scroll_x_after_splice.is_none());
+
+        // Frame 4 (idle): pin has expired; scroll_x must still hold.
+        run_frame(&mut ctx, &store, id, &mut view_state, false);
+        assert!(
+            (view_state.last_left_scroll_x - baseline_x).abs() < MAX_DRIFT,
+            "frame 4: scroll_x drifted from baseline {baseline_x} to {} (>{MAX_DRIFT}px)",
+            view_state.last_left_scroll_x,
+        );
+        assert!(view_state.pin_scroll_x_after_splice.is_none());
     }
 }
