@@ -2214,6 +2214,22 @@ mod headless_tests {
         ctx
     }
 
+    /// Load the live app's mono font (RobotoMono) into the context and
+    /// return its `FontId`. Tests that care about pixel-accurate hit
+    /// testing (e.g., double-click column → byte index) must push this
+    /// font; otherwise the default proportional font's varying glyph
+    /// widths make `(click_x - widget_x0) / char_w` lie.
+    fn load_mono_font(ctx: &mut imgui::Context, size_pixels: f32) -> imgui::FontId {
+        ctx.fonts().add_font(&[imgui::FontSource::TtfData {
+            data: include_bytes!("../../assets/RobotoMono-Regular.ttf"),
+            size_pixels,
+            config: Some(imgui::FontConfig {
+                size_pixels,
+                ..Default::default()
+            }),
+        }])
+    }
+
     /// One render frame with no input: scroll_x should be at 0 and no pin
     /// should be queued. Confirms the harness wiring is sound (font atlas
     /// resolves, child windows lay out, the render fn writes back its
@@ -2640,6 +2656,7 @@ mod headless_tests {
         store: &SessionStore,
         id: crate::session::SessionId,
         view_state: &mut DiffViewState,
+        mono_font: Option<imgui::FontId>,
         input: FrameInput,
     ) {
         if let Some(pos) = input.mouse_pos {
@@ -2674,7 +2691,7 @@ mod headless_tests {
                     &[],
                     &mut status,
                     view_state,
-                    None,
+                    mono_font,
                     &mut focus_request,
                     &mut pending_edits,
                     &[],
@@ -2787,7 +2804,7 @@ mod headless_tests {
         // First click: down, then up.
         run_frame_with_wgpu(
             &mut ctx, &mut renderer, &device, &queue, target_format,
-            &store, id, &mut view_state,
+            &store, id, &mut view_state, None,
             FrameInput {
                 mouse_pos: Some(word_pos),
                 left_button: Some(true),
@@ -2796,7 +2813,7 @@ mod headless_tests {
         );
         run_frame_with_wgpu(
             &mut ctx, &mut renderer, &device, &queue, target_format,
-            &store, id, &mut view_state,
+            &store, id, &mut view_state, None,
             FrameInput { left_button: Some(false), ..Default::default() },
         );
         // Second click on the same pixel — completes the double-click
@@ -2804,7 +2821,7 @@ mod headless_tests {
         // word under the cursor.
         run_frame_with_wgpu(
             &mut ctx, &mut renderer, &device, &queue, target_format,
-            &store, id, &mut view_state,
+            &store, id, &mut view_state, None,
             FrameInput {
                 mouse_pos: Some(word_pos),
                 left_button: Some(true),
@@ -2813,7 +2830,7 @@ mod headless_tests {
         );
         run_frame_with_wgpu(
             &mut ctx, &mut renderer, &device, &queue, target_format,
-            &store, id, &mut view_state,
+            &store, id, &mut view_state, None,
             FrameInput { left_button: Some(false), ..Default::default() },
         );
 
@@ -2822,7 +2839,7 @@ mod headless_tests {
         for _ in 0..3 {
             run_frame_with_wgpu(
                 &mut ctx, &mut renderer, &device, &queue, target_format,
-                &store, id, &mut view_state, FrameInput::default(),
+                &store, id, &mut view_state, None, FrameInput::default(),
             );
         }
 
@@ -2847,19 +2864,15 @@ mod headless_tests {
         );
     }
 
-    /// Double-clicking on a punctuation character must select only that
-    /// character, not the wider run imgui's native WORDLEFT/WORDRIGHT
-    /// grabs. ImGui treats whitespace as the only word boundary, so for
-    /// non-space punct runs (which appear constantly in code: `==`, `=>`,
-    /// `::`, `target_arch=value` inside cfg attributes, etc.) it selects
-    /// the whole run when the user wants just one character.
+    /// Double-clicking on a punctuation char in a non-space run (e.g.,
+    /// `target_arch=value`, `==`, `::`) must select just the single
+    /// punct char, not the whole run. ImGui's default WORDLEFT/WORDRIGHT
+    /// uses whitespace as the only word boundary, so for runs with no
+    /// internal spaces it selects everything.
     ///
-    /// Test design: use a row of pure punct (`===`) so any click position
-    /// inside the rendered text lands on a `=`. ImGui's default selects
-    /// all three; our override selects exactly one. The character class
-    /// fix is the substance — calibrating the precise click x in
-    /// headless mode is brittle because the default font is proportional,
-    /// so the test only requires landing somewhere in the text run.
+    /// Definitive regression check: a row of `===` (three equals signs,
+    /// no whitespace) — without the fix imgui selects all three; with
+    /// the fix any click in the rendered text selects a single `=`.
     #[test]
     fn headless_wgpu_double_click_punct_selects_single_char() {
         let _guard = imgui_lock();
@@ -2868,9 +2881,6 @@ mod headless_tests {
             return;
         };
 
-        // Three punct chars, no spaces: imgui's default WORDLEFT walks
-        // to start, WORDRIGHT walks to end → selects all 3. The fix
-        // narrows to 1.
         let line = "===";
         let text = format!("{line}\n");
         let store = SessionStore::new();
@@ -2891,16 +2901,11 @@ mod headless_tests {
             },
         );
 
-        // Click somewhere in the rendered text. From earlier traces:
-        // widget_x0 ≈ 76. The 3 `=` chars span ~30px (the actual width
-        // doesn't matter for this test — any click inside the run
-        // lands on a `=`).
         let click_pos = [90.0, 40.0];
         let mut view_state = DiffViewState::default();
-
         run_frame_with_wgpu(
             &mut ctx, &mut renderer, &device, &queue, target_format,
-            &store, id, &mut view_state,
+            &store, id, &mut view_state, None,
             FrameInput {
                 mouse_pos: Some(click_pos),
                 left_button: Some(true),
@@ -2909,12 +2914,12 @@ mod headless_tests {
         );
         run_frame_with_wgpu(
             &mut ctx, &mut renderer, &device, &queue, target_format,
-            &store, id, &mut view_state,
+            &store, id, &mut view_state, None,
             FrameInput { left_button: Some(false), ..Default::default() },
         );
         run_frame_with_wgpu(
             &mut ctx, &mut renderer, &device, &queue, target_format,
-            &store, id, &mut view_state,
+            &store, id, &mut view_state, None,
             FrameInput {
                 mouse_pos: Some(click_pos),
                 left_button: Some(true),
@@ -2923,13 +2928,13 @@ mod headless_tests {
         );
         run_frame_with_wgpu(
             &mut ctx, &mut renderer, &device, &queue, target_format,
-            &store, id, &mut view_state,
+            &store, id, &mut view_state, None,
             FrameInput { left_button: Some(false), ..Default::default() },
         );
         for _ in 0..2 {
             run_frame_with_wgpu(
                 &mut ctx, &mut renderer, &device, &queue, target_format,
-                &store, id, &mut view_state, FrameInput::default(),
+                &store, id, &mut view_state, None, FrameInput::default(),
             );
         }
 
@@ -2938,10 +2943,116 @@ mod headless_tests {
             .expect("imgui input_text should have a selection after double-click");
         assert_eq!(ln, 1);
         let selected = &line[start..end];
-        // With the fix: single `=`. Without: "===".
         assert_eq!(
             selected, "=",
             "expected single '=' to be selected; got bytes {start}..{end} = {selected:?}",
+        );
+    }
+
+    /// User-reported scenario: double-clicking on `=` in
+    /// `#[cfg(target_arch = "wasm32")]` selects just `=`, not
+    /// `target_arch`. This test loads the live app's mono font
+    /// (RobotoMono) so `char_w` matches imgui's hit-test and we can
+    /// drive a click at the exact `=` column.
+    ///
+    /// Note: imgui's default WORDLEFT/WORDRIGHT happens to also select
+    /// just `=` when the cursor lands directly on it (because `=` is
+    /// flanked by spaces, forming a one-char non-space run). So this
+    /// test PASSES with or without the override fix — it's a scenario
+    /// documentation rather than a bug-catcher. The punct-run test
+    /// above is the regression gate for the user's underlying class
+    /// of issue (no-space punct runs).
+    #[test]
+    fn headless_wgpu_double_click_equal_in_cfg_selects_just_equal() {
+        let _guard = imgui_lock();
+        let Some((device, queue)) = try_init_wgpu() else {
+            eprintln!("skipping: no wgpu adapter available");
+            return;
+        };
+
+        let line = "#[cfg(target_arch = \"wasm32\")]";
+        let text = format!("{line}\n");
+        let store = SessionStore::new();
+        let id = store.open_two_way(&text, &text, None).unwrap();
+
+        let mut ctx = imgui::Context::create();
+        ctx.io_mut().display_size = [1200.0, 800.0];
+        ctx.io_mut().delta_time = 1.0 / 60.0;
+        ctx.io_mut().config_flags |= imgui::ConfigFlags::NAV_ENABLE_KEYBOARD;
+        // Load mono font so calc_text_size("m") returns the per-char
+        // width imgui actually uses for hit-testing — without this the
+        // default proportional font breaks our column math.
+        let mono = load_mono_font(&mut ctx, 13.0);
+        let target_format = wgpu::TextureFormat::Rgba8UnormSrgb;
+        let mut renderer = imgui_wgpu::Renderer::new(
+            &mut ctx,
+            &device,
+            &queue,
+            imgui_wgpu::RendererConfig {
+                texture_format: target_format,
+                ..Default::default()
+            },
+        );
+
+        // The `=` is at byte (and char) index 18. With the mono font
+        // and 1200×800 display, widget_x0 ≈ 76 and char_w ≈ 7.8;
+        // x ≈ 76 + 18*7.8 ≈ 217. We sweep a small range to absorb any
+        // few-pixel drift; with the mono font in place this only needs
+        // one or two iterations to hit `=`, and crucially the imgui
+        // state doesn't bleed because the override fires once on each
+        // double-click detection.
+        let equal_byte_idx = 18;
+        let mut hit_equal = false;
+        for click_x in (160..=220).step_by(2) {
+            let mut view_state = DiffViewState::default();
+            let click_pos = [click_x as f32, 40.0];
+            run_frame_with_wgpu(
+                &mut ctx, &mut renderer, &device, &queue, target_format,
+                &store, id, &mut view_state, Some(mono),
+                FrameInput {
+                    mouse_pos: Some(click_pos),
+                    left_button: Some(true),
+                    ..Default::default()
+                },
+            );
+            run_frame_with_wgpu(
+                &mut ctx, &mut renderer, &device, &queue, target_format,
+                &store, id, &mut view_state, Some(mono),
+                FrameInput { left_button: Some(false), ..Default::default() },
+            );
+            run_frame_with_wgpu(
+                &mut ctx, &mut renderer, &device, &queue, target_format,
+                &store, id, &mut view_state, Some(mono),
+                FrameInput {
+                    mouse_pos: Some(click_pos),
+                    left_button: Some(true),
+                    ..Default::default()
+                },
+            );
+            run_frame_with_wgpu(
+                &mut ctx, &mut renderer, &device, &queue, target_format,
+                &store, id, &mut view_state, Some(mono),
+                FrameInput { left_button: Some(false), ..Default::default() },
+            );
+            for _ in 0..2 {
+                run_frame_with_wgpu(
+                    &mut ctx, &mut renderer, &device, &queue, target_format,
+                    &store, id, &mut view_state, Some(mono), FrameInput::default(),
+                );
+            }
+
+            let Some((_, ln, start, end)) = view_state.last_active_input_selection else {
+                continue;
+            };
+            assert_eq!(ln, 1);
+            if start == equal_byte_idx && end == equal_byte_idx + 1 {
+                hit_equal = true;
+                break;
+            }
+        }
+        assert!(
+            hit_equal,
+            "no swept x position selected exactly '='; calibration drifted",
         );
     }
 
@@ -3003,7 +3114,7 @@ mod headless_tests {
         // Engage NavWindow: click + release inside the left pane.
         run_frame_with_wgpu(
             &mut ctx, &mut renderer, &device, &queue, target_format,
-            &store, id, &mut view_state,
+            &store, id, &mut view_state, None,
             FrameInput {
                 mouse_pos: Some([150.0, 80.0]),
                 left_button: Some(true),
@@ -3012,7 +3123,7 @@ mod headless_tests {
         );
         run_frame_with_wgpu(
             &mut ctx, &mut renderer, &device, &queue, target_format,
-            &store, id, &mut view_state,
+            &store, id, &mut view_state, None,
             FrameInput { left_button: Some(false), ..Default::default() },
         );
         view_state.selection = Some(Selection {
@@ -3024,7 +3135,7 @@ mod headless_tests {
         // Splice frame: Backspace pressed.
         run_frame_with_wgpu(
             &mut ctx, &mut renderer, &device, &queue, target_format,
-            &store, id, &mut view_state,
+            &store, id, &mut view_state, None,
             FrameInput { backspace: true, ..Default::default() },
         );
         let snap = store.snapshot(id).unwrap();
@@ -3041,7 +3152,7 @@ mod headless_tests {
         for _ in 0..15 {
             run_frame_with_wgpu(
                 &mut ctx, &mut renderer, &device, &queue, target_format,
-                &store, id, &mut view_state, FrameInput::default(),
+                &store, id, &mut view_state, None, FrameInput::default(),
             );
         }
 
