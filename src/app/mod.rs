@@ -26,6 +26,7 @@ use crate::session::{SessionId, SessionMode, SessionStore};
 
 mod char_diff;
 mod diff_view;
+pub mod input;
 mod merge_view;
 mod recents;
 mod result_pane;
