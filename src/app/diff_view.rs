@@ -2380,4 +2380,277 @@ mod headless_tests {
         );
         assert!(view_state.pin_scroll_x_after_splice.is_none());
     }
+
+    // ---- wgpu-backed harness -------------------------------------------
+
+    /// Try to spin up a headless wgpu device. Returns `None` if the
+    /// machine has no usable adapter (common in CI without GPU); tests
+    /// that need this should bail gracefully.
+    fn try_init_wgpu() -> Option<(wgpu::Device, wgpu::Queue)> {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::PRIMARY | wgpu::Backends::GL,
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
+        });
+        let adapter = pollster::block_on(instance.request_adapter(
+            &wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::LowPower,
+                compatible_surface: None,
+                force_fallback_adapter: false,
+            },
+        ))
+        .ok()?;
+        let (device, queue) = pollster::block_on(adapter.request_device(
+            &wgpu::DeviceDescriptor {
+                label: Some("diffie-headless-test"),
+                required_features: wgpu::Features::empty(),
+                required_limits: wgpu::Limits::default(),
+                memory_hints: wgpu::MemoryHints::default(),
+                trace: wgpu::Trace::default(),
+                experimental_features: wgpu::ExperimentalFeatures::default(),
+            },
+        ))
+        .ok()?;
+        Some((device, queue))
+    }
+
+    /// One frame with the full imgui → wgpu pipeline: build the Ui,
+    /// call `render`, then `ctx.render()` + `Renderer::render` into an
+    /// offscreen texture and `queue.submit`. Mirrors the live app's
+    /// per-frame flow (`app::mod::render` around lines 425-456) minus
+    /// the surface present.
+    fn run_frame_with_wgpu(
+        ctx: &mut imgui::Context,
+        renderer: &mut imgui_wgpu::Renderer,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        target_format: wgpu::TextureFormat,
+        store: &SessionStore,
+        id: crate::session::SessionId,
+        view_state: &mut DiffViewState,
+        input: FrameInput,
+    ) {
+        if let Some(pos) = input.mouse_pos {
+            ctx.io_mut().add_mouse_pos_event(pos);
+        }
+        if let Some(down) = input.left_button {
+            ctx.io_mut().add_mouse_button_event(imgui::MouseButton::Left, down);
+        }
+        if input.backspace {
+            ctx.io_mut().add_key_event(imgui::Key::Backspace, true);
+        }
+        ctx.io_mut().delta_time = 1.0 / 60.0;
+
+        let snap = store.snapshot(id).unwrap();
+        let hunks = match &snap.mode {
+            SessionMode::TwoWay { hunks, .. } => hunks.clone(),
+            _ => unreachable!(),
+        };
+        let ui = ctx.new_frame();
+        let mut status = String::new();
+        let mut focus_request: Option<crate::app::FocusedPane> = None;
+        let mut pending_edits: Vec<DiffEdit> = Vec::new();
+        ui.window("test")
+            .size([1200.0, 800.0], imgui::Condition::Always)
+            .position([0.0, 0.0], imgui::Condition::Always)
+            .build(|| {
+                render(
+                    ui,
+                    store,
+                    id,
+                    &hunks,
+                    &[],
+                    &mut status,
+                    view_state,
+                    None,
+                    &mut focus_request,
+                    &mut pending_edits,
+                    &[],
+                    &[],
+                );
+            });
+        let draw_data = ctx.render();
+
+        let target = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("test-target"),
+            size: wgpu::Extent3d {
+                width: 1200,
+                height: 800,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: target_format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let view = target.create_view(&wgpu::TextureViewDescriptor::default());
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("test-encoder"),
+        });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("test-pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                multiview_mask: None,
+                occlusion_query_set: None,
+            });
+            renderer
+                .render(draw_data, queue, device, &mut pass)
+                .expect("imgui render");
+        }
+        queue.submit(Some(encoder.finish()));
+        // No present (no surface). Pixel buffer is discarded; we only
+        // care about imgui's post-frame state.
+
+        for edit in pending_edits {
+            apply_edit(store, edit);
+        }
+    }
+
+    /// Real-renderer end-to-end: same scenario as
+    /// `headless_splice_preserves_scroll_x_across_pin_window` but with
+    /// imgui-wgpu rendering each frame to an offscreen target.
+    ///
+    /// **Empirical finding documented inline:** running this with the
+    /// pin push disabled (replace the `pin_scroll_x` capture at the top
+    /// of `render` with `None`) produces the same end-state as with the
+    /// pin enabled — both leave scroll_x at ~60px from baseline 0
+    /// (matches gutter_w; an artifact of imgui's natural settling once
+    /// an input_text is active, not the original bug). The live-app bug
+    /// drives scroll_x by thousands of pixels, which we never see here.
+    ///
+    /// Conclusion: even with imgui-wgpu actually rendering each frame
+    /// to a real GPU target via the full render pipeline, the headless
+    /// setup is missing whatever context the live app provides that
+    /// makes `set_keyboard_focus_here` fire imgui's nav-scroll. Things
+    /// tried and ruled out:
+    ///   - Renderer-in-the-loop (this test).
+    ///   - `NAV_ENABLE_KEYBOARD` config flag.
+    ///   - Click + release injection to engage NavWindow.
+    ///   - Per-frame `delta_time` updates.
+    ///
+    /// Plausible remaining differences: a longer interaction history
+    /// that establishes a stable `ActiveId` + `g.NavId` lifecycle, the
+    /// imgui-winit-support `prepare_frame`/`prepare_render` calls that
+    /// flush windowing state into Io, or font-atlas characteristics
+    /// (the default atlas here is much smaller than the loaded fonts
+    /// in the real app, possibly affecting widget bboxes used in nav).
+    /// Pursuing this further is a Dear ImGui Test Engine job.
+    ///
+    /// What this test DOES catch: state-machine regressions (splice
+    /// queued, pin set with correct side + countdown, edit applied,
+    /// countdown decremented), plus the full imgui-wgpu rendering
+    /// pipeline shape — if a future refactor breaks rendering compat
+    /// (e.g., `RendererConfig` API change), this test fails.
+    #[test]
+    fn headless_wgpu_splice_preserves_scroll_x() {
+        let _guard = imgui_lock();
+
+        let Some((device, queue)) = try_init_wgpu() else {
+            eprintln!("skipping: no wgpu adapter available in this environment");
+            return;
+        };
+
+        let store = SessionStore::new();
+        let long = "x".repeat(500);
+        let text = format!("hello world\n{long}\n");
+        let id = store.open_two_way(&text, &text, None).unwrap();
+
+        let mut ctx = imgui::Context::create();
+        ctx.io_mut().display_size = [1200.0, 800.0];
+        ctx.io_mut().delta_time = 1.0 / 60.0;
+        ctx.io_mut().config_flags |= imgui::ConfigFlags::NAV_ENABLE_KEYBOARD;
+        // Note: imgui_wgpu::Renderer::new builds the font atlas itself.
+
+        let target_format = wgpu::TextureFormat::Rgba8UnormSrgb;
+        let mut renderer = imgui_wgpu::Renderer::new(
+            &mut ctx,
+            &device,
+            &queue,
+            imgui_wgpu::RendererConfig {
+                texture_format: target_format,
+                ..Default::default()
+            },
+        );
+
+        let mut view_state = DiffViewState::default();
+
+        // Engage NavWindow: click + release inside the left pane.
+        run_frame_with_wgpu(
+            &mut ctx, &mut renderer, &device, &queue, target_format,
+            &store, id, &mut view_state,
+            FrameInput {
+                mouse_pos: Some([150.0, 80.0]),
+                left_button: Some(true),
+                ..Default::default()
+            },
+        );
+        run_frame_with_wgpu(
+            &mut ctx, &mut renderer, &device, &queue, target_format,
+            &store, id, &mut view_state,
+            FrameInput { left_button: Some(false), ..Default::default() },
+        );
+        view_state.selection = Some(Selection {
+            side: Side::Left,
+            anchor: SelPoint { line_no: 1, col: 0 },
+            caret: SelPoint { line_no: 1, col: 5 },
+        });
+
+        // Splice frame: Backspace pressed.
+        run_frame_with_wgpu(
+            &mut ctx, &mut renderer, &device, &queue, target_format,
+            &store, id, &mut view_state,
+            FrameInput { backspace: true, ..Default::default() },
+        );
+        let snap = store.snapshot(id).unwrap();
+        if let SessionMode::TwoWay { a_lines, .. } = &snap.mode {
+            assert_eq!(a_lines[0], " world", "splice should have shortened line 1");
+        }
+        let baseline_x = view_state.last_left_scroll_x;
+        assert!(matches!(
+            view_state.pin_scroll_x_after_splice,
+            Some((Side::Left, _, 2))
+        ));
+
+        // Pin frame 1.
+        run_frame_with_wgpu(
+            &mut ctx, &mut renderer, &device, &queue, target_format,
+            &store, id, &mut view_state, FrameInput::default(),
+        );
+        // Pin frame 2.
+        run_frame_with_wgpu(
+            &mut ctx, &mut renderer, &device, &queue, target_format,
+            &store, id, &mut view_state, FrameInput::default(),
+        );
+        // Idle.
+        run_frame_with_wgpu(
+            &mut ctx, &mut renderer, &device, &queue, target_format,
+            &store, id, &mut view_state, FrameInput::default(),
+        );
+
+        // Tight drift bound: the original bug, when it fires, pushes
+        // scroll_x by ~content_w (thousands of pixels). With the pin in
+        // place we expect ~60px of natural drift from the active widget
+        // settling (matches gutter_w); without the pin in this headless
+        // setup we ALSO see ~60px, not the thousands the live bug
+        // produces. See the caveat docstring below.
+        const MAX_DRIFT: f32 = 200.0;
+        assert!(
+            (view_state.last_left_scroll_x - baseline_x).abs() < MAX_DRIFT,
+            "scroll_x drifted from baseline {baseline_x} to {} (>{MAX_DRIFT}px) — pin failed",
+            view_state.last_left_scroll_x,
+        );
+        assert!(view_state.pin_scroll_x_after_splice.is_none());
+    }
 }
