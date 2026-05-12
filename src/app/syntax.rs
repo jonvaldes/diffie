@@ -353,110 +353,13 @@ pub fn table_for(bg: HlBg) -> &'static ColorTable {
 }
 
 /// Force the OnceLocks to populate now. Called once at app startup so the
-/// contrast math doesn't run on the first frame's hot path. Also prints a
-/// diagnostic of the Insert (green) tables so we can verify visually what
-/// the adapt pipeline produced.
+/// contrast math doesn't run on the first frame's hot path.
 pub fn prime_tables() {
     let _ = table_for(HlBg::None);
     let _ = table_for(HlBg::DeleteRow);
     let _ = table_for(HlBg::DeleteHl);
     let _ = table_for(HlBg::InsertRow);
     let _ = table_for(HlBg::InsertHl);
-    debug_print_green_tables();
-}
-
-fn rgb_to_hsv(c: [f32; 4]) -> [f32; 3] {
-    let r = c[0];
-    let g = c[1];
-    let b = c[2];
-    let max = r.max(g).max(b);
-    let min = r.min(g).min(b);
-    let delta = max - min;
-    let v = max;
-    let s = if max > 1e-6 { delta / max } else { 0.0 };
-    let h = if delta < 1e-6 {
-        0.0
-    } else if (max - r).abs() < 1e-6 {
-        60.0 * (g - b) / delta
-    } else if (max - g).abs() < 1e-6 {
-        60.0 * (b - r) / delta + 120.0
-    } else {
-        60.0 * (r - g) / delta + 240.0
-    };
-    let h = if h < 0.0 { h + 360.0 } else { h };
-    [h, s, v]
-}
-
-fn fmt_rgb(c: [f32; 4]) -> String {
-    let to_u8 = |x: f32| (x.clamp(0.0, 1.0) * 255.0).round() as u8;
-    format!("#{:02X}{:02X}{:02X}", to_u8(c[0]), to_u8(c[1]), to_u8(c[2]))
-}
-
-fn fmt_hsv(c: [f32; 4]) -> String {
-    let h = rgb_to_hsv(c);
-    format!("({:>3.0}°, {:>3.0}%, {:>3.0}%)", h[0], h[1] * 100.0, h[2] * 100.0)
-}
-
-fn debug_print_green_tables() {
-    let row_bg = insert_row_bg();
-    let hl_bg = insert_hl_bg();
-    let row_table = table_for(HlBg::InsertRow);
-    let hl_table = table_for(HlBg::InsertHl);
-
-    let row_bg_l = lab_of(row_bg)[0];
-    let hl_bg_l = lab_of(hl_bg)[0];
-
-    eprintln!(
-        "InsertRow bg : {} {}  Lab L*={:.1}",
-        fmt_rgb(row_bg),
-        fmt_hsv(row_bg),
-        row_bg_l
-    );
-    eprintln!(
-        "InsertHl  bg : {} {}  Lab L*={:.1}",
-        fmt_rgb(hl_bg),
-        fmt_hsv(hl_bg),
-        hl_bg_l
-    );
-
-    let kinds: &[(&str, Option<SyntaxKind>, [f32; 4])] = &[
-        ("Keyword", Some(SyntaxKind::Keyword), theme::MAUVE),
-        ("Type", Some(SyntaxKind::Type), theme::YELLOW),
-        ("String", Some(SyntaxKind::String), theme::GREEN),
-        ("Number", Some(SyntaxKind::Number), theme::PEACH),
-        ("Comment", Some(SyntaxKind::Comment), theme::OVERLAY1),
-        ("Function", Some(SyntaxKind::Function), theme::BLUE),
-        ("Preproc", Some(SyntaxKind::Preproc), theme::PINK),
-        ("Constant", Some(SyntaxKind::Constant), theme::PEACH),
-        ("default", None, theme::TEXT),
-    ];
-
-    let print_table = |label: &str, table: &ColorTable, bg: [f32; 4]| {
-        let bg_y = wcag_luminance(bg);
-        eprintln!();
-        eprintln!("== {label} ==");
-        eprintln!(
-            "{:<8} | {:<8} {:<19} -> {:<8} {:<19} | WCAG",
-            "Kind", "InitRGB", "InitHSV", "FinalRGB", "FinalHSV"
-        );
-        for (name, kind, init) in kinds {
-            let final_color = table.get(*kind);
-            let wcag = wcag_ratio(wcag_luminance(final_color), bg_y);
-            eprintln!(
-                "{:<8} | {:<8} {:<19} -> {:<8} {:<19} | {:>5.2}",
-                name,
-                fmt_rgb(*init),
-                fmt_hsv(*init),
-                fmt_rgb(final_color),
-                fmt_hsv(final_color),
-                wcag
-            );
-        }
-    };
-
-    print_table("InsertRow", row_table, row_bg);
-    print_table("InsertHl", hl_table, hl_bg);
-    eprintln!();
 }
 
 /// A colored run within a line. `start_col` / `end_col` are **char** indices

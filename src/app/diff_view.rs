@@ -429,138 +429,233 @@ pub fn render(
     let drag_active_side = state.drag.as_ref().map(|d| d.side);
 
     let frame_selection = state.selection.clone();
-
-    // Same-frame scroll sync. The mouse-wheel input is normally consumed by
-    // imgui's NewFrame and applied to the hovered child window's `Scroll`
-    // field. We pre-compute the resulting scroll for the driver pane, run
-    // `target_scroll` to derive the follower's matching position, then
-    // push both via `igSetNextWindowScroll` — which is consumed during
-    // each child's `Begin` *this* frame, so the two panes land in sync
-    // without the one-frame lag the old `pending_X` → `set_scroll_y`-inside-
-    // closure round-trip produced. Non-wheel scroll changes (scrollbar
-    // drag, programmatic) still go through the existing `pending_X` path
-    // and incur the same one-frame delay they always have.
-    let panes_origin = ui.cursor_screen_pos();
-    let left_x0 = panes_origin[0];
-    let left_x1 = left_x0 + pane_w;
-    let right_x0 = left_x1 + CONNECTOR_W;
-    let right_x1 = right_x0 + pane_w;
-    let pane_top = panes_origin[1];
-    let pane_bot = panes_origin[1] + avail[1];
-    let mouse_pos = ui.io().mouse_pos;
-    let wheel = ui.io().mouse_wheel;
-    let wheel_step = ui.text_line_height_with_spacing() * 5.0;
     let max_left = (left.rows.len() as f32 * row_h() - avail[1]).max(0.0);
     let max_right = (right.rows.len() as f32 * row_h() - avail[1]).max(0.0);
 
-    let in_left = mouse_pos[0] >= left_x0
-        && mouse_pos[0] < left_x1
-        && mouse_pos[1] >= pane_top
-        && mouse_pos[1] < pane_bot;
-    let in_right = mouse_pos[0] >= right_x0
-        && mouse_pos[0] < right_x1
-        && mouse_pos[1] >= pane_top
-        && mouse_pos[1] < pane_bot;
+    // Pane geometry, computed before any child renders so we can flip the
+    // render order without losing the visual layout. `set_cursor_screen_pos`
+    // positions each child explicitly; `connector_origin` is derived from
+    // geometry rather than the cursor between the two children.
+    let panes_top_left = ui.cursor_screen_pos();
+    let left_pos = panes_top_left;
+    let right_pos = [panes_top_left[0] + pane_w + CONNECTOR_W, panes_top_left[1]];
+    let connector_origin = [panes_top_left[0] + pane_w, panes_top_left[1]];
 
-    let (wheel_left_target, wheel_right_target): (Option<f32>, Option<f32>) =
-        if wheel.abs() > 1e-3 && in_left {
-            let new_left = (state.last_left - wheel * wheel_step).clamp(0.0, max_left);
-            let t_right = target_scroll(
-                new_left,
+    // Driver detection: which pane is the mouse hovering when the wheel
+    // fires? We need to know up-front so we can render the driver first,
+    // capture its post-wheel scroll, and push the follower's matching
+    // scroll via `igSetNextWindowScroll` — all within the same frame.
+    let mouse_pos = ui.io().mouse_pos;
+    let wheel = ui.io().mouse_wheel;
+    let in_y = mouse_pos[1] >= panes_top_left[1]
+        && mouse_pos[1] < panes_top_left[1] + avail[1];
+    let in_right_x =
+        mouse_pos[0] >= right_pos[0] && mouse_pos[0] < right_pos[0] + pane_w;
+    let right_first = wheel.abs() > 1e-3 && in_y && in_right_x;
+
+    // --- Inline closures kept lightweight by separating "render" from the
+    // sync math. Each render branch threads the same state mutations
+    // (pending_X, written_X) explicitly to keep the borrow checker happy.
+
+    if right_first {
+        // --- right is driver: render right first ---
+        ui.set_cursor_screen_pos(right_pos);
+        if let Some(y) = state.pending_right.take() {
+            unsafe {
+                imgui::sys::igSetNextWindowScroll(imgui::sys::ImVec2 { x: -1.0, y });
+            }
+            state.written_right = Some(y);
+        }
+        ui.child_window("diffie_right")
+            .size([pane_w, avail[1]])
+            .border(true)
+            .build(|| {
+                right_scroll.set(ui.scroll_y());
+                right_origin.set(ui.cursor_screen_pos());
+                right_visible.set(ui.content_region_avail()[1]);
+                draw_pane(
+                    ui,
+                    &right.rows,
+                    Side::Right,
+                    session_id,
+                    &anchored_b,
+                    &right_click,
+                    mono_font,
+                    frame_selection.as_ref(),
+                    &focus_event,
+                    &line_remove,
+                    pending_edits,
+                    &arrow_focus_cell,
+                    drag_active_side,
+                    &char_w_cell,
+                    b_highlights,
+                );
+            });
+
+        // Right pane has applied its wheel-induced scroll — derive matching
+        // left target same-frame.
+        let cur_right_for_sync = right_scroll.get();
+        let r_changed = (cur_right_for_sync - state.last_right).abs() > ECHO_TOLERANCE;
+        let r_echo = state
+            .written_right
+            .map_or(false, |w| (cur_right_for_sync - w).abs() < ECHO_TOLERANCE);
+        let left_override = if r_changed && !r_echo {
+            target_scroll(
+                cur_right_for_sync,
                 avail[1],
                 avail[1],
-                &left.ranges,
                 &right.ranges,
-            )
-            .map(|t| t.clamp(0.0, max_right));
-            (Some(new_left), t_right)
-        } else if wheel.abs() > 1e-3 && in_right {
-            let new_right = (state.last_right - wheel * wheel_step).clamp(0.0, max_right);
-            let t_left = target_scroll(
-                new_right,
-                avail[1],
-                avail[1],
-                &right.ranges,
                 &left.ranges,
             )
-            .map(|t| t.clamp(0.0, max_left));
-            (t_left, Some(new_right))
+            .map(|t| t.clamp(0.0, max_left))
         } else {
-            (None, None)
+            None
         };
+        // Always drain `pending_left` so a same-frame override never leaves a
+        // stale value queued for the next frame (which would snap-back the
+        // scroll when the wheel rate dips below threshold mid-gesture).
+        let pending_consumed = state.pending_left.take();
+        let apply_left = left_override.or(pending_consumed);
 
-    // Wheel overrides pending; pending applies for non-wheel-driven syncs.
-    let apply_left = wheel_left_target.or_else(|| state.pending_left.take());
-    let apply_right = wheel_right_target.or_else(|| state.pending_right.take());
-
-    if let Some(y) = apply_left {
-        unsafe {
-            imgui::sys::igSetNextWindowScroll(imgui::sys::ImVec2 { x: -1.0, y });
+        ui.set_cursor_screen_pos(left_pos);
+        if let Some(y) = apply_left {
+            unsafe {
+                imgui::sys::igSetNextWindowScroll(imgui::sys::ImVec2 { x: -1.0, y });
+            }
+            state.written_left = Some(y);
         }
-        state.written_left = Some(y);
-    }
-    ui.child_window("diffie_left")
-        .size([pane_w, avail[1]])
-        .border(true)
-        .build(|| {
-            left_scroll.set(ui.scroll_y());
-            left_origin.set(ui.cursor_screen_pos());
-            left_visible.set(ui.content_region_avail()[1]);
-            draw_pane(
-                ui,
-                &left.rows,
-                Side::Left,
-                session_id,
-                &anchored_a,
-                &left_click,
-                mono_font,
-                frame_selection.as_ref(),
-                &focus_event,
-                &line_remove,
-                pending_edits,
-                &arrow_focus_cell,
-                drag_active_side,
-                &char_w_cell,
-                a_highlights,
-            );
-        });
+        ui.child_window("diffie_left")
+            .size([pane_w, avail[1]])
+            .border(true)
+            .build(|| {
+                left_scroll.set(ui.scroll_y());
+                left_origin.set(ui.cursor_screen_pos());
+                left_visible.set(ui.content_region_avail()[1]);
+                draw_pane(
+                    ui,
+                    &left.rows,
+                    Side::Left,
+                    session_id,
+                    &anchored_a,
+                    &left_click,
+                    mono_font,
+                    frame_selection.as_ref(),
+                    &focus_event,
+                    &line_remove,
+                    pending_edits,
+                    &arrow_focus_cell,
+                    drag_active_side,
+                    &char_w_cell,
+                    a_highlights,
+                );
+            });
 
-    ui.same_line_with_spacing(0.0, 0.0);
-    let connector_origin = ui.cursor_screen_pos();
-    ui.dummy([CONNECTOR_W, avail[1]]);
-    ui.same_line_with_spacing(0.0, 0.0);
-
-    if let Some(y) = apply_right {
-        unsafe {
-            imgui::sys::igSetNextWindowScroll(imgui::sys::ImVec2 { x: -1.0, y });
+        // Stamp `written_X` with the actually-rendered scroll values, not
+        // the floats we requested. Imgui rounds Scroll to whole pixels, so
+        // when `left_override` is fractional (e.g. 2369.5) the echoed value
+        // comes back as 2369.0 — exactly `ECHO_TOLERANCE` off, which the
+        // strict `<` check trips into `!l_echo` and `sync_scrolls` queues a
+        // stale `pending_right`. Storing the post-render value makes the
+        // echo check exact.
+        state.written_left = Some(left_scroll.get());
+        state.written_right = Some(cur_right_for_sync);
+    } else {
+        // --- left is driver (or no wheel): render left first ---
+        ui.set_cursor_screen_pos(left_pos);
+        if let Some(y) = state.pending_left.take() {
+            unsafe {
+                imgui::sys::igSetNextWindowScroll(imgui::sys::ImVec2 { x: -1.0, y });
+            }
+            state.written_left = Some(y);
         }
-        state.written_right = Some(y);
+        ui.child_window("diffie_left")
+            .size([pane_w, avail[1]])
+            .border(true)
+            .build(|| {
+                left_scroll.set(ui.scroll_y());
+                left_origin.set(ui.cursor_screen_pos());
+                left_visible.set(ui.content_region_avail()[1]);
+                draw_pane(
+                    ui,
+                    &left.rows,
+                    Side::Left,
+                    session_id,
+                    &anchored_a,
+                    &left_click,
+                    mono_font,
+                    frame_selection.as_ref(),
+                    &focus_event,
+                    &line_remove,
+                    pending_edits,
+                    &arrow_focus_cell,
+                    drag_active_side,
+                    &char_w_cell,
+                    a_highlights,
+                );
+            });
+
+        let cur_left_for_sync = left_scroll.get();
+        let l_changed = (cur_left_for_sync - state.last_left).abs() > ECHO_TOLERANCE;
+        let l_echo = state
+            .written_left
+            .map_or(false, |w| (cur_left_for_sync - w).abs() < ECHO_TOLERANCE);
+        let right_override = if l_changed && !l_echo {
+            target_scroll(
+                cur_left_for_sync,
+                avail[1],
+                avail[1],
+                &left.ranges,
+                &right.ranges,
+            )
+            .map(|t| t.clamp(0.0, max_right))
+        } else {
+            None
+        };
+        // Always drain `pending_right` — see the right_first branch for why.
+        let pending_consumed = state.pending_right.take();
+        let apply_right = right_override.or(pending_consumed);
+
+        ui.set_cursor_screen_pos(right_pos);
+        if let Some(y) = apply_right {
+            unsafe {
+                imgui::sys::igSetNextWindowScroll(imgui::sys::ImVec2 { x: -1.0, y });
+            }
+            state.written_right = Some(y);
+        }
+        ui.child_window("diffie_right")
+            .size([pane_w, avail[1]])
+            .border(true)
+            .build(|| {
+                right_scroll.set(ui.scroll_y());
+                right_origin.set(ui.cursor_screen_pos());
+                right_visible.set(ui.content_region_avail()[1]);
+                draw_pane(
+                    ui,
+                    &right.rows,
+                    Side::Right,
+                    session_id,
+                    &anchored_b,
+                    &right_click,
+                    mono_font,
+                    frame_selection.as_ref(),
+                    &focus_event,
+                    &line_remove,
+                    pending_edits,
+                    &arrow_focus_cell,
+                    drag_active_side,
+                    &char_w_cell,
+                    b_highlights,
+                );
+            });
+
+        // Mirror of the right_first branch — see comment there. Store the
+        // actually-rendered scrolls so the next frame's echo check is exact.
+        let cur_right_post = right_scroll.get();
+        state.written_left = Some(cur_left_for_sync);
+        state.written_right = Some(cur_right_post);
     }
-    ui.child_window("diffie_right")
-        .size([pane_w, avail[1]])
-        .border(true)
-        .build(|| {
-            right_scroll.set(ui.scroll_y());
-            right_origin.set(ui.cursor_screen_pos());
-            right_visible.set(ui.content_region_avail()[1]);
-            draw_pane(
-                ui,
-                &right.rows,
-                Side::Right,
-                session_id,
-                &anchored_b,
-                &right_click,
-                mono_font,
-                frame_selection.as_ref(),
-                &focus_event,
-                &line_remove,
-                pending_edits,
-                &arrow_focus_cell,
-                drag_active_side,
-                &char_w_cell,
-                b_highlights,
-            );
-        });
+    // Restore the cursor below the diff area for any subsequent widgets.
+    ui.set_cursor_screen_pos([panes_top_left[0], panes_top_left[1] + avail[1]]);
 
     if let Some(p) = focus_event.get() {
         *focus_request = Some(p);
