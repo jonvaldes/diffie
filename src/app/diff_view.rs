@@ -69,6 +69,13 @@ pub struct DiffViewState {
     /// stale write was the root cause of "undo immediately reapplies the
     /// edit" loops while the row had focus.
     pub input_epoch: u32,
+    /// One-shot horizontal scroll pin applied on the frame right after a
+    /// multi-line selection splice. The splice queues `arrow_focus` to
+    /// refocus the surviving row, which triggers imgui's nav-scroll to
+    /// bring the focused (wide) input_text widget into view — yanking the
+    /// pane horizontally. We snapshot scroll_x at splice time and re-apply
+    /// it inside the next frame's child render, after nav-scroll has run.
+    pin_scroll_x_after_splice: Option<(Side, f32)>,
 }
 
 /// One end of a selection. `line_no` is the source-line index on `side` of
@@ -437,10 +444,18 @@ pub fn render(
 
     let left_scroll = Cell::new(0.0_f32);
     let right_scroll = Cell::new(0.0_f32);
+    let left_scroll_x = Cell::new(0.0_f32);
+    let right_scroll_x = Cell::new(0.0_f32);
     let left_origin = Cell::new([0.0_f32, 0.0_f32]);
     let right_origin = Cell::new([0.0_f32, 0.0_f32]);
     let left_visible = Cell::new(avail[1]);
     let right_visible = Cell::new(avail[1]);
+
+    // Consume the one-shot scroll-x pin from the previous frame's splice
+    // (if any). The matching pane's child callback re-applies it after
+    // `draw_pane`, overriding imgui's nav-scroll triggered by the
+    // arrow_focus → set_keyboard_focus_here chain.
+    let pin_scroll_x = state.pin_scroll_x_after_splice.take();
     // First row's `calc_text_size("m")` under the mono font lands here; the
     // central selection handler needs it to map mouse x to a column.
     let char_w_cell: Cell<f32> = Cell::new(0.0);
@@ -513,6 +528,7 @@ pub fn render(
             .content_size([content_w_right, 0.0])
             .build(|| {
                 right_scroll.set(ui.scroll_y());
+                right_scroll_x.set(ui.scroll_x());
                 right_origin.set(ui.cursor_screen_pos());
                 right_visible.set(ui.content_region_avail()[1]);
                 draw_pane(
@@ -535,6 +551,11 @@ pub fn render(
                     b_highlights,
                     content_w_right,
                 );
+                if let Some((s, x)) = pin_scroll_x {
+                    if s == Side::Right {
+                        ui.set_scroll_x(x);
+                    }
+                }
             });
 
         // Right pane has applied its wheel-induced scroll — derive matching
@@ -576,6 +597,7 @@ pub fn render(
             .content_size([content_w_left, 0.0])
             .build(|| {
                 left_scroll.set(ui.scroll_y());
+                left_scroll_x.set(ui.scroll_x());
                 left_origin.set(ui.cursor_screen_pos());
                 left_visible.set(ui.content_region_avail()[1]);
                 draw_pane(
@@ -598,6 +620,11 @@ pub fn render(
                     a_highlights,
                     content_w_left,
                 );
+                if let Some((s, x)) = pin_scroll_x {
+                    if s == Side::Left {
+                        ui.set_scroll_x(x);
+                    }
+                }
             });
 
         // Stamp `written_X` with the actually-rendered scroll values, not
@@ -625,6 +652,7 @@ pub fn render(
             .content_size([content_w_left, 0.0])
             .build(|| {
                 left_scroll.set(ui.scroll_y());
+                left_scroll_x.set(ui.scroll_x());
                 left_origin.set(ui.cursor_screen_pos());
                 left_visible.set(ui.content_region_avail()[1]);
                 draw_pane(
@@ -647,6 +675,11 @@ pub fn render(
                     a_highlights,
                     content_w_left,
                 );
+                if let Some((s, x)) = pin_scroll_x {
+                    if s == Side::Left {
+                        ui.set_scroll_x(x);
+                    }
+                }
             });
 
         let cur_left_for_sync = left_scroll.get();
@@ -684,6 +717,7 @@ pub fn render(
             .content_size([content_w_right, 0.0])
             .build(|| {
                 right_scroll.set(ui.scroll_y());
+                right_scroll_x.set(ui.scroll_x());
                 right_origin.set(ui.cursor_screen_pos());
                 right_visible.set(ui.content_region_avail()[1]);
                 draw_pane(
@@ -706,6 +740,11 @@ pub fn render(
                     b_highlights,
                     content_w_right,
                 );
+                if let Some((s, x)) = pin_scroll_x {
+                    if s == Side::Right {
+                        ui.set_scroll_x(x);
+                    }
+                }
             });
 
         // Mirror of the right_first branch — see comment there. Store the
@@ -782,6 +821,16 @@ pub fn render(
                     // nothing active after the splice tears down the old
                     // row's widget id.
                     state.arrow_focus = Some((sel.side, lo.line_no, lo.col));
+                    // Pin scroll_x for next frame: `set_keyboard_focus_here`
+                    // would otherwise nav-scroll the pane to bring the wide
+                    // input_text into view. The cells hold this frame's
+                    // pre-edit scroll position — exactly what we want to
+                    // restore.
+                    let cur_scroll_x = match sel.side {
+                        Side::Left => left_scroll_x.get(),
+                        Side::Right => right_scroll_x.get(),
+                    };
+                    state.pin_scroll_x_after_splice = Some((sel.side, cur_scroll_x));
                     state.selection = None;
                 }
             }
