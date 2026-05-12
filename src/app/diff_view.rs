@@ -52,9 +52,23 @@ pub struct DiffViewState {
     /// without movement is just a caret placement and leaves selection `None`.
     drag: Option<DragState>,
     /// Arrow-key focus request: when set, the row whose (side, line_no)
-    /// matches grabs keyboard focus on its next render. Driven by Up / Down
-    /// inside an active `input_text` row.
-    pub arrow_focus: Option<(Side, u32)>,
+    /// matches grabs keyboard focus on its next render. The `usize` is the
+    /// target column (in chars) we'd like the caret to land at — clamped to
+    /// the new line's length so vertical motion preserves the column the
+    /// user was on. Driven by Up / Down inside an active `input_text` row.
+    pub arrow_focus: Option<(Side, u32, usize)>,
+    /// `ui.time()` at the last moment something forced the caret to become
+    /// visible (line jump, click). Used to phase-reset the blink so the new
+    /// caret is on immediately rather than potentially landing in the "off"
+    /// half of the cycle.
+    pub caret_blink_reset: f64,
+    /// Bumped whenever something mutates session lines from *outside* the
+    /// row's own input_text (undo, redo, hunk apply). Mixed into each row's
+    /// imgui widget id so an active input_text gets a fresh internal state
+    /// instead of writing its stale stb buffer back into our session — that
+    /// stale write was the root cause of "undo immediately reapplies the
+    /// edit" loops while the row had focus.
+    pub input_epoch: u32,
 }
 
 /// One end of a selection. `line_no` is the source-line index on `side` of
@@ -411,7 +425,12 @@ pub fn render(
     // Up/Down arrow focus handoff between row input_texts. Seeded from
     // `state.arrow_focus` so a request set last frame survives; consumed by
     // whichever row matches and re-set by an active row that sees Up/Down.
-    let arrow_focus_cell: Cell<Option<(Side, u32)>> = Cell::new(state.arrow_focus.take());
+    let arrow_focus_cell: Cell<Option<(Side, u32, usize)>> = Cell::new(state.arrow_focus.take());
+    // Phase-reset for the manually drawn caret blink. Rows write `ui.time()`
+    // here whenever an input freshly activates (line change, click) so the
+    // caret is guaranteed visible at that instant rather than possibly
+    // landing in the "off" half of the cycle.
+    let caret_blink_reset_cell: Cell<f64> = Cell::new(state.caret_blink_reset);
 
     let avail = ui.content_region_avail();
     let pane_w = ((avail[0] - CONNECTOR_W) * 0.5).max(80.0);
@@ -509,6 +528,8 @@ pub fn render(
                     &line_remove,
                     pending_edits,
                     &arrow_focus_cell,
+                    &caret_blink_reset_cell,
+                    state.input_epoch,
                     drag_active_side,
                     &char_w_cell,
                     b_highlights,
@@ -570,6 +591,8 @@ pub fn render(
                     &line_remove,
                     pending_edits,
                     &arrow_focus_cell,
+                    &caret_blink_reset_cell,
+                    state.input_epoch,
                     drag_active_side,
                     &char_w_cell,
                     a_highlights,
@@ -617,6 +640,8 @@ pub fn render(
                     &line_remove,
                     pending_edits,
                     &arrow_focus_cell,
+                    &caret_blink_reset_cell,
+                    state.input_epoch,
                     drag_active_side,
                     &char_w_cell,
                     a_highlights,
@@ -674,6 +699,8 @@ pub fn render(
                     &line_remove,
                     pending_edits,
                     &arrow_focus_cell,
+                    &caret_blink_reset_cell,
+                    state.input_epoch,
                     drag_active_side,
                     &char_w_cell,
                     b_highlights,
@@ -696,6 +723,7 @@ pub fn render(
     // Persist any unconsumed arrow-focus request for the next frame (the
     // target row may not have been visible this frame).
     state.arrow_focus = arrow_focus_cell.take();
+    state.caret_blink_reset = caret_blink_reset_cell.get();
     if let Some(edit) = line_remove.take() {
         pending_edits.push(edit);
     }
@@ -748,6 +776,12 @@ pub fn render(
                         _ => true,
                     });
                     pending_edits.push(edit);
+                    // Park the caret on the surviving merged line at the
+                    // selection's start column, so the next frame's render
+                    // refocuses that row's input_text instead of leaving
+                    // nothing active after the splice tears down the old
+                    // row's widget id.
+                    state.arrow_focus = Some((sel.side, lo.line_no, lo.col));
                     state.selection = None;
                 }
             }
@@ -1188,7 +1222,9 @@ fn draw_pane(
     focus_event: &Cell<Option<crate::app::FocusedPane>>,
     line_remove: &Cell<Option<DiffEdit>>,
     pending_edits: &mut Vec<DiffEdit>,
-    arrow_focus: &Cell<Option<(Side, u32)>>,
+    arrow_focus: &Cell<Option<(Side, u32, usize)>>,
+    caret_blink_reset: &Cell<f64>,
+    input_epoch: u32,
     drag_active: Option<Side>,
     char_w_out: &Cell<f32>,
     highlights: &[LineSpans],
@@ -1230,6 +1266,9 @@ fn draw_pane(
                 line_remove,
                 pending_edits,
                 arrow_focus,
+                caret_blink_reset,
+                input_epoch,
+                drag_active,
                 char_w_out,
                 line_hl,
                 content_w,
@@ -1418,7 +1457,10 @@ fn draw_row(
     focus_event: &Cell<Option<crate::app::FocusedPane>>,
     line_remove: &Cell<Option<DiffEdit>>,
     pending_edits: &mut Vec<DiffEdit>,
-    arrow_focus: &Cell<Option<(Side, u32)>>,
+    arrow_focus: &Cell<Option<(Side, u32, usize)>>,
+    caret_blink_reset: &Cell<f64>,
+    input_epoch: u32,
+    drag_active: Option<Side>,
     char_w_out: &Cell<f32>,
     line_hl: &[super::syntax::LineSpan],
     content_w: f32,
@@ -1561,28 +1603,120 @@ fn draw_row(
     // *own* contents on long lines, fighting the parent's scroll position.
     ui.set_next_item_width((content_w - gutter_w()).max(1.0));
     let input_id = match row.line_no {
-        Some(n) => format!("##rowedit_{:?}_{n}", side),
-        None => format!("##rowedit_{:?}_idx_{idx}", side),
+        Some(n) => format!("##rowedit_{:?}_{n}_e{input_epoch}", side),
+        None => format!("##rowedit_{:?}_idx_{idx}_e{input_epoch}", side),
     };
     // If a previous frame's Up/Down arrow asked us to focus this row, claim
-    // keyboard focus right before the input_text builds.
-    if let (Some((req_side, req_ln)), Some(ln)) = (arrow_focus.get(), row.line_no) {
-        if req_side == side && req_ln == ln {
-            ui.set_keyboard_focus_here();
+    // keyboard focus right before the input_text builds. imgui routes
+    // SetKeyboardFocusHere through its nav-tabbing system, which actually
+    // activates the widget on the *next* frame — so we keep the request
+    // alive until `is_item_activated` confirms the input took focus, and
+    // the callback below clears the imgui-inserted select-all whenever the
+    // request is still live for this row.
+    let arrow_match_target: Option<usize> = match (arrow_focus.get(), row.line_no) {
+        (Some((req_side, req_ln, tcol)), Some(ln)) if req_side == side && req_ln == ln => {
+            Some(tcol)
+        }
+        _ => None,
+    };
+    let arrow_match = arrow_match_target.is_some();
+    if arrow_match {
+        ui.set_keyboard_focus_here();
+    }
+    // Convert the requested target column (chars) into a byte offset within
+    // this row's buffer, clamped to its length. -1 means "don't seed".
+    let seed_byte: i32 = match arrow_match_target {
+        Some(tcol) => {
+            let take = tcol.min(buf.chars().count());
+            buf.chars().take(take).map(|c| c.len_utf8()).sum::<usize>() as i32
+        }
+        None => -1,
+    };
+    // Capture imgui's internal cursor position via the ALWAYS callback so we
+    // can paint the caret ourselves below — imgui's own caret uses the Text
+    // color, which we forced to transparent to avoid double-drawing. We also
+    // use the callback to suppress the select-all that imgui does on the
+    // first frame after `SetKeyboardFocusHere`, which otherwise highlights
+    // the whole row when arrow keys jump between lines, and to seed the
+    // caret at the column the user had on the previous line.
+    // While a cross-row drag selection is live on this side, the row where
+    // mouse-down landed will *also* drag-select its imgui input_text
+    // contents — that's the extra horizontal highlight tracking the
+    // pointer. Suppress it by collapsing imgui's selection to the cursor
+    // every frame the drag is live on our side.
+    let drag_on_this_side = drag_active == Some(side);
+    let caret_pos: Cell<i32> = Cell::new(-1);
+    struct CaretCapture<'a> {
+        out: &'a Cell<i32>,
+        clear_selection: bool,
+        seed_byte: i32,
+        suppress_imgui_selection: bool,
+    }
+    impl<'a> imgui::InputTextCallbackHandler for CaretCapture<'a> {
+        fn on_always(&mut self, mut data: imgui::TextCallbackData) {
+            if self.clear_selection {
+                if self.seed_byte >= 0 {
+                    data.set_cursor_pos(self.seed_byte as usize);
+                }
+                let pos = data.cursor_pos() as i32;
+                *data.selection_start_mut() = pos;
+                *data.selection_end_mut() = pos;
+            } else if self.suppress_imgui_selection {
+                let pos = data.cursor_pos() as i32;
+                *data.selection_start_mut() = pos;
+                *data.selection_end_mut() = pos;
+            }
+            self.out.set(data.cursor_pos() as i32);
+        }
+    }
+    let changed = ui
+        .input_text(input_id, &mut buf)
+        // imgui's input_text has its own per-char undo stack on Ctrl+Z. If
+        // it ran alongside our app-level stack, a Ctrl+Z that pops a
+        // selection-driven `Splice` would *also* make imgui re-insert a
+        // char in the focused row, the input fires `changed`, we push a
+        // stale `SetTwoWayLine`, and `record.edit` truncates the redo
+        // history — the Splice is gone for good. We own undo at the diff
+        // level, so disable imgui's.
+        .no_undo_redo(true)
+        .callback(
+            imgui::InputTextCallback::ALWAYS,
+            CaretCapture {
+                out: &caret_pos,
+                clear_selection: arrow_match,
+                seed_byte,
+                suppress_imgui_selection: drag_on_this_side,
+            },
+        )
+        .build();
+    let input_active = ui.is_item_active();
+    // The arrow-focus request is satisfied once the input actually becomes
+    // active — `is_item_activated` is true only on that single frame, after
+    // which we drop the request so a normal click can select-all again.
+    if ui.is_item_activated() {
+        caret_blink_reset.set(ui.time());
+        if arrow_match {
             arrow_focus.set(None);
         }
     }
-    let changed = ui.input_text(input_id, &mut buf).build();
-    let input_active = ui.is_item_active();
     // Up/Down inside an active row: hand keyboard focus to the adjacent
-    // source-line row on the same side. Consumed by the matching row on the
-    // next frame via `arrow_focus`.
+    // source-line row on the same side. We snapshot the current caret column
+    // (chars, converted from imgui's byte offset using the row's buffer) so
+    // the target row can drop the caret at the same column instead of at the
+    // end of the line.
     if input_active {
         if let Some(ln) = row.line_no {
-            if ui.is_key_pressed(imgui::Key::UpArrow) && ln > 1 {
-                arrow_focus.set(Some((side, ln - 1)));
-            } else if ui.is_key_pressed(imgui::Key::DownArrow) {
-                arrow_focus.set(Some((side, ln + 1)));
+            let up = ui.is_key_pressed(imgui::Key::UpArrow) && ln > 1;
+            let down = ui.is_key_pressed(imgui::Key::DownArrow);
+            if up || down {
+                let cur_byte = caret_pos.get().max(0) as usize;
+                let take = cur_byte.min(buf.len());
+                let cur_col = buf
+                    .get(..take)
+                    .map(|s| s.chars().count())
+                    .unwrap_or_else(|| buf.chars().count());
+                let new_ln = if up { ln - 1 } else { ln + 1 };
+                arrow_focus.set(Some((side, new_ln, cur_col)));
             }
         }
     }
@@ -1592,6 +1726,26 @@ fn draw_row(
     drop(_frame_bg_act);
     drop(_frame_bg_hov);
     drop(_frame_bg);
+
+    // Manual caret: imgui draws its own caret with `ImGuiCol_Text`, which we
+    // forced to transparent so it wouldn't overpaint the syntax-colored
+    // spans. We replay the caret here at the position the callback reported,
+    // blinking on a ~1s cycle to roughly match imgui's default.
+    if input_active && caret_pos.get() >= 0 {
+        // Phase the blink off the most recent activation so the caret is on
+        // for the first half-cycle after a line jump or click.
+        let since = (ui.time() - caret_blink_reset.get()).max(0.0);
+        let blink_on = (since % 1.06) < 0.53;
+        if blink_on {
+            let col = caret_pos.get() as f32;
+            let cx = text_start_x + col * char_w;
+            let cy0 = p0[1] + 2.0;
+            let cy1 = p0[1] + row_h() - 2.0;
+            dl.add_line([cx, cy0], [cx, cy1], theme::TEXT)
+                .thickness(1.0)
+                .build();
+        }
+    }
 
     // Live commit: any change pushes a `SetTwoWayLine` onto the undo stack,
     // and the next frame's diff reflects it. Equivalent edits on the same

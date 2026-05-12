@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
 
-use imgui::{Context, FontId, FontSource};
+use imgui::{Context, FontGlyphRanges, FontId, FontSource};
 use imgui_wgpu::{Renderer, RendererConfig};
 use imgui_winit_support::{HiDpiMode, WinitPlatform};
 use winit::{
@@ -823,6 +823,7 @@ fn load_fonts(imgui: &mut Context, ui_font_size: f32) -> FontId {
         size_pixels: ui_font_size,
         config: Some(imgui::FontConfig {
             size_pixels: ui_font_size,
+            glyph_ranges: FontGlyphRanges::from_slice(EXTRA_GLYPH_RANGES),
             ..Default::default()
         }),
     }]);
@@ -832,10 +833,26 @@ fn load_fonts(imgui: &mut Context, ui_font_size: f32) -> FontId {
         size_pixels: code_size,
         config: Some(imgui::FontConfig {
             size_pixels: code_size,
+            glyph_ranges: FontGlyphRanges::from_slice(EXTRA_GLYPH_RANGES),
             ..Default::default()
         }),
     }])
 }
+
+/// Codepoint ranges loaded into the font atlas. Default imgui covers only
+/// Basic Latin, which leaves UI strings full of `→ ↔ — … ✕ ⇒ ≥ Δ` rendering
+/// as missing-glyph boxes. Each pair is an inclusive [start, end]; the slice
+/// is zero-terminated as imgui requires.
+#[rustfmt::skip]
+static EXTRA_GLYPH_RANGES: &[u32] = &[
+    0x0020, 0x00FF, // Basic Latin + Latin-1 Supplement
+    0x0370, 0x03FF, // Greek (Δ)
+    0x2010, 0x205E, // General Punctuation (— – … etc.)
+    0x2190, 0x21FF, // Arrows (→ ↔ ⇒)
+    0x2200, 0x22FF, // Mathematical Operators (≥)
+    0x2700, 0x27BF, // Dingbats (✕)
+    0,
+];
 
 fn inject_pending_key(io: &mut imgui::Io, key: PendingKey) {
     use imgui::Key;
@@ -861,6 +878,9 @@ fn do_undo(state: &mut AppState) {
     };
     if record.can_undo() {
         record.undo(store);
+        if let Some(v) = state.diff_views.get_mut(&id) {
+            v.input_epoch = v.input_epoch.wrapping_add(1);
+        }
         state.status = "undone".to_string();
     } else {
         state.status = "nothing to undo".to_string();
@@ -877,6 +897,9 @@ fn do_redo(state: &mut AppState) {
     };
     if record.can_redo() {
         record.redo(store);
+        if let Some(v) = state.diff_views.get_mut(&id) {
+            v.input_epoch = v.input_epoch.wrapping_add(1);
+        }
         state.status = "redone".to_string();
     } else {
         state.status = "nothing to redo".to_string();
@@ -1172,8 +1195,23 @@ fn current_session_summary(ui: &imgui::Ui, state: &mut AppState) {
             // operation is reversible via Edit > Undo / Redo.
             if !pending_edits.is_empty() {
                 let record = state.undo_stacks.entry(id).or_default();
+                // A non-SetTwoWayLine edit (splice, hunk-apply) mutates
+                // lines from outside any focused row, so the focused
+                // input_text's internal stb buffer goes stale and would
+                // overwrite our session with its old contents next frame.
+                // Bump the per-view input epoch so each row's widget id
+                // changes and imgui re-inits from `buf`.
+                let mut needs_epoch_bump = false;
                 for edit in pending_edits {
+                    if !matches!(edit, undo_stack::DiffEdit::SetTwoWayLine { .. }) {
+                        needs_epoch_bump = true;
+                    }
                     record.edit(&mut state.sessions, edit);
+                }
+                if needs_epoch_bump {
+                    if let Some(v) = state.diff_views.get_mut(&id) {
+                        v.input_epoch = v.input_epoch.wrapping_add(1);
+                    }
                 }
                 state.status = "edited (Ctrl+Z to undo)".to_string();
             }
