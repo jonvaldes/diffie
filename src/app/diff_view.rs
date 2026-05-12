@@ -91,6 +91,12 @@ pub struct DiffViewState {
     /// position after a frame. Cheap to maintain (one `f32` per pane).
     pub last_left_scroll_x: f32,
     pub last_right_scroll_x: f32,
+    /// Last frame's active input_text selection (imgui's internal one,
+    /// captured AFTER our suppression callback runs). `None` when no row
+    /// is active or the selection is collapsed. `(side, line_no, start_byte,
+    /// end_byte)`. Written by `draw_row`'s callback; read by tests to
+    /// verify behaviors like double-click word-select.
+    pub last_active_input_selection: Option<(Side, u32, usize, usize)>,
 }
 
 /// One end of a selection. `line_no` is the source-line index on `side` of
@@ -465,6 +471,10 @@ pub fn render(
     let right_origin = Cell::new([0.0_f32, 0.0_f32]);
     let left_visible = Cell::new(avail[1]);
     let right_visible = Cell::new(avail[1]);
+    // Filled by whichever row's input_text is active this frame, with the
+    // imgui-internal selection bounds AFTER our CaretCapture callback ran.
+    // Read at end of `render` into `state.last_active_input_selection`.
+    let active_selection: Cell<Option<(Side, u32, usize, usize)>> = Cell::new(None);
 
     // Read the splice-induced scroll-x pin (if any) and decrement its
     // frame counter. We re-push it via `igSetNextWindowScroll` for the
@@ -483,7 +493,14 @@ pub fn render(
     // central selection handler needs it to map mouse x to a column.
     let char_w_cell: Cell<f32> = Cell::new(0.0);
 
-    let drag_active_side = state.drag.as_ref().map(|d| d.side);
+    // Carries the drag's side AND whether it has crossed the movement
+    // threshold. The threshold flag gates per-row imgui-selection
+    // suppression: below threshold (e.g. just after a click or a
+    // double-click) we let imgui's native input_text selection alone so
+    // double-click word-select can survive; past threshold we collapse it
+    // so our drag-selection is the only visible selection.
+    let drag_active_side: Option<(Side, bool)> =
+        state.drag.as_ref().map(|d| (d.side, d.threshold_passed));
 
     let frame_selection = state.selection.clone();
     let max_left = (left.rows.len() as f32 * row_h() - avail[1]).max(0.0);
@@ -583,6 +600,7 @@ pub fn render(
                     &char_w_cell,
                     b_highlights,
                     content_w_right,
+                    &active_selection,
                 );
             });
 
@@ -656,6 +674,7 @@ pub fn render(
                     &char_w_cell,
                     a_highlights,
                     content_w_left,
+                    &active_selection,
                 );
             });
 
@@ -716,6 +735,7 @@ pub fn render(
                     &char_w_cell,
                     a_highlights,
                     content_w_left,
+                    &active_selection,
                 );
             });
 
@@ -785,6 +805,7 @@ pub fn render(
                     &char_w_cell,
                     b_highlights,
                     content_w_right,
+                    &active_selection,
                 );
             });
 
@@ -904,6 +925,7 @@ pub fn render(
     sync_scrolls(state, l, r, l_view, r_view, &left.ranges, &right.ranges);
     state.last_left_scroll_x = left_scroll_x.get();
     state.last_right_scroll_x = right_scroll_x.get();
+    state.last_active_input_selection = active_selection.get();
 
     draw_connector(
         ui,
@@ -1298,10 +1320,11 @@ fn draw_pane(
     arrow_focus: &Cell<Option<(Side, u32, usize)>>,
     caret_blink_reset: &Cell<f64>,
     input_epoch: u32,
-    drag_active: Option<Side>,
+    drag_active: Option<(Side, bool)>,
     char_w_out: &Cell<f32>,
     highlights: &[LineSpans],
     content_w: f32,
+    active_selection_out: &Cell<Option<(Side, u32, usize, usize)>>,
 ) {
     let total = rows.len() as i32;
     if total == 0 {
@@ -1345,6 +1368,7 @@ fn draw_pane(
                 char_w_out,
                 line_hl,
                 content_w,
+                active_selection_out,
             ) {
                 click_out.set(Some(clicked_line));
             }
@@ -1356,7 +1380,7 @@ fn draw_pane(
     // past the pane's visible band, scroll proportionally. The selection
     // caret advances on its own via `update_selection`, which clamps the
     // mouse to the visible band and re-computes the caret each frame.
-    if drag_active == Some(side) && ui.is_mouse_down(imgui::MouseButton::Left) {
+    if drag_active.map(|(s, _)| s) == Some(side) && ui.is_mouse_down(imgui::MouseButton::Left) {
         let mouse_y = ui.io().mouse_pos[1];
         let pane_top = pane_origin[1] + cur_scroll;
         let pane_bot = pane_top + visible_h;
@@ -1533,10 +1557,11 @@ fn draw_row(
     arrow_focus: &Cell<Option<(Side, u32, usize)>>,
     caret_blink_reset: &Cell<f64>,
     input_epoch: u32,
-    drag_active: Option<Side>,
+    drag_active: Option<(Side, bool)>,
     char_w_out: &Cell<f32>,
     line_hl: &[super::syntax::LineSpan],
     content_w: f32,
+    active_selection_out: &Cell<Option<(Side, u32, usize, usize)>>,
 ) -> Option<u32> {
     let p0 = ui.cursor_screen_pos();
     let row_w = ui.content_region_avail()[0];
@@ -1717,10 +1742,22 @@ fn draw_row(
     // contents — that's the extra horizontal highlight tracking the
     // pointer. Suppress it by collapsing imgui's selection to the cursor
     // every frame the drag is live on our side.
-    let drag_on_this_side = drag_active == Some(side);
+    // Only suppress imgui's native input_text selection once our drag has
+    // crossed the movement threshold. Pre-threshold we let imgui's
+    // selection survive so double-click word-select (which sets a multi-
+    // char selection that our state.selection doesn't track) doesn't get
+    // immediately collapsed by this callback.
+    let drag_on_this_side_past_threshold = drag_active
+        .map(|(s, past)| s == side && past)
+        .unwrap_or(false);
     let caret_pos: Cell<i32> = Cell::new(-1);
+    // Filled after the callback with imgui's post-mutation selection bounds
+    // (start_byte, end_byte). Read after `build()` so we know whether
+    // imgui's input_text ended up with a selection this frame.
+    let caret_selection: Cell<Option<(usize, usize)>> = Cell::new(None);
     struct CaretCapture<'a> {
         out: &'a Cell<i32>,
+        selection_out: &'a Cell<Option<(usize, usize)>>,
         clear_selection: bool,
         seed_byte: i32,
         suppress_imgui_selection: bool,
@@ -1740,6 +1777,10 @@ fn draw_row(
                 *data.selection_end_mut() = pos;
             }
             self.out.set(data.cursor_pos() as i32);
+            // Capture the post-mutation selection so tests can observe
+            // double-click word-select and similar behaviors.
+            let sel = data.selection();
+            self.selection_out.set(Some((sel.start, sel.end)));
         }
     }
     let changed = ui
@@ -1756,13 +1797,25 @@ fn draw_row(
             imgui::InputTextCallback::ALWAYS,
             CaretCapture {
                 out: &caret_pos,
+                selection_out: &caret_selection,
                 clear_selection: arrow_match,
                 seed_byte,
-                suppress_imgui_selection: drag_on_this_side,
+                suppress_imgui_selection: drag_on_this_side_past_threshold,
             },
         )
         .build();
     let input_active = ui.is_item_active();
+    // Export the active row's imgui selection (post-callback) so render's
+    // caller — currently just headless tests — can observe behaviors like
+    // double-click word-select. Last-active-row wins if multiple are
+    // active in a frame, which doesn't happen in practice.
+    if input_active {
+        if let (Some(ln), Some((s, e))) = (row.line_no, caret_selection.get()) {
+            if s != e {
+                active_selection_out.set(Some((side, ln, s, e)));
+            }
+        }
+    }
     // The arrow-focus request is satisfied once the input actually becomes
     // active — `is_item_activated` is true only on that single frame, after
     // which we drop the request so a normal click can select-all again.
@@ -2523,6 +2576,122 @@ mod headless_tests {
         for edit in pending_edits {
             apply_edit(store, edit);
         }
+    }
+
+    /// Double-clicking a word activates imgui's input_text native
+    /// word-selection. The selection must survive into subsequent
+    /// frames — previously our `suppress_imgui_selection` callback
+    /// collapsed it the very next frame because we suppressed
+    /// imgui's selection whenever `state.drag` was Some on this side,
+    /// even at `threshold_passed=false` (which is the state right
+    /// after any click). The fix gates suppression on
+    /// `threshold_passed` so double-click survives.
+    ///
+    /// Requires the wgpu pipeline because imgui's input_text word-select
+    /// only fires when the widget is fully active, which needs the same
+    /// renderer-in-the-loop conditions as the scroll-pin bug.
+    #[test]
+    fn headless_wgpu_double_click_selects_word() {
+        let _guard = imgui_lock();
+        let Some((device, queue)) = try_init_wgpu() else {
+            eprintln!("skipping: no wgpu adapter available");
+            return;
+        };
+
+        let store = SessionStore::new();
+        let text = "alpha beta gamma\n";
+        let id = store.open_two_way(text, text, None).unwrap();
+
+        let mut ctx = imgui::Context::create();
+        ctx.io_mut().display_size = [1200.0, 800.0];
+        ctx.io_mut().delta_time = 1.0 / 60.0;
+        ctx.io_mut().config_flags |= imgui::ConfigFlags::NAV_ENABLE_KEYBOARD;
+        // Make sure the synthetic clicks fall well inside imgui's default
+        // double-click window (0.3s); each frame advances time by
+        // delta_time, so two clicks separated by a few frames is fine.
+
+        let target_format = wgpu::TextureFormat::Rgba8UnormSrgb;
+        let mut renderer = imgui_wgpu::Renderer::new(
+            &mut ctx,
+            &device,
+            &queue,
+            imgui_wgpu::RendererConfig {
+                texture_format: target_format,
+                ..Default::default()
+            },
+        );
+
+        let mut view_state = DiffViewState::default();
+
+        // Aim at the "beta" token on row 1 (the only row containing text;
+        // row 0 is the diff's top row). Position calibration: pane origin
+        // ~ (8, 33); gutter_w=60; chars start at x≈68; char_w with the
+        // default font ≈ 7px. "alpha " is 6 chars → "beta" starts at
+        // x ≈ 68 + 6*7 = 110. Click at x=120 (somewhere inside "beta").
+        // y=40 lands inside the first row (height ~24, top ~33).
+        let word_pos = [120.0, 40.0];
+
+        // First click: down, then up.
+        run_frame_with_wgpu(
+            &mut ctx, &mut renderer, &device, &queue, target_format,
+            &store, id, &mut view_state,
+            FrameInput {
+                mouse_pos: Some(word_pos),
+                left_button: Some(true),
+                ..Default::default()
+            },
+        );
+        run_frame_with_wgpu(
+            &mut ctx, &mut renderer, &device, &queue, target_format,
+            &store, id, &mut view_state,
+            FrameInput { left_button: Some(false), ..Default::default() },
+        );
+        // Second click on the same pixel — completes the double-click
+        // gesture. ImGui's input_text recognizes this and selects the
+        // word under the cursor.
+        run_frame_with_wgpu(
+            &mut ctx, &mut renderer, &device, &queue, target_format,
+            &store, id, &mut view_state,
+            FrameInput {
+                mouse_pos: Some(word_pos),
+                left_button: Some(true),
+                ..Default::default()
+            },
+        );
+        run_frame_with_wgpu(
+            &mut ctx, &mut renderer, &device, &queue, target_format,
+            &store, id, &mut view_state,
+            FrameInput { left_button: Some(false), ..Default::default() },
+        );
+
+        // Run a few more idle frames to make sure the selection persists
+        // past the suppression check (which fires only post-threshold).
+        for _ in 0..3 {
+            run_frame_with_wgpu(
+                &mut ctx, &mut renderer, &device, &queue, target_format,
+                &store, id, &mut view_state, FrameInput::default(),
+            );
+        }
+
+        // ImGui's input_text should have selected SOME word on the row.
+        // We don't pin to a specific word — pane origin and char_w in the
+        // headless context differ from the live app, so the exact hit
+        // column shifts. What we're testing is the bug-relevant invariant:
+        // a non-collapsed selection survives past the splice-suppression
+        // window. With the bug present the selection would be collapsed
+        // by frame 2 of the post-double-click run.
+        let (side, line_no, start, end) = view_state
+            .last_active_input_selection
+            .expect("imgui input_text should have a selection after double-click");
+        assert_eq!(side, Side::Left);
+        assert_eq!(line_no, 1);
+        assert!(end > start, "selection should be non-collapsed");
+        let line = "alpha beta gamma";
+        let selected = &line[start..end];
+        assert!(
+            ["alpha", "beta", "gamma"].contains(&selected),
+            "expected a whole-word selection (alpha/beta/gamma); got bytes {start}..{end} = {selected:?}",
+        );
     }
 
     /// Real-renderer end-to-end: drives the full imgui → wgpu pipeline
