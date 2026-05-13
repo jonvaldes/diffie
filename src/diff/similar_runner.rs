@@ -1,11 +1,19 @@
 use similar::{capture_diff_slices, Algorithm};
 
-use super::DiffOp;
+use super::{normalize::normalize_lines, DiffOp, Whitespace};
 
 /// Convert a `similar` algorithm's output on `&[&str]` line slices into
-/// our per-line `DiffOp` stream. 1-based line numbers.
-pub fn run(alg: Algorithm, a: &[&str], b: &[&str]) -> Vec<DiffOp> {
-    let ops = capture_diff_slices(alg, a, b);
+/// our per-line `DiffOp` stream. 1-based line numbers. Lines are compared
+/// after applying the requested whitespace normalization, but emitted
+/// `DiffOp`s always carry the original line text.
+pub fn run(alg: Algorithm, a: &[&str], b: &[&str], whitespace: Whitespace) -> Vec<DiffOp> {
+    let ops = if matches!(whitespace, Whitespace::None) {
+        capture_diff_slices(alg, a, b)
+    } else {
+        let a_norm = normalize_lines(a, whitespace);
+        let b_norm = normalize_lines(b, whitespace);
+        capture_diff_slices(alg, &a_norm, &b_norm)
+    };
     let mut out: Vec<DiffOp> = Vec::new();
     for op in ops {
         match op {

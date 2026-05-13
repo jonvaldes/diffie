@@ -2,7 +2,7 @@ use std::ops::Range;
 
 use imara_diff::{intern::InternedInput, Algorithm, Sink};
 
-use super::{DiffEngine, DiffOp, DiffOptions};
+use super::{normalize::normalize_lines, DiffEngine, DiffOp, DiffOptions, Whitespace};
 
 /// Histogram line-level diff (via the `imara-diff` crate).
 #[derive(Clone)]
@@ -11,9 +11,35 @@ pub struct HistogramDiff;
 impl DiffEngine for HistogramDiff {
     fn name(&self) -> &'static str { "histogram" }
 
-    fn diff(&self, a: &[&str], b: &[&str], _opts: &DiffOptions) -> Vec<DiffOp> {
-        run_histogram(a, b)
+    fn diff(&self, a: &[&str], b: &[&str], opts: &DiffOptions) -> Vec<DiffOp> {
+        if matches!(opts.whitespace, Whitespace::None) {
+            run_histogram(a, b)
+        } else {
+            let a_norm = normalize_lines(a, opts.whitespace);
+            let b_norm = normalize_lines(b, opts.whitespace);
+            let a_refs: Vec<&str> = a_norm.iter().map(|s| s.as_str()).collect();
+            let b_refs: Vec<&str> = b_norm.iter().map(|s| s.as_str()).collect();
+            // Run histogram against normalized lines, then map back to originals.
+            let ops_norm = run_histogram(&a_refs, &b_refs);
+            map_text_back(&ops_norm, a, b)
+        }
     }
+}
+
+/// Replace the (normalized) text in each op with the matching original-line
+/// text addressed by line number.
+fn map_text_back(ops: &[DiffOp], a: &[&str], b: &[&str]) -> Vec<DiffOp> {
+    ops.iter()
+        .map(|op| match op {
+            DiffOp::Equal { a: ai, b: bi, .. } => DiffOp::Equal {
+                a: *ai,
+                b: *bi,
+                text: a[(*ai - 1) as usize].to_string(),
+            },
+            DiffOp::Delete { a: ai, .. } => DiffOp::delete(*ai, a[(*ai - 1) as usize].to_string()),
+            DiffOp::Insert { b: bi, .. } => DiffOp::insert(*bi, b[(*bi - 1) as usize].to_string()),
+        })
+        .collect()
 }
 
 struct ChangeCollector {

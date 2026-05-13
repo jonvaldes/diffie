@@ -9,8 +9,8 @@ pub struct MyersDiff;
 impl DiffEngine for MyersDiff {
     fn name(&self) -> &'static str { "myers" }
 
-    fn diff(&self, a: &[&str], b: &[&str], _opts: &DiffOptions) -> Vec<DiffOp> {
-        crate::diff::similar_runner::run(Algorithm::Myers, a, b)
+    fn diff(&self, a: &[&str], b: &[&str], opts: &DiffOptions) -> Vec<DiffOp> {
+        crate::diff::similar_runner::run(Algorithm::Myers, a, b, opts.whitespace)
     }
 }
 

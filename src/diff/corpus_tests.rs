@@ -116,6 +116,44 @@ fn every_a_line_appears_once_per_side() {
 }
 
 #[test]
+fn whitespace_ignore_all_treats_indentation_change_as_equal() {
+    let opts = DiffOptions { whitespace: super::Whitespace::IgnoreAll, ..Default::default() };
+    each_engine(|name, e| {
+        let a = split_lines("fn x() {\n    return 1;\n}\n");
+        let b = split_lines("fn x() {\n\t\treturn 1;\n}\n");
+        let ops = e.diff(&a, &b, &opts);
+        // Every line treated as equal under IgnoreAll.
+        assert!(
+            ops.iter().all(|o| matches!(o, DiffOp::Equal { .. })),
+            "engine={name}: got {ops:?}"
+        );
+        // Original text must be preserved (B's tabs, not A's spaces) in the
+        // emitted Equal ops — engines use A's text for matched lines.
+        let texts: Vec<&str> = ops.iter().filter_map(|o| match o {
+            DiffOp::Equal { text, .. } => Some(text.as_str()),
+            _ => None,
+        }).collect();
+        assert!(texts.iter().any(|t| t.contains("    return")), "engine={name}: original A text lost");
+    });
+}
+
+#[test]
+fn whitespace_ignore_trailing_eol_folds_crlf() {
+    let opts = DiffOptions { whitespace: super::Whitespace::IgnoreTrailingEol, ..Default::default() };
+    each_engine(|name, e| {
+        let a_text = "hello\nworld\n";
+        let b_text = "hello\r\nworld\r\n";
+        let a = split_lines(a_text);
+        let b = split_lines(b_text);
+        let ops = e.diff(&a, &b, &opts);
+        assert!(
+            ops.iter().all(|o| matches!(o, DiffOp::Equal { .. })),
+            "engine={name}: got {ops:?}"
+        );
+    });
+}
+
+#[test]
 fn engines_with_supports_moves_false_emit_no_move_tag() {
     // Sanity check on the capability matrix: no initial engine claims moves,
     // and DiffOp has no Moved variant yet, so nothing to assert beyond the
