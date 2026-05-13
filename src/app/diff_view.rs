@@ -595,6 +595,10 @@ pub fn render(
     // an arrow key fires: `(side, current_line, current_col, target_line)`.
     // Applied to `state.selection` after the panes render.
     let shift_arrow_extend: Cell<Option<(Side, u32, usize, u32)>> = Cell::new(None);
+    // Plain arrow key (no shift) inside an active input_text: clear the
+    // cross-row selection. Standard editor behavior — the caret moves
+    // and the selection collapses.
+    let clear_state_selection: Cell<bool> = Cell::new(false);
 
     // Read the splice-induced scroll-x pin (if any) and decrement its
     // frame counter. We re-push it via `igSetNextWindowScroll` for the
@@ -722,6 +726,7 @@ pub fn render(
                     content_w_right,
                     &active_selection,
                     &shift_arrow_extend,
+                    &clear_state_selection,
                 );
             });
 
@@ -797,6 +802,7 @@ pub fn render(
                     content_w_left,
                     &active_selection,
                     &shift_arrow_extend,
+                    &clear_state_selection,
                 );
             });
 
@@ -859,6 +865,7 @@ pub fn render(
                     content_w_left,
                     &active_selection,
                     &shift_arrow_extend,
+                    &clear_state_selection,
                 );
             });
 
@@ -930,6 +937,7 @@ pub fn render(
                     content_w_right,
                     &active_selection,
                     &shift_arrow_extend,
+                    &clear_state_selection,
                 );
             });
 
@@ -963,6 +971,11 @@ pub fn render(
             anchor,
             caret: SelPoint { line_no: new_ln, col: cur_col },
         });
+    } else if clear_state_selection.take() {
+        // Plain arrow press inside the active row — collapse any
+        // existing cross-row selection. Mutually exclusive with the
+        // shift-extend branch above.
+        state.selection = None;
     }
     if let Some(edit) = line_remove.take() {
         pending_edits.push(edit);
@@ -1465,6 +1478,7 @@ fn draw_pane(
     content_w: f32,
     active_selection_out: &Cell<Option<(Side, u32, usize, usize)>>,
     shift_arrow_out: &Cell<Option<(Side, u32, usize, u32)>>,
+    clear_state_selection_out: &Cell<bool>,
 ) {
     let total = rows.len() as i32;
     if total == 0 {
@@ -1510,6 +1524,7 @@ fn draw_pane(
                 content_w,
                 active_selection_out,
                 shift_arrow_out,
+                clear_state_selection_out,
             ) {
                 click_out.set(Some(clicked_line));
             }
@@ -1704,6 +1719,7 @@ fn draw_row(
     content_w: f32,
     active_selection_out: &Cell<Option<(Side, u32, usize, usize)>>,
     shift_arrow_out: &Cell<Option<(Side, u32, usize, u32)>>,
+    clear_state_selection_out: &Cell<bool>,
 ) -> Option<u32> {
     let p0 = ui.cursor_screen_pos();
     let row_w = ui.content_region_avail()[0];
@@ -2014,6 +2030,9 @@ fn draw_row(
         if let Some(ln) = row.line_no {
             let up = ui.is_key_pressed(imgui::Key::UpArrow) && ln > 1;
             let down = ui.is_key_pressed(imgui::Key::DownArrow);
+            let left = ui.is_key_pressed(imgui::Key::LeftArrow);
+            let right = ui.is_key_pressed(imgui::Key::RightArrow);
+            let shift = ui.io().key_shift;
             if up || down {
                 let cur_byte = caret_pos.get().max(0) as usize;
                 let take = cur_byte.min(buf.len());
@@ -2023,9 +2042,16 @@ fn draw_row(
                     .unwrap_or_else(|| buf.chars().count());
                 let new_ln = if up { ln - 1 } else { ln + 1 };
                 arrow_focus.set(Some((side, new_ln, cur_col)));
-                if ui.io().key_shift {
+                if shift {
                     shift_arrow_out.set(Some((side, ln, cur_col, new_ln)));
                 }
+            }
+            // Plain arrow navigation (any direction, no shift) collapses
+            // the cross-row selection. The caret continues moving via
+            // imgui's own handling (Left/Right within the row) or our
+            // arrow_focus (Up/Down between rows).
+            if !shift && (up || down || left || right) {
+                clear_state_selection_out.set(true);
             }
         }
     }
@@ -3098,6 +3124,73 @@ mod headless_tests {
             sel.caret,
             SelPoint { line_no: 2, col: 4 },
             "caret should jump to same column on line 2",
+        );
+    }
+
+    /// Pressing a plain arrow key (no shift modifier) inside an active
+    /// row collapses any existing cross-row `state.selection`. Standard
+    /// editor behavior: arrow keys without shift dismiss the selection
+    /// and move the caret as a point.
+    #[test]
+    fn headless_wgpu_plain_arrow_clears_selection() {
+        let _guard = imgui_lock();
+        let Some((device, queue)) = try_init_wgpu() else {
+            eprintln!("skipping: no wgpu adapter available");
+            return;
+        };
+
+        let text = "abcdefghij\nklmnopqrst\nuvwxyz0123\n";
+        let store = SessionStore::new();
+        let id = store.open_two_way(text, text, None).unwrap();
+
+        let mut ctx = imgui::Context::create();
+        ctx.io_mut().display_size = [1200.0, 800.0];
+        ctx.io_mut().delta_time = 1.0 / 60.0;
+        ctx.io_mut().config_flags |= imgui::ConfigFlags::NAV_ENABLE_KEYBOARD;
+        let mono = load_mono_font(&mut ctx, 13.0);
+        let target_format = wgpu::TextureFormat::Rgba8UnormSrgb;
+        let mut renderer = imgui_wgpu::Renderer::new(
+            &mut ctx,
+            &device,
+            &queue,
+            imgui_wgpu::RendererConfig {
+                texture_format: target_format,
+                ..Default::default()
+            },
+        );
+
+        let mut view_state = DiffViewState::default();
+        // Activate line 2's input_text.
+        focus_row_and_settle(
+            &mut ctx, &mut renderer, &device, &queue, target_format,
+            &store, id, &mut view_state, mono, Side::Left, 2, 4,
+        );
+        // Pre-seed a cross-row selection from (1, 4) → (2, 4).
+        view_state.selection = Some(Selection {
+            side: Side::Left,
+            anchor: SelPoint { line_no: 1, col: 4 },
+            caret: SelPoint { line_no: 2, col: 4 },
+        });
+
+        // Plain Down (no shift) should clear the selection.
+        run_frame_with_wgpu(
+            &mut ctx, &mut renderer, &device, &queue, target_format,
+            &store, id, &mut view_state, Some(mono),
+            FrameInput {
+                arrow: Some(imgui::Key::DownArrow),
+                shift: false,
+                ..Default::default()
+            },
+        );
+        run_frame_with_wgpu(
+            &mut ctx, &mut renderer, &device, &queue, target_format,
+            &store, id, &mut view_state, Some(mono), FrameInput::default(),
+        );
+
+        assert!(
+            view_state.selection.is_none(),
+            "plain DownArrow should have cleared selection; got {:?}",
+            view_state.selection.as_ref().map(|s| (s.anchor, s.caret)),
         );
     }
 
