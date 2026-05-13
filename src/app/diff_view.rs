@@ -599,12 +599,14 @@ pub fn render(
     // cross-row selection. Standard editor behavior — the caret moves
     // and the selection collapses.
     let clear_state_selection: Cell<bool> = Cell::new(false);
-    // Set by `draw_row` when a Left/Right keypress in an active row
-    // would trigger imgui's nav-scroll (same gutter-sized horizontal
-    // drift the splice path produces). Drained after the panes render
-    // into `state.pin_scroll_x_after_splice` so subsequent frames pin
-    // the scroll back.
-    let pin_scroll_x_request: Cell<Option<Side>> = Cell::new(None);
+    // Set by `draw_row` when an arrow keypress in an active row would
+    // trigger imgui's nav-scroll (the gutter-sized horizontal drift the
+    // splice path also produces). For Up/Down the requested value is
+    // the pre-key scroll_x (just neutralize the snap). For Left/Right
+    // the requested value is computed to keep the new caret column
+    // visible — same machinery, different target — so the pin doesn't
+    // block the cursor-follow scroll users expect.
+    let pin_scroll_x_request: Cell<Option<(Side, f32)>> = Cell::new(None);
 
     // Read the splice-induced scroll-x pin (if any) and decrement its
     // frame counter. We re-push it via `igSetNextWindowScroll` for the
@@ -987,17 +989,12 @@ pub fn render(
         // shift-extend branch above.
         state.selection = None;
     }
-    // If a lateral arrow press requested a scroll-x pin, capture the
-    // current scroll_x of that side (snapshotted at the top of the
-    // matching pane's build) and queue the pin. Same field + countdown
-    // as the splice pin; same `igSetNextWindowScroll` machinery on
-    // subsequent frames neutralizes imgui's nav-scroll-set ScrollTarget.
-    if let Some(side) = pin_scroll_x_request.take() {
-        let cur_x = match side {
-            Side::Left => left_scroll_x.get(),
-            Side::Right => right_scroll_x.get(),
-        };
-        state.pin_scroll_x_after_splice = Some((side, cur_x, 4));
+    // An arrow keypress requested a scroll-x pin. `draw_row` already
+    // computed the target value (pre-key scroll for Up/Down, cursor-
+    // follow scroll for Left/Right). Same field + countdown as the
+    // splice pin.
+    if let Some((side, target)) = pin_scroll_x_request.take() {
+        state.pin_scroll_x_after_splice = Some((side, target, 4));
     }
     if let Some(edit) = line_remove.take() {
         pending_edits.push(edit);
@@ -1501,7 +1498,7 @@ fn draw_pane(
     active_selection_out: &Cell<Option<(Side, u32, usize, usize)>>,
     shift_arrow_out: &Cell<Option<(Side, u32, usize, u32)>>,
     clear_state_selection_out: &Cell<bool>,
-    pin_scroll_x_request_out: &Cell<Option<Side>>,
+    pin_scroll_x_request_out: &Cell<Option<(Side, f32)>>,
 ) {
     let total = rows.len() as i32;
     if total == 0 {
@@ -1744,7 +1741,7 @@ fn draw_row(
     active_selection_out: &Cell<Option<(Side, u32, usize, usize)>>,
     shift_arrow_out: &Cell<Option<(Side, u32, usize, u32)>>,
     clear_state_selection_out: &Cell<bool>,
-    pin_scroll_x_request_out: &Cell<Option<Side>>,
+    pin_scroll_x_request_out: &Cell<Option<(Side, f32)>>,
 ) -> Option<u32> {
     let p0 = ui.cursor_screen_pos();
     let row_w = ui.content_region_avail()[0];
@@ -2065,15 +2062,43 @@ fn draw_row(
             if left || right {
                 caret_blink_reset.set(ui.time());
             }
-            // Any arrow keypress on an active row queues the scroll-x
-            // pin to neutralize imgui's nav-scroll-induced gutter drift:
-            //   - Left/Right: imgui's input_text fires nav-scroll on
-            //     the still-focused widget after the cursor moves.
+            // Pin scroll_x to neutralize imgui's nav-scroll-induced
+            // gutter drift:
             //   - Up/Down: arrow_focus → set_keyboard_focus_here on the
-            //     adjacent row's widget, same nav-scroll path that the
-            //     splice-refocus bug triggers.
-            if up || down || left || right {
-                pin_scroll_x_request_out.set(Some(side));
+            //     adjacent row's widget snaps to gutter_w. Pin to the
+            //     pre-key scroll_x (current `ui.scroll_x()`).
+            //   - Left/Right: imgui's input_text doesn't manage the
+            //     parent's scroll, so we compute the target ourselves
+            //     to keep the new caret column visible. This both
+            //     neutralizes the gutter snap AND provides cursor-
+            //     follow scroll when the caret would otherwise go past
+            //     the viewport edge.
+            if up || down {
+                pin_scroll_x_request_out.set(Some((side, ui.scroll_x())));
+            } else if left || right {
+                let cur_byte = caret_pos.get().max(0) as usize;
+                let take = cur_byte.min(buf.len());
+                let new_col = buf
+                    .get(..take)
+                    .map(|s| s.chars().count())
+                    .unwrap_or_else(|| buf.chars().count());
+                let cur_scroll = ui.scroll_x();
+                // The pane's visible width. `row_w` (from content_region_avail
+                // at top of draw_row) is misleading because the child
+                // window's explicit content_size makes content_region_avail
+                // report the wide content width, not the visible width.
+                // `ui.window_size()` is the child's actual rect.
+                let viewport_w = ui.window_size()[0];
+                let cursor_content_x = gutter_w() + (new_col as f32) * char_w;
+                let pad = char_w;
+                let target = if cursor_content_x < cur_scroll + pad {
+                    (cursor_content_x - pad).max(0.0)
+                } else if cursor_content_x > cur_scroll + viewport_w - pad {
+                    cursor_content_x - viewport_w + pad
+                } else {
+                    cur_scroll
+                };
+                pin_scroll_x_request_out.set(Some((side, target)));
             }
             if up || down {
                 let cur_byte = caret_pos.get().max(0) as usize;
@@ -3357,6 +3382,99 @@ mod headless_tests {
             .expect("Right arrow inside active row should queue a scroll-x pin");
         assert_eq!(pin.0, Side::Left);
         assert_eq!(pin.2, 4);
+    }
+
+    /// Pressing Left/Right while the caret is off-screen must scroll
+    /// the view so the caret comes back into view. ImGui's input_text
+    /// doesn't manage the parent's scroll when the widget spans the
+    /// full content_w, so we compute the scroll target ourselves in
+    /// `draw_row` and feed it through the pin mechanism.
+    ///
+    /// Test setup: focus the row, force scroll_x to a non-zero value
+    /// (so the caret at column 0 is off the LEFT edge of the visible
+    /// pane), press Right, and assert scroll_x came back to keep the
+    /// caret in view.
+    #[test]
+    fn headless_wgpu_lateral_arrow_follows_cursor_into_view() {
+        let _guard = imgui_lock();
+        let Some((device, queue)) = try_init_wgpu() else {
+            eprintln!("skipping: no wgpu adapter available");
+            return;
+        };
+
+        let long = "x".repeat(500);
+        let text = format!("{long}\n");
+        let store = SessionStore::new();
+        let id = store.open_two_way(&text, &text, None).unwrap();
+
+        let mut ctx = imgui::Context::create();
+        ctx.io_mut().display_size = [1200.0, 800.0];
+        ctx.io_mut().delta_time = 1.0 / 60.0;
+        ctx.io_mut().config_flags |= imgui::ConfigFlags::NAV_ENABLE_KEYBOARD;
+        let mono = load_mono_font(&mut ctx, 13.0);
+        let target_format = wgpu::TextureFormat::Rgba8UnormSrgb;
+        let mut renderer = imgui_wgpu::Renderer::new(
+            &mut ctx,
+            &device,
+            &queue,
+            imgui_wgpu::RendererConfig {
+                texture_format: target_format,
+                ..Default::default()
+            },
+        );
+
+        let mut view_state = DiffViewState::default();
+        // Park caret at column 0.
+        focus_row_and_settle(
+            &mut ctx, &mut renderer, &device, &queue, target_format,
+            &store, id, &mut view_state, mono, Side::Left, 1, 0,
+        );
+
+        // Force scroll_x to 300, well past where column 0 lives.
+        // After this settles, the caret is off the left edge of the
+        // visible pane.
+        view_state.pin_scroll_x_after_splice = Some((Side::Left, 300.0, 4));
+        for _ in 0..6 {
+            run_frame_with_wgpu(
+                &mut ctx, &mut renderer, &device, &queue, target_format,
+                &store, id, &mut view_state, Some(mono), FrameInput::default(),
+            );
+        }
+        let scrolled_away = view_state.last_left_scroll_x;
+        assert!(
+            (scrolled_away - 300.0).abs() < 5.0,
+            "scroll_x didn't take the forced value (got {scrolled_away})",
+        );
+
+        // Press Right: caret moves from col 0 to col 1, still way off
+        // the left edge of the visible pane. Cursor-follow scroll must
+        // bring scroll_x back near 0 so the caret is visible.
+        run_frame_with_wgpu(
+            &mut ctx, &mut renderer, &device, &queue, target_format,
+            &store, id, &mut view_state, Some(mono),
+            FrameInput {
+                arrow: Some(imgui::Key::RightArrow),
+                ..Default::default()
+            },
+        );
+        for _ in 0..6 {
+            run_frame_with_wgpu(
+                &mut ctx, &mut renderer, &device, &queue, target_format,
+                &store, id, &mut view_state, Some(mono), FrameInput::default(),
+            );
+        }
+
+        // The caret is at column 1 (cursor_content_x ≈ 60 + 1*6 = 66).
+        // With a left-edge pad of `char_w`, scroll target ≈ 60. So
+        // scroll_x should be far from 300 (the previous "scrolled
+        // away" value) — anything below 100 indicates the cursor-
+        // follow kicked in.
+        assert!(
+            view_state.last_left_scroll_x < 100.0,
+            "scroll_x should have followed the cursor back to ~60; \
+             was {scrolled_away}, now {}",
+            view_state.last_left_scroll_x,
+        );
     }
 
     /// Left or Right arrow inside an active row must reset
