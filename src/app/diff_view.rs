@@ -590,6 +590,11 @@ pub fn render(
     // imgui-internal selection bounds AFTER our CaretCapture callback ran.
     // Read at end of `render` into `state.last_active_input_selection`.
     let active_selection: Cell<Option<(Side, u32, usize, usize)>> = Cell::new(None);
+    // Shift+Up / Shift+Down inside an active input_text extends the
+    // cross-row selection. Filled by `draw_row` when shift is held and
+    // an arrow key fires: `(side, current_line, current_col, target_line)`.
+    // Applied to `state.selection` after the panes render.
+    let shift_arrow_extend: Cell<Option<(Side, u32, usize, u32)>> = Cell::new(None);
 
     // Read the splice-induced scroll-x pin (if any) and decrement its
     // frame counter. We re-push it via `igSetNextWindowScroll` for the
@@ -716,6 +721,7 @@ pub fn render(
                     b_highlights,
                     content_w_right,
                     &active_selection,
+                    &shift_arrow_extend,
                 );
             });
 
@@ -790,6 +796,7 @@ pub fn render(
                     a_highlights,
                     content_w_left,
                     &active_selection,
+                    &shift_arrow_extend,
                 );
             });
 
@@ -851,6 +858,7 @@ pub fn render(
                     a_highlights,
                     content_w_left,
                     &active_selection,
+                    &shift_arrow_extend,
                 );
             });
 
@@ -921,6 +929,7 @@ pub fn render(
                     b_highlights,
                     content_w_right,
                     &active_selection,
+                    &shift_arrow_extend,
                 );
             });
 
@@ -940,6 +949,21 @@ pub fn render(
     // target row may not have been visible this frame).
     state.arrow_focus = arrow_focus_cell.take();
     state.caret_blink_reset = caret_blink_reset_cell.get();
+    // Apply Shift+Up/Down cross-row selection extension. Anchor is
+    // preserved from any existing same-side selection; otherwise it's
+    // pinned at the cursor's pre-move position. Caret moves to the
+    // same column on the adjacent line.
+    if let Some((side, cur_ln, cur_col, new_ln)) = shift_arrow_extend.take() {
+        let anchor = match state.selection.as_ref() {
+            Some(s) if s.side == side => s.anchor,
+            _ => SelPoint { line_no: cur_ln, col: cur_col },
+        };
+        state.selection = Some(Selection {
+            side,
+            anchor,
+            caret: SelPoint { line_no: new_ln, col: cur_col },
+        });
+    }
     if let Some(edit) = line_remove.take() {
         pending_edits.push(edit);
     }
@@ -1440,6 +1464,7 @@ fn draw_pane(
     highlights: &[LineSpans],
     content_w: f32,
     active_selection_out: &Cell<Option<(Side, u32, usize, usize)>>,
+    shift_arrow_out: &Cell<Option<(Side, u32, usize, u32)>>,
 ) {
     let total = rows.len() as i32;
     if total == 0 {
@@ -1484,6 +1509,7 @@ fn draw_pane(
                 line_hl,
                 content_w,
                 active_selection_out,
+                shift_arrow_out,
             ) {
                 click_out.set(Some(clicked_line));
             }
@@ -1677,6 +1703,7 @@ fn draw_row(
     line_hl: &[super::syntax::LineSpan],
     content_w: f32,
     active_selection_out: &Cell<Option<(Side, u32, usize, usize)>>,
+    shift_arrow_out: &Cell<Option<(Side, u32, usize, u32)>>,
 ) -> Option<u32> {
     let p0 = ui.cursor_screen_pos();
     let row_w = ui.content_region_avail()[0];
@@ -1996,6 +2023,9 @@ fn draw_row(
                     .unwrap_or_else(|| buf.chars().count());
                 let new_ln = if up { ln - 1 } else { ln + 1 };
                 arrow_focus.set(Some((side, new_ln, cur_col)));
+                if ui.io().key_shift {
+                    shift_arrow_out.set(Some((side, ln, cur_col, new_ln)));
+                }
             }
         }
     }
@@ -2400,6 +2430,10 @@ mod headless_tests {
         mouse_pos: Option<[f32; 2]>,
         /// Press or release the left mouse button.
         left_button: Option<bool>,
+        /// Press an arrow key (UpArrow or DownArrow) this frame.
+        arrow: Option<imgui::Key>,
+        /// Hold the shift modifier this frame.
+        shift: bool,
     }
 
     /// Run one render frame: snapshot the session, inject queued input
@@ -2668,6 +2702,14 @@ mod headless_tests {
         if input.backspace {
             ctx.io_mut().add_key_event(imgui::Key::Backspace, true);
         }
+        // Shift modifier must go through the event queue so NewFrame
+        // updates `io.key_shift` for this frame's widgets.
+        if input.shift {
+            ctx.io_mut().add_key_event(imgui::Key::ModShift, true);
+        }
+        if let Some(k) = input.arrow {
+            ctx.io_mut().add_key_event(k, true);
+        }
         ctx.io_mut().delta_time = 1.0 / 60.0;
 
         let snap = store.snapshot(id).unwrap();
@@ -2742,6 +2784,14 @@ mod headless_tests {
         queue.submit(Some(encoder.finish()));
         // No present (no surface). Pixel buffer is discarded; we only
         // care about imgui's post-frame state.
+        // Release the arrow + shift so the next frame doesn't see them
+        // as still pressed.
+        if let Some(k) = input.arrow {
+            ctx.io_mut().add_key_event(k, false);
+        }
+        if input.shift {
+            ctx.io_mut().add_key_event(imgui::Key::ModShift, false);
+        }
 
         for edit in pending_edits {
             apply_edit(store, edit);
@@ -2946,6 +2996,174 @@ mod headless_tests {
         assert_eq!(
             selected, "=",
             "expected single '=' to be selected; got bytes {start}..{end} = {selected:?}",
+        );
+    }
+
+    /// Drive the harness through enough frames to fully activate the
+    /// input_text on `(side, line_no)` and let imgui settle. Returns
+    /// the column the caret ended up at (which may differ slightly
+    /// from the requested column due to imgui's clamping behavior).
+    fn focus_row_and_settle(
+        ctx: &mut imgui::Context,
+        renderer: &mut imgui_wgpu::Renderer,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        target_format: wgpu::TextureFormat,
+        store: &SessionStore,
+        id: crate::session::SessionId,
+        view_state: &mut DiffViewState,
+        mono: imgui::FontId,
+        side: Side,
+        line_no: u32,
+        col: usize,
+    ) {
+        view_state.arrow_focus = Some((side, line_no, col));
+        // Several frames: set_keyboard_focus_here takes a couple of
+        // frames to make the widget active; selection state stabilizes
+        // after another frame or two.
+        for _ in 0..5 {
+            run_frame_with_wgpu(
+                ctx, renderer, device, queue, target_format,
+                store, id, view_state, Some(mono), FrameInput::default(),
+            );
+        }
+    }
+
+    /// Shift+Down inside the middle of a line extends `state.selection`
+    /// across rows: anchor at the caret's pre-move position, caret at
+    /// the same column on the line below. Standard editor behavior.
+    #[test]
+    fn headless_wgpu_shift_down_extends_selection_to_next_line() {
+        let _guard = imgui_lock();
+        let Some((device, queue)) = try_init_wgpu() else {
+            eprintln!("skipping: no wgpu adapter available");
+            return;
+        };
+
+        let text = "abcdefghij\nklmnopqrst\n";
+        let store = SessionStore::new();
+        let id = store.open_two_way(text, text, None).unwrap();
+
+        let mut ctx = imgui::Context::create();
+        ctx.io_mut().display_size = [1200.0, 800.0];
+        ctx.io_mut().delta_time = 1.0 / 60.0;
+        ctx.io_mut().config_flags |= imgui::ConfigFlags::NAV_ENABLE_KEYBOARD;
+        let mono = load_mono_font(&mut ctx, 13.0);
+        let target_format = wgpu::TextureFormat::Rgba8UnormSrgb;
+        let mut renderer = imgui_wgpu::Renderer::new(
+            &mut ctx,
+            &device,
+            &queue,
+            imgui_wgpu::RendererConfig {
+                texture_format: target_format,
+                ..Default::default()
+            },
+        );
+
+        let mut view_state = DiffViewState::default();
+        // Park the caret at column 4 on line 1 via the arrow-focus
+        // mechanism (more reliable in headless than relying on a click
+        // to activate imgui's input_text).
+        focus_row_and_settle(
+            &mut ctx, &mut renderer, &device, &queue, target_format,
+            &store, id, &mut view_state, mono, Side::Left, 1, 4,
+        );
+
+        // Press Shift+Down. Selection should now span (1, 4) → (2, 4).
+        run_frame_with_wgpu(
+            &mut ctx, &mut renderer, &device, &queue, target_format,
+            &store, id, &mut view_state, Some(mono),
+            FrameInput {
+                arrow: Some(imgui::Key::DownArrow),
+                shift: true,
+                ..Default::default()
+            },
+        );
+        run_frame_with_wgpu(
+            &mut ctx, &mut renderer, &device, &queue, target_format,
+            &store, id, &mut view_state, Some(mono), FrameInput::default(),
+        );
+
+        let sel = view_state
+            .selection
+            .as_ref()
+            .expect("Shift+Down should produce a selection");
+        assert_eq!(sel.side, Side::Left);
+        assert_eq!(
+            sel.anchor,
+            SelPoint { line_no: 1, col: 4 },
+            "anchor should be at the pre-move caret position",
+        );
+        assert_eq!(
+            sel.caret,
+            SelPoint { line_no: 2, col: 4 },
+            "caret should jump to same column on line 2",
+        );
+    }
+
+    /// Shift+Up mirror of the Shift+Down test.
+    #[test]
+    fn headless_wgpu_shift_up_extends_selection_to_prev_line() {
+        let _guard = imgui_lock();
+        let Some((device, queue)) = try_init_wgpu() else {
+            eprintln!("skipping: no wgpu adapter available");
+            return;
+        };
+
+        let text = "abcdefghij\nklmnopqrst\nuvwxyz0123\n";
+        let store = SessionStore::new();
+        let id = store.open_two_way(text, text, None).unwrap();
+
+        let mut ctx = imgui::Context::create();
+        ctx.io_mut().display_size = [1200.0, 800.0];
+        ctx.io_mut().delta_time = 1.0 / 60.0;
+        ctx.io_mut().config_flags |= imgui::ConfigFlags::NAV_ENABLE_KEYBOARD;
+        let mono = load_mono_font(&mut ctx, 13.0);
+        let target_format = wgpu::TextureFormat::Rgba8UnormSrgb;
+        let mut renderer = imgui_wgpu::Renderer::new(
+            &mut ctx,
+            &device,
+            &queue,
+            imgui_wgpu::RendererConfig {
+                texture_format: target_format,
+                ..Default::default()
+            },
+        );
+
+        let mut view_state = DiffViewState::default();
+        focus_row_and_settle(
+            &mut ctx, &mut renderer, &device, &queue, target_format,
+            &store, id, &mut view_state, mono, Side::Left, 2, 4,
+        );
+
+        run_frame_with_wgpu(
+            &mut ctx, &mut renderer, &device, &queue, target_format,
+            &store, id, &mut view_state, Some(mono),
+            FrameInput {
+                arrow: Some(imgui::Key::UpArrow),
+                shift: true,
+                ..Default::default()
+            },
+        );
+        run_frame_with_wgpu(
+            &mut ctx, &mut renderer, &device, &queue, target_format,
+            &store, id, &mut view_state, Some(mono), FrameInput::default(),
+        );
+
+        let sel = view_state
+            .selection
+            .as_ref()
+            .expect("Shift+Up should produce a selection");
+        assert_eq!(sel.side, Side::Left);
+        assert_eq!(
+            sel.anchor,
+            SelPoint { line_no: 2, col: 4 },
+            "anchor should be at the pre-move caret position",
+        );
+        assert_eq!(
+            sel.caret,
+            SelPoint { line_no: 1, col: 4 },
+            "caret should jump to same column on line 1",
         );
     }
 
