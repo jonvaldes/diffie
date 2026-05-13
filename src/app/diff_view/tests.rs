@@ -2957,3 +2957,47 @@ mod headless_tests {
         assert!(view_state.pin_scroll_x_after_splice.is_none());
     }
 }
+
+mod move_pairing_tests {
+    use super::*;
+
+    #[test]
+    fn session_with_move_produces_paired_hunks_with_matching_id() {
+        use crate::app::diff_view::common::{find_paired_hunk, hunk_move_id, Side};
+        use crate::diff::{DiffOptions, Hunk};
+        use crate::session::{SessionMode, SessionStore};
+
+        let a_text = "hdr1\nhdr2\nblk1\nblk2\nblk3\nblk4\nblk5\nftr1\nftr2\n";
+        let b_text = "hdr1\nhdr2\nftr1\nftr2\nblk1\nblk2\nblk3\nblk4\nblk5\n";
+        let store = SessionStore::new();
+        let opts = DiffOptions {
+            detect_moves: true,
+            move_min_lines: 2,
+            ..DiffOptions::default()
+        };
+        let id = store
+            .open_two_way_with(a_text, b_text, Some("histogram".into()), opts)
+            .expect("create session");
+        let snapshot = store.snapshot(id).expect("snapshot");
+        let hunks: Vec<Hunk> = match snapshot.mode {
+            SessionMode::TwoWay { hunks, .. } => hunks,
+            _ => panic!("expected TwoWay"),
+        };
+        let tagged: Vec<&Hunk> = hunks.iter().filter(|h| hunk_move_id(h).is_some()).collect();
+        assert_eq!(tagged.len(), 2, "exactly two hunks should be tagged");
+        let id_a = hunk_move_id(tagged[0]);
+        let id_b = hunk_move_id(tagged[1]);
+        assert_eq!(id_a, id_b, "both halves of a move share the id");
+        let move_id = id_a.unwrap();
+        let delete_hunk = tagged
+            .iter()
+            .find(|h| h.b_range == (0, 0))
+            .expect("delete-only present");
+        let paired = find_paired_hunk(&hunks, move_id, Side::Left);
+        assert_eq!(
+            paired.map(|h| h.id),
+            Some(tagged.iter().find(|h| h.a_range == (0, 0)).unwrap().id)
+        );
+        let _ = delete_hunk;
+    }
+}

@@ -20,7 +20,8 @@ use crate::session::{SessionId, TwoWaySide};
 use super::common::{
     fill_bezier_ribbon, find_paired_hunk, gutter_w, hunk_move_id, is_change_hunk, move_color,
     move_ribbon_alpha, ordered_endpoints, ribbon_color, row_h, stroke_bezier_curve, target_scroll,
-    text_x_at_byte, double_click_word_bounds, Cls, DiffViewState, Row, Selection, Side,
+    text_x_at_byte, double_click_word_bounds, Cls, DiffViewState, MoveFlash, PendingJump, Row,
+    Selection, Side, MOVE_FLASH_FRAMES, MOVE_FLASH_PEAK_ALPHA,
 };
 
 #[allow(clippy::too_many_arguments)]
@@ -133,6 +134,9 @@ pub(super) fn draw_pane(
     clear_state_selection_out: &Cell<bool>,
     pin_scroll_x_request_out: &Cell<Option<(Side, f32)>>,
     caret_offset_out: &Cell<Option<(Side, f32)>>,
+    hunks: &[Hunk],
+    pending_jump_out: &Cell<Option<PendingJump>>,
+    flash: Option<MoveFlash>,
 ) {
     let total = rows.len() as i32;
     if total == 0 {
@@ -181,6 +185,7 @@ pub(super) fn draw_pane(
                 clear_state_selection_out,
                 pin_scroll_x_request_out,
                 caret_offset_out,
+                flash,
             ) {
                 click_out.set(Some(clicked_line));
             }
@@ -214,7 +219,16 @@ pub(super) fn draw_pane(
     }
 
     if let Some((hunk_id, pos)) = hover.get() {
-        draw_control_overlay(ui, session_id, hunk_id, pos, pending_edits);
+        draw_control_overlay(
+            ui,
+            session_id,
+            hunk_id,
+            pos,
+            pending_edits,
+            hunks,
+            side,
+            pending_jump_out,
+        );
     }
 }
 
@@ -227,13 +241,21 @@ fn draw_control_overlay(
     hunk_id: u32,
     pos: [f32; 2],
     pending_edits: &mut Vec<DiffEdit>,
+    hunks: &[Hunk],
+    side: Side,
+    pending_jump_out: &Cell<Option<PendingJump>>,
 ) {
     let _pad = ui.push_style_var(StyleVar::FramePadding([6.0, 2.0]));
     let _spacing = ui.push_style_var(StyleVar::ItemSpacing([4.0, 0.0]));
 
+    let hunk = hunks.iter().find(|h| h.id == hunk_id);
+    let move_id = hunk.and_then(hunk_move_id);
+    let paired = move_id.and_then(|id| find_paired_hunk(hunks, id, side));
+    let is_moved_with_pair = paired.is_some();
+
     let panel_x = pos[0] + 4.0;
     let panel_y = pos[1] + 2.0;
-    let panel_w = 200.0;
+    let panel_w: f32 = if is_moved_with_pair { 240.0 } else { 200.0 };
     let panel_h = row_h() - 4.0;
 
     let dl = ui.get_window_draw_list();
@@ -273,6 +295,35 @@ fn draw_control_overlay(
             target: TwoWaySide::A,
             old_target_lines: None,
         });
+    }
+    if is_moved_with_pair {
+        ui.same_line();
+        if ui.small_button(format!("↕##ov{hunk_id}_jump")) {
+            if let Some(p) = paired {
+                let target_line = match side {
+                    Side::Left => p.b_range.0,
+                    Side::Right => p.a_range.0,
+                };
+                let target_pane = match side {
+                    Side::Left => Side::Right,
+                    Side::Right => Side::Left,
+                };
+                pending_jump_out.set(Some(PendingJump {
+                    session_id,
+                    pane: target_pane,
+                    target_line,
+                }));
+            }
+        }
+        if let Some(p) = paired {
+            if ui.is_item_hovered() {
+                let n = match side {
+                    Side::Left => p.b_range.0,
+                    Side::Right => p.a_range.0,
+                };
+                ui.tooltip_text(format!("Jump to paired half (line {n})"));
+            }
+        }
     }
 }
 
@@ -394,6 +445,7 @@ fn draw_row(
     clear_state_selection_out: &Cell<bool>,
     pin_scroll_x_request_out: &Cell<Option<(Side, f32)>>,
     caret_offset_out: &Cell<Option<(Side, f32)>>,
+    flash: Option<MoveFlash>,
 ) -> Option<u32> {
     let p0 = ui.cursor_screen_pos();
     let row_w = ui.content_region_avail()[0];
@@ -449,6 +501,14 @@ fn draw_row(
         dl.add_rect(p0, p1, theme::with_alpha(theme::TEXT, 0.04))
             .filled(true)
             .build();
+    }
+    if let Some(f) = flash {
+        if f.session_id == session_id && f.hunk_id == row.hunk_id {
+            let alpha = MOVE_FLASH_PEAK_ALPHA
+                * (f.frames_remaining as f32 / MOVE_FLASH_FRAMES as f32);
+            let color = theme::with_alpha(move_color(), alpha);
+            dl.add_rect(p0, p1, color).filled(true).build();
+        }
     }
     if let (Some(sel), Some(ln)) = (selection, row.line_no) {
         if sel.side == side {

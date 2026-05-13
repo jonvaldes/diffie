@@ -42,7 +42,7 @@ pub use common::{
     Side,
 };
 
-use common::{build_pane, gutter_w, row_h, CONNECTOR_W};
+use common::{build_pane, gutter_w, row_h, MoveFlash, PendingJump, CONNECTOR_W};
 use input::{build_selection_splice, handle_anchor_clicks, update_selection};
 use render::{draw_connector, draw_pane, sync_scrolls};
 
@@ -126,6 +126,13 @@ pub fn render(
     // where caret_offset is the caret's x offset from the text-start
     // column, in pixels. Read by tests to verify caret–text alignment.
     let caret_offset_cell: Cell<Option<(Side, f32)>> = Cell::new(None);
+    // Jump-to-pair request: a request set by the `↕` button last frame is
+    // consumed now (the target pane scrolls to center `target_line` and a
+    // `MoveFlash` is started on the arrival hunk). The cell collects any
+    // NEW request set during THIS frame's overlay paint, which lands in
+    // `state.pending_jump` for next frame to consume.
+    let mut pending_jump_this_frame: Option<PendingJump> = state.pending_jump.take();
+    let pending_jump_cell: Cell<Option<PendingJump>> = Cell::new(None);
 
     // Read the splice-induced scroll-x pin (if any) and decrement its
     // frame counter. We re-push it via `igSetNextWindowScroll` for the
@@ -203,11 +210,46 @@ pub fn render(
     // sync math. Each render branch threads the same state mutations
     // (pending_X, written_X) explicitly to keep the borrow checker happy.
 
+    // Per-pane jump consumer. Returns the scroll-y to push (if any) and as
+    // a side effect: clears `*pending` and sets `state.flash` to a fresh
+    // MoveFlash on the hunk containing `target_line`. Called right before
+    // each pane's `igSetNextWindowScroll` block so the jump can override
+    // sync-driven scroll for that pane this frame.
+    let consume_jump = |this_side: Side,
+                            pane: &common::Pane,
+                            pending: &mut Option<PendingJump>,
+                            state: &mut DiffViewState|
+     -> Option<f32> {
+        let jump = (*pending)?;
+        if jump.session_id != session_id || jump.pane != this_side {
+            return None;
+        }
+        let content_y = pane.line_ys.get(&jump.target_line).copied()?;
+        let y = (content_y - avail[1] * 0.5).max(0.0);
+        let paired_hunk_id = hunks.iter().find(|h| {
+            let (lo, hi) = match this_side {
+                Side::Left => h.a_range,
+                Side::Right => h.b_range,
+            };
+            lo != 0 && jump.target_line >= lo && jump.target_line <= hi
+        }).map(|h| h.id);
+        if let Some(hid) = paired_hunk_id {
+            state.flash = Some(MoveFlash {
+                session_id,
+                hunk_id: hid,
+                frames_remaining: common::MOVE_FLASH_FRAMES,
+            });
+        }
+        *pending = None;
+        Some(y)
+    };
+
     if right_first {
         // --- right is driver: render right first ---
         ui.set_cursor_screen_pos(right_pos);
         {
-            let y_to_apply = state.pending_right.take();
+            let jump_y = consume_jump(Side::Right, &right, &mut pending_jump_this_frame, state);
+            let y_to_apply = jump_y.or_else(|| state.pending_right.take());
             let x_to_apply = pin_scroll_x
                 .filter(|(s, _)| *s == Side::Right)
                 .map(|(_, x)| x);
@@ -256,6 +298,9 @@ pub fn render(
                     &clear_state_selection,
                     &pin_scroll_x_request,
                     &caret_offset_cell,
+                    hunks,
+                    &pending_jump_cell,
+                    state.flash,
                 );
             });
 
@@ -282,7 +327,8 @@ pub fn render(
         // stale value queued for the next frame (which would snap-back the
         // scroll when the wheel rate dips below threshold mid-gesture).
         let pending_consumed = state.pending_left.take();
-        let apply_left = left_override.or(pending_consumed);
+        let jump_y_left = consume_jump(Side::Left, &left, &mut pending_jump_this_frame, state);
+        let apply_left = jump_y_left.or(left_override).or(pending_consumed);
 
         ui.set_cursor_screen_pos(left_pos);
         {
@@ -334,6 +380,9 @@ pub fn render(
                     &clear_state_selection,
                     &pin_scroll_x_request,
                     &caret_offset_cell,
+                    hunks,
+                    &pending_jump_cell,
+                    state.flash,
                 );
             });
 
@@ -350,7 +399,8 @@ pub fn render(
         // --- left is driver (or no wheel): render left first ---
         ui.set_cursor_screen_pos(left_pos);
         {
-            let y_to_apply = state.pending_left.take();
+            let jump_y = consume_jump(Side::Left, &left, &mut pending_jump_this_frame, state);
+            let y_to_apply = jump_y.or_else(|| state.pending_left.take());
             let x_to_apply = pin_scroll_x
                 .filter(|(s, _)| *s == Side::Left)
                 .map(|(_, x)| x);
@@ -399,6 +449,9 @@ pub fn render(
                     &clear_state_selection,
                     &pin_scroll_x_request,
                     &caret_offset_cell,
+                    hunks,
+                    &pending_jump_cell,
+                    state.flash,
                 );
             });
 
@@ -421,7 +474,8 @@ pub fn render(
         };
         // Always drain `pending_right` — see the right_first branch for why.
         let pending_consumed = state.pending_right.take();
-        let apply_right = right_override.or(pending_consumed);
+        let jump_y_right = consume_jump(Side::Right, &right, &mut pending_jump_this_frame, state);
+        let apply_right = jump_y_right.or(right_override).or(pending_consumed);
 
         ui.set_cursor_screen_pos(right_pos);
         {
@@ -473,6 +527,9 @@ pub fn render(
                     &clear_state_selection,
                     &pin_scroll_x_request,
                     &caret_offset_cell,
+                    hunks,
+                    &pending_jump_cell,
+                    state.flash,
                 );
             });
 
@@ -492,6 +549,20 @@ pub fn render(
     // target row may not have been visible this frame).
     state.arrow_focus = arrow_focus_cell.take();
     state.caret_blink_reset = caret_blink_reset_cell.get();
+    // Stash a new jump-to-pair request set this frame via the `↕` button
+    // (consumed by the next frame's pane render). Also re-stash an
+    // unconsumed prior-frame jump — its target pane's `line_ys` didn't
+    // contain the requested line on this frame's render, so retry next.
+    state.pending_jump = pending_jump_cell.take().or(pending_jump_this_frame);
+    // Decrement the arrival flash and clear when it expires.
+    if let Some(f) = state.flash.as_mut() {
+        if f.frames_remaining > 0 {
+            f.frames_remaining -= 1;
+        }
+        if f.frames_remaining == 0 {
+            state.flash = None;
+        }
+    }
     // Apply Shift+Up/Down cross-row selection extension. Anchor is
     // preserved from any existing same-side selection; otherwise it's
     // pinned at the cursor's pre-move position. Caret moves to the

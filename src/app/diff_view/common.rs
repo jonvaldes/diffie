@@ -58,6 +58,29 @@ pub(super) fn gutter_w() -> f32 {
     GUTTER_W_BASE * crate::app::code_font_zoom()
 }
 
+/// Jump-to-paired-half request, set by the `↕` button in the hover
+/// overlay and consumed on the next frame's pane render. `target_line`
+/// is the line number on `pane`'s side that we want centered.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct PendingJump {
+    pub(super) session_id: crate::session::SessionId,
+    pub(super) pane: Side,
+    pub(super) target_line: crate::diff::LineNo,
+}
+
+/// Brief peach flash painted on top of a hunk's rows for a few frames
+/// after the user arrives via the `↕` jump button. Fades out by
+/// decrementing `frames_remaining`.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct MoveFlash {
+    pub(super) session_id: crate::session::SessionId,
+    pub(super) hunk_id: u32,
+    pub(super) frames_remaining: u8,
+}
+
+pub(super) const MOVE_FLASH_FRAMES: u8 = 30;
+pub(super) const MOVE_FLASH_PEAK_ALPHA: f32 = 0.20;
+
 /// Per-session view state that must persist across frames.
 #[derive(Default)]
 pub struct DiffViewState {
@@ -129,6 +152,15 @@ pub struct DiffViewState {
     /// is the character index (not byte index) of the caret. Tests use
     /// this to verify the caret aligns with the rendered characters.
     pub last_active_caret_offset: Option<(Side, f32)>,
+    /// Pending jump-to-pair request set by the `↕` button in the hover
+    /// overlay. Consumed by the next frame's pane render: that pane
+    /// scrolls so `target_line` lands at the vertical center, and a
+    /// `MoveFlash` is started on the hunk containing `target_line`.
+    pub(super) pending_jump: Option<PendingJump>,
+    /// Active arrival flash on a moved hunk after a jump. Drawn as a
+    /// translucent peach rect under each row of the hunk, with alpha
+    /// fading linearly as `frames_remaining` decrements toward zero.
+    pub(super) flash: Option<MoveFlash>,
 }
 
 /// One end of a selection. `line_no` is the source-line index on `side` of
