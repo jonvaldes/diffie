@@ -1818,8 +1818,24 @@ fn draw_row(
                 let l_col = l_col.min(char_count);
                 let r_col = r_col.min(char_count);
                 if r_col > l_col {
-                    let sel_x0 = text_start_x + l_col as f32 * char_w;
-                    let sel_x1 = text_start_x + r_col as f32 * char_w;
+                    // Use calc_text_size on the row's text prefix so the
+                    // selection rect aligns with the rendered glyphs
+                    // (proportional-font safe; for monospace it matches
+                    // col * char_w exactly).
+                    let row_text: String =
+                        row.segments.iter().map(|s| s.text.as_str()).collect();
+                    let l_byte = row_text
+                        .char_indices()
+                        .nth(l_col)
+                        .map(|(b, _)| b)
+                        .unwrap_or(row_text.len());
+                    let r_byte = row_text
+                        .char_indices()
+                        .nth(r_col)
+                        .map(|(b, _)| b)
+                        .unwrap_or(row_text.len());
+                    let sel_x0 = text_start_x + ui.calc_text_size(&row_text[..l_byte])[0];
+                    let sel_x1 = text_start_x + ui.calc_text_size(&row_text[..r_byte])[0];
                     dl.add_rect(
                         [sel_x0, p0[1]],
                         [sel_x1, p1[1]],
@@ -2102,10 +2118,10 @@ fn draw_row(
             } else if left || right {
                 let cur_byte = caret_pos.get().max(0) as usize;
                 let take = cur_byte.min(buf.len());
-                let new_col = buf
-                    .get(..take)
-                    .map(|s| s.chars().count())
-                    .unwrap_or_else(|| buf.chars().count());
+                let mut snap = take;
+                while snap > 0 && !buf.is_char_boundary(snap) {
+                    snap -= 1;
+                }
                 let cur_scroll = ui.scroll_x();
                 // True visible content width. `window_size()` includes
                 // WindowPadding (~8 px each side), and `content_region`
@@ -2117,7 +2133,11 @@ fn draw_row(
                 // edge before the scroll-follow triggers.
                 let style_pad_x = unsafe { ui.style() }.window_padding[0];
                 let viewport_w = (ui.window_size()[0] - 2.0 * style_pad_x).max(1.0);
-                let cursor_content_x = gutter_w() + (new_col as f32) * char_w;
+                // Use calc_text_size so the scroll target matches the
+                // actual rendered position of the new caret (works for
+                // proportional fonts too).
+                let cursor_content_x =
+                    gutter_w() + ui.calc_text_size(&buf[..snap])[0];
                 // Two-character margin: scroll when the cursor gets
                 // within 2 chars of either edge, and land it 2 chars
                 // from the edge after the scroll. Standard "soft edge"
