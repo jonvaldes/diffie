@@ -2090,7 +2090,12 @@ fn draw_row(
                 // `ui.window_size()` is the child's actual rect.
                 let viewport_w = ui.window_size()[0];
                 let cursor_content_x = gutter_w() + (new_col as f32) * char_w;
-                let pad = char_w;
+                // Two-character margin: scroll when the cursor gets
+                // within 2 chars of either edge, and land it 2 chars
+                // from the edge after the scroll. Standard "soft edge"
+                // behavior so the user has visual context around the
+                // caret instead of it pressing against the viewport wall.
+                let pad = 2.0 * char_w;
                 let target = if cursor_content_x < cur_scroll + pad {
                     (cursor_content_x - pad).max(0.0)
                 } else if cursor_content_x > cur_scroll + viewport_w - pad {
@@ -3382,6 +3387,99 @@ mod headless_tests {
             .expect("Right arrow inside active row should queue a scroll-x pin");
         assert_eq!(pin.0, Side::Left);
         assert_eq!(pin.2, 4);
+    }
+
+    /// The cursor-follow scroll keeps a 2-character margin from the
+    /// viewport edges. Setup: scroll so the caret would be exactly at
+    /// the edge, then press an arrow; after the move the cursor must
+    /// be at least 2 chars inside the viewport.
+    #[test]
+    fn headless_wgpu_lateral_arrow_keeps_two_char_margin() {
+        let _guard = imgui_lock();
+        let Some((device, queue)) = try_init_wgpu() else {
+            eprintln!("skipping: no wgpu adapter available");
+            return;
+        };
+
+        let long = "x".repeat(500);
+        let text = format!("{long}\n");
+        let store = SessionStore::new();
+        let id = store.open_two_way(&text, &text, None).unwrap();
+
+        let mut ctx = imgui::Context::create();
+        ctx.io_mut().display_size = [1200.0, 800.0];
+        ctx.io_mut().delta_time = 1.0 / 60.0;
+        ctx.io_mut().config_flags |= imgui::ConfigFlags::NAV_ENABLE_KEYBOARD;
+        let mono = load_mono_font(&mut ctx, 13.0);
+        let target_format = wgpu::TextureFormat::Rgba8UnormSrgb;
+        let mut renderer = imgui_wgpu::Renderer::new(
+            &mut ctx,
+            &device,
+            &queue,
+            imgui_wgpu::RendererConfig {
+                texture_format: target_format,
+                ..Default::default()
+            },
+        );
+
+        let mut view_state = DiffViewState::default();
+        focus_row_and_settle(
+            &mut ctx, &mut renderer, &device, &queue, target_format,
+            &store, id, &mut view_state, mono, Side::Left, 1, 0,
+        );
+
+        // Force scroll_x to a moderate value so the caret at col 0 is
+        // off-screen. After the Right press, the caret will be brought
+        // back into view — and we'll measure how far inside the viewport
+        // it ended up.
+        view_state.pin_scroll_x_after_splice = Some((Side::Left, 200.0, 4));
+        for _ in 0..6 {
+            run_frame_with_wgpu(
+                &mut ctx, &mut renderer, &device, &queue, target_format,
+                &store, id, &mut view_state, Some(mono), FrameInput::default(),
+            );
+        }
+
+        // Press Right: caret advances to col 1; scroll snaps back so
+        // cursor is visible with the 2-char margin.
+        run_frame_with_wgpu(
+            &mut ctx, &mut renderer, &device, &queue, target_format,
+            &store, id, &mut view_state, Some(mono),
+            FrameInput {
+                arrow: Some(imgui::Key::RightArrow),
+                ..Default::default()
+            },
+        );
+        for _ in 0..6 {
+            run_frame_with_wgpu(
+                &mut ctx, &mut renderer, &device, &queue, target_format,
+                &store, id, &mut view_state, Some(mono), FrameInput::default(),
+            );
+        }
+
+        // char_w in the mono font at size 13 is ~6 px (verified by
+        // existing tests). Cursor at col 1 has content x ≈ 66
+        // (gutter_w 60 + 1*6). With a 2-char margin we expect
+        // scroll_x ≈ 66 - 12 = 54. That puts the cursor 12 px inside
+        // the left edge of the viewport — i.e., a 2-char margin.
+        let scroll_x = view_state.last_left_scroll_x;
+        let cursor_content_x = 60.0 + 6.0; // approximate (col 1)
+        let cursor_screen_x_in_viewport = cursor_content_x - scroll_x;
+
+        // Margin should be ~2 chars (~12 px). Allow generous tolerance
+        // for char_w drift and float math; the bug case would be 0 or
+        // 6 (1-char or no margin).
+        assert!(
+            cursor_screen_x_in_viewport >= 10.0,
+            "cursor landed too close to left edge: cursor_x={cursor_content_x}, \
+             scroll_x={scroll_x}, in-viewport={cursor_screen_x_in_viewport} \
+             (expected >=10 for ~2-char margin)",
+        );
+        assert!(
+            cursor_screen_x_in_viewport <= 20.0,
+            "cursor landed too far from edge: in-viewport={cursor_screen_x_in_viewport} \
+             (expected ~12 for 2-char margin)",
+        );
     }
 
     /// Pressing Left/Right while the caret is off-screen must scroll
