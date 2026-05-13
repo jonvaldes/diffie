@@ -343,7 +343,7 @@ pub(super) fn build_pane(hunks: &[Hunk], side: Side) -> Pane {
                 .ops
                 .iter()
                 .filter_map(|op| match op {
-                    DiffOp::Delete { a, text } => Some((*a, text.as_str())),
+                    DiffOp::Delete { a, text, .. } => Some((*a, text.as_str())),
                     _ => None,
                 })
                 .collect();
@@ -351,7 +351,7 @@ pub(super) fn build_pane(hunks: &[Hunk], side: Side) -> Pane {
                 .ops
                 .iter()
                 .filter_map(|op| match op {
-                    DiffOp::Insert { b, text } => Some((*b, text.as_str())),
+                    DiffOp::Insert { b, text, .. } => Some((*b, text.as_str())),
                     _ => None,
                 })
                 .collect();

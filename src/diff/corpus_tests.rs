@@ -1,0 +1,130 @@
+//! Shared correctness tests run against every registered engine.
+
+#![cfg(test)]
+
+use super::{
+    available_engines, build_engine, split_lines, DiffOp, DiffOptions, EngineCapabilities,
+};
+
+fn each_engine(case: impl Fn(&str, &dyn super::DiffEngine)) {
+    for (name, _caps) in available_engines() {
+        let engine = build_engine(&name).expect("engine builds");
+        case(&name, engine.as_ref());
+    }
+}
+
+fn run(engine: &dyn super::DiffEngine, a: &str, b: &str) -> Vec<DiffOp> {
+    let al = split_lines(a);
+    let bl = split_lines(b);
+    engine.diff(&al, &bl, &DiffOptions::default())
+}
+
+#[test]
+fn identity_yields_only_equals() {
+    each_engine(|name, e| {
+        let ops = run(e, "alpha\nbeta\ngamma\n", "alpha\nbeta\ngamma\n");
+        assert_eq!(ops.len(), 3, "engine={name}");
+        assert!(
+            ops.iter().all(|o| matches!(o, DiffOp::Equal { .. })),
+            "engine={name}: expected all Equal, got {ops:?}"
+        );
+    });
+}
+
+#[test]
+fn pure_insertion_keeps_existing_lines_equal() {
+    each_engine(|name, e| {
+        let ops = run(e, "a\nc\n", "a\nb\nc\n");
+        let inserts = ops.iter().filter(|o| matches!(o, DiffOp::Insert { .. })).count();
+        let deletes = ops.iter().filter(|o| matches!(o, DiffOp::Delete { .. })).count();
+        let equals = ops.iter().filter(|o| matches!(o, DiffOp::Equal { .. })).count();
+        assert_eq!(inserts, 1, "engine={name}");
+        assert_eq!(deletes, 0, "engine={name}");
+        assert_eq!(equals, 2, "engine={name}");
+    });
+}
+
+#[test]
+fn pure_deletion_keeps_existing_lines_equal() {
+    each_engine(|name, e| {
+        let ops = run(e, "a\nb\nc\n", "a\nc\n");
+        let inserts = ops.iter().filter(|o| matches!(o, DiffOp::Insert { .. })).count();
+        let deletes = ops.iter().filter(|o| matches!(o, DiffOp::Delete { .. })).count();
+        let equals = ops.iter().filter(|o| matches!(o, DiffOp::Equal { .. })).count();
+        assert_eq!(inserts, 0, "engine={name}");
+        assert_eq!(deletes, 1, "engine={name}");
+        assert_eq!(equals, 2, "engine={name}");
+    });
+}
+
+#[test]
+fn line_numbers_are_one_based_and_increasing() {
+    each_engine(|name, e| {
+        let ops = run(e, "a\nb\nc\nd\n", "a\nB\nc\nD\n");
+        let mut last_a: u32 = 0;
+        let mut last_b: u32 = 0;
+        for op in &ops {
+            match op {
+                DiffOp::Equal { a, b, .. } => {
+                    assert!(*a >= 1 && *b >= 1, "engine={name}: zero line no");
+                    assert!(*a >= last_a, "engine={name}: a not monotonic");
+                    assert!(*b >= last_b, "engine={name}: b not monotonic");
+                    last_a = *a;
+                    last_b = *b;
+                }
+                DiffOp::Delete { a, .. } => {
+                    assert!(*a >= 1);
+                    assert!(*a >= last_a, "engine={name}: a not monotonic in delete");
+                    last_a = *a;
+                }
+                DiffOp::Insert { b, .. } => {
+                    assert!(*b >= 1);
+                    assert!(*b >= last_b, "engine={name}: b not monotonic in insert");
+                    last_b = *b;
+                }
+            }
+        }
+    });
+}
+
+#[test]
+fn every_a_line_appears_once_per_side() {
+    // Each `a` line should appear in exactly one Equal or Delete op; each
+    // `b` line in exactly one Equal or Insert op.
+    each_engine(|name, e| {
+        let a = "alpha\nbeta\ngamma\ndelta\nepsilon\n";
+        let b = "alpha\nBETA\ngamma\ndelta\nEPSILON\n";
+        let al = split_lines(a);
+        let bl = split_lines(b);
+        let ops = e.diff(&al, &bl, &DiffOptions::default());
+
+        let mut a_seen = vec![0u32; al.len()];
+        let mut b_seen = vec![0u32; bl.len()];
+        for op in &ops {
+            match op {
+                DiffOp::Equal { a, b, .. } => {
+                    a_seen[(*a - 1) as usize] += 1;
+                    b_seen[(*b - 1) as usize] += 1;
+                }
+                DiffOp::Delete { a, .. } => a_seen[(*a - 1) as usize] += 1,
+                DiffOp::Insert { b, .. } => b_seen[(*b - 1) as usize] += 1,
+            }
+        }
+        assert!(a_seen.iter().all(|c| *c == 1), "engine={name}: a counts {a_seen:?}");
+        assert!(b_seen.iter().all(|c| *c == 1), "engine={name}: b counts {b_seen:?}");
+    });
+}
+
+#[test]
+fn engines_with_supports_moves_false_emit_no_move_tag() {
+    // Sanity check on the capability matrix: no initial engine claims moves,
+    // and DiffOp has no Moved variant yet, so nothing to assert beyond the
+    // capability declaration itself.
+    for (name, caps) in available_engines() {
+        assert_eq!(
+            caps,
+            EngineCapabilities { supports_moves: false },
+            "engine={name}: unexpected capabilities"
+        );
+    }
+}

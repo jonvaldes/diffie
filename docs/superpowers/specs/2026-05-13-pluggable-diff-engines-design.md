@@ -12,7 +12,7 @@ The hunk/anchor/merge data model stays line-based. All new behavior is additive 
 ## Goals
 
 - Multiple diff algorithms selectable per tab.
-- Whitespace insensitivity options (ignore-all / ignore-leading / ignore-trailing+EOL).
+- Whitespace insensitivity options (all-significant / ignore-all / ignore-leading / ignore-trailing+EOL).
 - Sub-line highlight granularity (word / char / grapheme), as a visual refinement only.
 - Capability-gated move-detection toggle, with plumbing in place for future engines.
 - Per-tab settings with a global default in a Preferences dialog.

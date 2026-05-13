@@ -1,4 +1,4 @@
-use super::{Anchor, DiffEngine, DiffOp, LineNo};
+use super::{Anchor, DiffEngine, DiffOp, DiffOptions, EngineCapabilities, LineNo};
 
 /// Wraps any `DiffEngine` and forces matches at user-supplied anchors.
 ///
@@ -46,9 +46,9 @@ impl<E: DiffEngine> AnchoredDiff<E> {
         Ok(())
     }
 
-    pub fn diff_checked(&self, a: &[&str], b: &[&str]) -> Result<Vec<DiffOp>, AnchorError> {
+    pub fn diff_checked(&self, a: &[&str], b: &[&str], opts: &DiffOptions) -> Result<Vec<DiffOp>, AnchorError> {
         self.validate(a.len(), b.len())?;
-        Ok(self.diff(a, b))
+        Ok(self.diff(a, b, opts))
     }
 }
 
@@ -57,9 +57,13 @@ impl<E: DiffEngine> DiffEngine for AnchoredDiff<E> {
         "anchored"
     }
 
-    fn diff(&self, a: &[&str], b: &[&str]) -> Vec<DiffOp> {
+    fn capabilities(&self) -> EngineCapabilities {
+        self.inner.capabilities()
+    }
+
+    fn diff(&self, a: &[&str], b: &[&str], opts: &DiffOptions) -> Vec<DiffOp> {
         if self.anchors.is_empty() {
-            return self.inner.diff(a, b);
+            return self.inner.diff(a, b, opts);
         }
 
         let mut out: Vec<DiffOp> = Vec::new();
@@ -80,7 +84,7 @@ impl<E: DiffEngine> DiffEngine for AnchoredDiff<E> {
             let b_hi = (anc.b as usize).saturating_sub(1);
             let a_seg = &a[a_lo..a_hi];
             let b_seg = &b[b_lo..b_hi];
-            let seg_ops = self.inner.diff(a_seg, b_seg);
+            let seg_ops = self.inner.diff(a_seg, b_seg, opts);
             push_offset(&mut out, &seg_ops, prev_a, prev_b);
 
             // The anchor itself: emit as Equal pinning the two lines together.
@@ -100,7 +104,7 @@ impl<E: DiffEngine> DiffEngine for AnchoredDiff<E> {
         // Tail segment after the last anchor.
         let a_seg = &a[(prev_a as usize)..];
         let b_seg = &b[(prev_b as usize)..];
-        let seg_ops = self.inner.diff(a_seg, b_seg);
+        let seg_ops = self.inner.diff(a_seg, b_seg, opts);
         push_offset(&mut out, &seg_ops, prev_a, prev_b);
 
         out
@@ -113,11 +117,11 @@ fn push_offset(out: &mut Vec<DiffOp>, ops: &[DiffOp], a_off: LineNo, b_off: Line
             DiffOp::Equal { a, b, text } => out.push(DiffOp::Equal {
                 a: a + a_off, b: b + b_off, text: text.clone(),
             }),
-            DiffOp::Delete { a, text } => out.push(DiffOp::Delete {
-                a: a + a_off, text: text.clone(),
+            DiffOp::Delete { a, text, spans } => out.push(DiffOp::Delete {
+                a: a + a_off, text: text.clone(), spans: spans.clone(),
             }),
-            DiffOp::Insert { b, text } => out.push(DiffOp::Insert {
-                b: b + b_off, text: text.clone(),
+            DiffOp::Insert { b, text, spans } => out.push(DiffOp::Insert {
+                b: b + b_off, text: text.clone(), spans: spans.clone(),
             }),
         }
     }
@@ -126,37 +130,31 @@ fn push_offset(out: &mut Vec<DiffOp>, ops: &[DiffOp], a_off: LineNo, b_off: Line
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::diff::basic::BasicDiff;
+    use crate::diff::myers::MyersDiff;
     use crate::diff::split_lines;
+
+    fn opts() -> DiffOptions { DiffOptions::default() }
 
     #[test]
     fn no_anchors_matches_inner() {
         let a = split_lines("a\nb\nc\n");
         let b = split_lines("a\nx\nc\n");
-        let inner_ops = BasicDiff.diff(&a, &b);
-        let anchored = AnchoredDiff::new(BasicDiff, vec![]);
-        assert_eq!(anchored.diff(&a, &b), inner_ops);
+        let inner_ops = MyersDiff.diff(&a, &b, &opts());
+        let anchored = AnchoredDiff::new(MyersDiff, vec![]);
+        assert_eq!(anchored.diff(&a, &b, &opts()), inner_ops);
     }
 
     #[test]
     fn anchor_forces_alignment() {
-        // Without an anchor the basic Myers would happily match the two `x`
-        // lines across what we consider "different" sections. Anchoring
-        // (1,1) and (4,4) splits the file at those points so each segment
-        // is diffed independently.
         let a = split_lines("HEADER\nx\nA1\nFOOTER\n");
         let b = split_lines("HEADER\nB1\nx\nFOOTER\n");
-
-        // Anchors pin (HEADER,HEADER), (A1,B1), (FOOTER,FOOTER). The lone
-        // `x` lines now live in *different* segments so they cannot be
-        // matched across the anchor.
         let anchors = vec![
             Anchor { a: 1, b: 1 },
             Anchor { a: 3, b: 2 },
             Anchor { a: 4, b: 4 },
         ];
-        let anchored = AnchoredDiff::new(BasicDiff, anchors);
-        let ops = anchored.diff(&a, &b);
+        let anchored = AnchoredDiff::new(MyersDiff, anchors);
+        let ops = anchored.diff(&a, &b, &opts());
 
         let equals: Vec<_> = ops.iter().filter_map(|o| match o {
             DiffOp::Equal { text, .. } => Some(text.as_str()),
@@ -164,8 +162,7 @@ mod tests {
         }).collect();
         assert!(equals.contains(&"HEADER"));
         assert!(equals.contains(&"FOOTER"));
-        assert!(equals.contains(&"A1")); // anchor pins this
-        // No Equal for `x`: each is in its own segment paired with empty.
+        assert!(equals.contains(&"A1"));
         let n_x_equal = equals.iter().filter(|t| **t == "x").count();
         assert_eq!(n_x_equal, 0);
     }
@@ -174,14 +171,14 @@ mod tests {
     fn anchor_validation() {
         let a = split_lines("a\nb\n");
         let b = split_lines("c\nd\n");
-        let bad = AnchoredDiff::new(BasicDiff, vec![Anchor { a: 5, b: 1 }]);
-        assert!(matches!(bad.diff_checked(&a, &b), Err(AnchorError::OutOfRange { .. })));
+        let bad = AnchoredDiff::new(MyersDiff, vec![Anchor { a: 5, b: 1 }]);
+        assert!(matches!(bad.diff_checked(&a, &b, &opts()), Err(AnchorError::OutOfRange { .. })));
 
-        let bad2 = AnchoredDiff::new(BasicDiff, vec![
+        let bad2 = AnchoredDiff::new(MyersDiff, vec![
             Anchor { a: 2, b: 1 },
             Anchor { a: 1, b: 2 },
         ]);
-        assert_eq!(bad2.diff_checked(&a, &b), Err(AnchorError::NotStrictlyIncreasing));
+        assert_eq!(bad2.diff_checked(&a, &b, &opts()), Err(AnchorError::NotStrictlyIncreasing));
     }
 
     #[test]
@@ -189,10 +186,9 @@ mod tests {
         let a = split_lines("h\nx\np\nq\nf\n");
         let b = split_lines("h\ny\np\nq\nf\n");
         let anchors = vec![Anchor { a: 1, b: 1 }, Anchor { a: 5, b: 5 }];
-        let anchored = AnchoredDiff::new(BasicDiff, anchors);
-        let ops = anchored.diff(&a, &b);
+        let anchored = AnchoredDiff::new(MyersDiff, anchors);
+        let ops = anchored.diff(&a, &b, &opts());
 
-        // p (line 3 in both) must remain Equal with original line numbers.
         let p_eq = ops.iter().find(|o| matches!(o, DiffOp::Equal { text, .. } if text == "p"));
         match p_eq {
             Some(DiffOp::Equal { a: an, b: bn, .. }) => {

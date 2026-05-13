@@ -3,7 +3,7 @@ use std::sync::{Mutex, atomic::{AtomicU64, Ordering}};
 
 use serde::{Deserialize, Serialize};
 
-use crate::diff::{anchored::AnchoredDiff, basic::BasicDiff, group_into_hunks, split_lines, Anchor, DiffEngine, DiffOp, Hunk};
+use crate::diff::{anchored::AnchoredDiff, build_engine as build_diff_engine, group_into_hunks, myers::MyersDiff, split_lines, Anchor, DiffEngine, DiffOp, DiffOptions, Hunk};
 use crate::merge::{apply_resolutions, MergeAnchor, MergeHunk, Resolution, ThreeWayMerge};
 
 pub type SessionId = u64;
@@ -50,6 +50,7 @@ pub enum SessionMode {
 pub struct DiffSession {
     pub id: SessionId,
     pub engine: String,
+    pub options: DiffOptions,
     pub mode: SessionMode,
     /// User-edited result buffer (overrides computed result when set).
     pub manual_result: Option<String>,
@@ -74,14 +75,25 @@ pub enum SessionError {
 }
 
 fn build_engine(name: &str) -> Result<Box<dyn DiffEngine>, SessionError> {
-    match name {
-        "basic" => Ok(Box::new(BasicDiff)),
-        other => Err(SessionError::UnknownEngine(other.to_string())),
-    }
+    build_diff_engine(name).ok_or_else(|| SessionError::UnknownEngine(name.to_string()))
 }
 
 pub fn available_engines() -> Vec<String> {
-    vec!["basic".to_string()]
+    crate::diff::available_engines().into_iter().map(|(n, _)| n).collect()
+}
+
+pub fn engine_capabilities(name: &str) -> Option<crate::diff::EngineCapabilities> {
+    crate::diff::registry().get(name).map(|e| e.capabilities)
+}
+
+/// First registered engine name, used as the default when callers don't
+/// specify one.
+fn default_engine_name() -> String {
+    crate::diff::available_engines()
+        .into_iter()
+        .next()
+        .map(|(n, _)| n)
+        .unwrap_or_else(|| "myers".to_string())
 }
 
 /// Walk all hunks in order and emit the lines that should make up the
@@ -129,22 +141,28 @@ fn recompute_two_way(
     a_lines: &[String],
     b_lines: &[String],
     anchors: &[Anchor],
+    opts: &DiffOptions,
 ) -> Result<Vec<Hunk>, SessionError> {
     let inner = build_engine(engine_name)?;
     let a = refs(a_lines);
     let b = refs(b_lines);
     let ops: Vec<DiffOp> = if anchors.is_empty() {
-        inner.diff(&a, &b)
+        inner.diff(&a, &b, opts)
     } else {
-        // Wrap with anchored. We can't easily generic-wrap a Box<dyn>; use a
-        // small adapter struct.
+        // Adapter to wrap a Box<dyn DiffEngine> inside AnchoredDiff (which is
+        // generic over E: DiffEngine).
         struct DynEngine<'a>(&'a dyn DiffEngine);
         impl<'a> DiffEngine for DynEngine<'a> {
             fn name(&self) -> &'static str { "dyn" }
-            fn diff(&self, a: &[&str], b: &[&str]) -> Vec<DiffOp> { self.0.diff(a, b) }
+            fn capabilities(&self) -> crate::diff::EngineCapabilities {
+                self.0.capabilities()
+            }
+            fn diff(&self, a: &[&str], b: &[&str], opts: &DiffOptions) -> Vec<DiffOp> {
+                self.0.diff(a, b, opts)
+            }
         }
         let wrapper = AnchoredDiff::new(DynEngine(inner.as_ref()), anchors.to_vec());
-        wrapper.diff_checked(&a, &b)?
+        wrapper.diff_checked(&a, &b, opts)?
     };
     Ok(group_into_hunks(&split_trivial_equals(ops)))
 }
@@ -160,8 +178,8 @@ fn split_trivial_equals(ops: Vec<DiffOp>) -> Vec<DiffOp> {
     for op in ops {
         match op {
             DiffOp::Equal { a, b, text } if text.trim().is_empty() => {
-                out.push(DiffOp::Delete { a, text: text.clone() });
-                out.push(DiffOp::Insert { b, text });
+                out.push(DiffOp::delete(a, text.clone()));
+                out.push(DiffOp::insert(b, text));
             }
             other => out.push(other),
         }
@@ -175,11 +193,22 @@ fn recompute_three_way(
     local: &[String],
     remote: &[String],
     anchors: &[MergeAnchor],
+    opts: &DiffOptions,
 ) -> Result<Vec<MergeHunk>, SessionError> {
+    // Three-way merge is generic over a concrete engine type for performance,
+    // so we dispatch by name. Initial set: myers, patience, histogram.
     match engine_name {
-        "basic" => {
-            let m = ThreeWayMerge::new(BasicDiff);
-            Ok(m.merge(&refs(base), &refs(local), &refs(remote), anchors))
+        "myers" => {
+            let m = ThreeWayMerge::new(MyersDiff);
+            Ok(m.merge(&refs(base), &refs(local), &refs(remote), anchors, opts))
+        }
+        "patience" => {
+            let m = ThreeWayMerge::new(crate::diff::patience::PatienceDiff);
+            Ok(m.merge(&refs(base), &refs(local), &refs(remote), anchors, opts))
+        }
+        "histogram" => {
+            let m = ThreeWayMerge::new(crate::diff::histogram::HistogramDiff);
+            Ok(m.merge(&refs(base), &refs(local), &refs(remote), anchors, opts))
         }
         other => Err(SessionError::UnknownEngine(other.to_string())),
     }
@@ -196,13 +225,23 @@ impl SessionStore {
         b_text: &str,
         engine: Option<String>,
     ) -> Result<SessionId, SessionError> {
-        let engine = engine.unwrap_or_else(|| "basic".to_string());
+        self.open_two_way_with(a_text, b_text, engine, DiffOptions::default())
+    }
+
+    pub fn open_two_way_with(
+        &self,
+        a_text: &str,
+        b_text: &str,
+        engine: Option<String>,
+        options: DiffOptions,
+    ) -> Result<SessionId, SessionError> {
+        let engine = engine.unwrap_or_else(default_engine_name);
         let a_lines: Vec<String> = split_lines(a_text).into_iter().map(|s| s.to_string()).collect();
         let b_lines: Vec<String> = split_lines(b_text).into_iter().map(|s| s.to_string()).collect();
-        let hunks = recompute_two_way(&engine, &a_lines, &b_lines, &[])?;
+        let hunks = recompute_two_way(&engine, &a_lines, &b_lines, &[], &options)?;
         let id = self.alloc_id();
         let s = DiffSession {
-            id, engine,
+            id, engine, options,
             mode: SessionMode::TwoWay {
                 a_lines, b_lines, anchors: vec![], hunks, decisions: HashMap::new(),
             },
@@ -219,14 +258,25 @@ impl SessionStore {
         remote_text: &str,
         engine: Option<String>,
     ) -> Result<SessionId, SessionError> {
-        let engine = engine.unwrap_or_else(|| "basic".to_string());
+        self.open_three_way_with(base_text, local_text, remote_text, engine, DiffOptions::default())
+    }
+
+    pub fn open_three_way_with(
+        &self,
+        base_text: &str,
+        local_text: &str,
+        remote_text: &str,
+        engine: Option<String>,
+        options: DiffOptions,
+    ) -> Result<SessionId, SessionError> {
+        let engine = engine.unwrap_or_else(default_engine_name);
         let base_lines: Vec<String> = split_lines(base_text).into_iter().map(|s| s.to_string()).collect();
         let local_lines: Vec<String> = split_lines(local_text).into_iter().map(|s| s.to_string()).collect();
         let remote_lines: Vec<String> = split_lines(remote_text).into_iter().map(|s| s.to_string()).collect();
-        let hunks = recompute_three_way(&engine, &base_lines, &local_lines, &remote_lines, &[])?;
+        let hunks = recompute_three_way(&engine, &base_lines, &local_lines, &remote_lines, &[], &options)?;
         let id = self.alloc_id();
         let s = DiffSession {
-            id, engine,
+            id, engine, options,
             mode: SessionMode::ThreeWay {
                 base_lines, local_lines, remote_lines, anchors: vec![], hunks, resolutions: HashMap::new(),
             },
@@ -267,6 +317,7 @@ impl SessionStore {
     ) -> Result<(), SessionError> {
         self.with(id, |s| {
             let engine = s.engine.clone();
+            let options = s.options;
             match &mut s.mode {
                 SessionMode::TwoWay {
                     a_lines,
@@ -280,7 +331,7 @@ impl SessionStore {
                         TwoWaySide::A => *a_lines = rebuilt,
                         TwoWaySide::B => *b_lines = rebuilt,
                     }
-                    let new_hunks = recompute_two_way(&engine, a_lines, b_lines, anchors)?;
+                    let new_hunks = recompute_two_way(&engine, a_lines, b_lines, anchors, &options)?;
                     *hunks = new_hunks;
                     Ok(())
                 }
@@ -301,6 +352,7 @@ impl SessionStore {
     ) -> Result<(), SessionError> {
         self.with(id, |s| {
             let engine = s.engine.clone();
+            let options = s.options;
             match &mut s.mode {
                 SessionMode::TwoWay {
                     a_lines,
@@ -323,7 +375,7 @@ impl SessionStore {
                             b_lines.splice(start..end, replacement.into_iter());
                         }
                     }
-                    let new_hunks = recompute_two_way(&engine, a_lines, b_lines, anchors)?;
+                    let new_hunks = recompute_two_way(&engine, a_lines, b_lines, anchors, &options)?;
                     *hunks = new_hunks;
                     Ok(())
                 }
@@ -343,6 +395,7 @@ impl SessionStore {
     ) -> Result<(), SessionError> {
         self.with(id, |s| {
             let engine = s.engine.clone();
+            let options = s.options;
             match &mut s.mode {
                 SessionMode::TwoWay {
                     a_lines,
@@ -355,7 +408,7 @@ impl SessionStore {
                         TwoWaySide::A => *a_lines = new_lines,
                         TwoWaySide::B => *b_lines = new_lines,
                     }
-                    let new_hunks = recompute_two_way(&engine, a_lines, b_lines, anchors)?;
+                    let new_hunks = recompute_two_way(&engine, a_lines, b_lines, anchors, &options)?;
                     *hunks = new_hunks;
                     Ok(())
                 }
@@ -376,6 +429,7 @@ impl SessionStore {
     ) -> Result<(), SessionError> {
         self.with(id, |s| {
             let engine = s.engine.clone();
+            let options = s.options;
             match &mut s.mode {
                 SessionMode::TwoWay {
                     a_lines,
@@ -393,7 +447,7 @@ impl SessionStore {
                         return Err(SessionError::WrongMode);
                     }
                     target[idx] = text;
-                    let new_hunks = recompute_two_way(&engine, a_lines, b_lines, anchors)?;
+                    let new_hunks = recompute_two_way(&engine, a_lines, b_lines, anchors, &options)?;
                     *hunks = new_hunks;
                     Ok(())
                 }
@@ -405,12 +459,13 @@ impl SessionStore {
     pub fn add_anchor_two_way(&self, id: SessionId, anchor: Anchor) -> Result<(), SessionError> {
         self.with(id, |s| {
             let engine = s.engine.clone();
+            let options = s.options;
             match &mut s.mode {
                 SessionMode::TwoWay { a_lines, b_lines, anchors, hunks, .. } => {
                     let mut new_anchors = anchors.clone();
                     new_anchors.push(anchor);
                     new_anchors.sort_by_key(|a| (a.a, a.b));
-                    let new_hunks = recompute_two_way(&engine, a_lines, b_lines, &new_anchors)?;
+                    let new_hunks = recompute_two_way(&engine, a_lines, b_lines, &new_anchors, &options)?;
                     *anchors = new_anchors;
                     *hunks = new_hunks;
                     Ok(())
@@ -423,12 +478,13 @@ impl SessionStore {
     pub fn add_anchor_three_way(&self, id: SessionId, anchor: MergeAnchor) -> Result<(), SessionError> {
         self.with(id, |s| {
             let engine = s.engine.clone();
+            let options = s.options;
             match &mut s.mode {
                 SessionMode::ThreeWay { base_lines, local_lines, remote_lines, anchors, hunks, .. } => {
                     let mut new_anchors = anchors.clone();
                     new_anchors.push(anchor);
                     new_anchors.sort_by_key(|a| a.base);
-                    let new_hunks = recompute_three_way(&engine, base_lines, local_lines, remote_lines, &new_anchors)?;
+                    let new_hunks = recompute_three_way(&engine, base_lines, local_lines, remote_lines, &new_anchors, &options)?;
                     *anchors = new_anchors;
                     *hunks = new_hunks;
                     Ok(())
@@ -441,17 +497,18 @@ impl SessionStore {
     pub fn remove_anchor(&self, id: SessionId, idx: usize) -> Result<(), SessionError> {
         self.with(id, |s| {
             let engine = s.engine.clone();
+            let options = s.options;
             match &mut s.mode {
                 SessionMode::TwoWay { a_lines, b_lines, anchors, hunks, .. } => {
                     if idx >= anchors.len() { return Ok(()); }
                     anchors.remove(idx);
-                    *hunks = recompute_two_way(&engine, a_lines, b_lines, anchors)?;
+                    *hunks = recompute_two_way(&engine, a_lines, b_lines, anchors, &options)?;
                     Ok(())
                 }
                 SessionMode::ThreeWay { base_lines, local_lines, remote_lines, anchors, hunks, .. } => {
                     if idx >= anchors.len() { return Ok(()); }
                     anchors.remove(idx);
-                    *hunks = recompute_three_way(&engine, base_lines, local_lines, remote_lines, anchors)?;
+                    *hunks = recompute_three_way(&engine, base_lines, local_lines, remote_lines, anchors, &options)?;
                     Ok(())
                 }
             }
@@ -463,12 +520,29 @@ impl SessionStore {
         let _ = build_engine(&engine)?;
         self.with(id, |s| {
             s.engine = engine.clone();
+            let options = s.options;
             match &mut s.mode {
                 SessionMode::TwoWay { a_lines, b_lines, anchors, hunks, .. } => {
-                    *hunks = recompute_two_way(&engine, a_lines, b_lines, anchors)?;
+                    *hunks = recompute_two_way(&engine, a_lines, b_lines, anchors, &options)?;
                 }
                 SessionMode::ThreeWay { base_lines, local_lines, remote_lines, anchors, hunks, .. } => {
-                    *hunks = recompute_three_way(&engine, base_lines, local_lines, remote_lines, anchors)?;
+                    *hunks = recompute_three_way(&engine, base_lines, local_lines, remote_lines, anchors, &options)?;
+                }
+            }
+            Ok(())
+        })
+    }
+
+    pub fn set_options(&self, id: SessionId, options: DiffOptions) -> Result<(), SessionError> {
+        self.with(id, |s| {
+            s.options = options;
+            let engine = s.engine.clone();
+            match &mut s.mode {
+                SessionMode::TwoWay { a_lines, b_lines, anchors, hunks, .. } => {
+                    *hunks = recompute_two_way(&engine, a_lines, b_lines, anchors, &options)?;
+                }
+                SessionMode::ThreeWay { base_lines, local_lines, remote_lines, anchors, hunks, .. } => {
+                    *hunks = recompute_three_way(&engine, base_lines, local_lines, remote_lines, anchors, &options)?;
                 }
             }
             Ok(())

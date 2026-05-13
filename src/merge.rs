@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::diff::{anchored::AnchoredDiff, Anchor, DiffEngine, DiffOp, LineNo};
+use crate::diff::{anchored::AnchoredDiff, Anchor, DiffEngine, DiffOp, DiffOptions, LineNo};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MergeAnchor {
@@ -117,7 +117,7 @@ fn bucket_by_base(ops: &[DiffOp], base_len: usize) -> Vec<SideOp> {
                 filled[idx] = true;
                 last_base_index = Some(idx);
             }
-            DiffOp::Delete { a, text } => {
+            DiffOp::Delete { a, text, .. } => {
                 let idx = (*a as usize) - 1;
                 if !pending_inserts.is_empty() {
                     // Inserts immediately followed by a delete: classic replace.
@@ -176,6 +176,7 @@ impl<E: DiffEngine + Clone> ThreeWayMerge<E> {
         local: &[&str],
         remote: &[&str],
         anchors: &[MergeAnchor],
+        opts: &DiffOptions,
     ) -> Vec<MergeHunk> {
         let local_anchors: Vec<Anchor> = anchors.iter().map(|a| Anchor { a: a.base, b: a.local }).collect();
         let remote_anchors: Vec<Anchor> = anchors.iter().map(|a| Anchor { a: a.base, b: a.remote }).collect();
@@ -183,8 +184,8 @@ impl<E: DiffEngine + Clone> ThreeWayMerge<E> {
         let local_engine = AnchoredDiff::new(self.engine.clone(), local_anchors);
         let remote_engine = AnchoredDiff::new(self.engine.clone(), remote_anchors);
 
-        let local_ops = local_engine.diff(base, local);
-        let remote_ops = remote_engine.diff(base, remote);
+        let local_ops = local_engine.diff(base, local, opts);
+        let remote_ops = remote_engine.diff(base, remote, opts);
 
         let local_buckets = bucket_by_base(&local_ops, base.len());
         let remote_buckets = bucket_by_base(&remote_ops, base.len());
@@ -326,21 +327,18 @@ pub fn apply_resolutions(
     out.join("\n")
 }
 
-// `BasicDiff` needs to be Clone to be used inside ThreeWayMerge; supply impl.
-impl Clone for crate::diff::basic::BasicDiff {
-    fn clone(&self) -> Self { crate::diff::basic::BasicDiff }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::diff::{basic::BasicDiff, split_lines};
+    use crate::diff::{myers::MyersDiff, split_lines};
+
+    fn opts() -> DiffOptions { DiffOptions::default() }
 
     #[test]
     fn stable_when_no_changes() {
         let base = split_lines("a\nb\nc\n");
-        let m = ThreeWayMerge::new(BasicDiff);
-        let hunks = m.merge(&base, &base, &base, &[]);
+        let m = ThreeWayMerge::new(MyersDiff);
+        let hunks = m.merge(&base, &base, &base, &[], &opts());
         assert!(hunks.iter().all(|h| matches!(h, MergeHunk::Stable { .. })));
     }
 
@@ -349,16 +347,14 @@ mod tests {
         let base = split_lines("a\nb\nc\n");
         let local = split_lines("a\nB\nc\n");
         let remote = split_lines("a\nb\nc\n");
-        let m = ThreeWayMerge::new(BasicDiff);
-        let hunks = m.merge(&base, &local, &remote, &[]);
+        let m = ThreeWayMerge::new(MyersDiff);
+        let hunks = m.merge(&base, &local, &remote, &[], &opts());
         assert!(hunks.iter().any(|h| matches!(h, MergeHunk::LocalOnly { .. })));
 
         let mut res = std::collections::HashMap::new();
-        // No resolution → defaults pick local.
         let merged = apply_resolutions(&hunks, &res);
         assert_eq!(merged, "a\nB\nc");
 
-        // Override with Base.
         let local_id = hunks.iter().find_map(|h| match h {
             MergeHunk::LocalOnly { id, .. } => Some(*id),
             _ => None,
@@ -373,8 +369,8 @@ mod tests {
         let base = split_lines("a\nb\nc\n");
         let local = split_lines("a\nL\nc\n");
         let remote = split_lines("a\nR\nc\n");
-        let m = ThreeWayMerge::new(BasicDiff);
-        let hunks = m.merge(&base, &local, &remote, &[]);
+        let m = ThreeWayMerge::new(MyersDiff);
+        let hunks = m.merge(&base, &local, &remote, &[], &opts());
         let conflict_id = hunks.iter().find_map(|h| match h {
             MergeHunk::Conflict { id, .. } => Some(*id),
             _ => None,
@@ -395,8 +391,8 @@ mod tests {
     fn same_change_on_both_sides_is_stable() {
         let base = split_lines("a\nb\nc\n");
         let same = split_lines("a\nB\nc\n");
-        let m = ThreeWayMerge::new(BasicDiff);
-        let hunks = m.merge(&base, &same, &same, &[]);
+        let m = ThreeWayMerge::new(MyersDiff);
+        let hunks = m.merge(&base, &same, &same, &[], &opts());
         // Either Stable for the whole thing, or no Conflict hunks.
         assert!(hunks.iter().all(|h| !matches!(h, MergeHunk::Conflict { .. })));
         let merged = apply_resolutions(&hunks, &std::collections::HashMap::new());

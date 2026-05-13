@@ -1,16 +1,65 @@
-pub mod basic;
 pub mod anchored;
+pub mod histogram;
+pub mod myers;
+pub mod normalize;
+pub mod patience;
+pub mod similar_runner;
+pub mod sub_line;
+
+#[cfg(test)]
+mod corpus_tests;
+
+use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 
 pub type LineNo = u32;
 
+/// A sub-line span produced by the sub-line refinement post-pass.
+/// Byte offsets are into the op's `text` string.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SubSpan {
+    pub start: u32,
+    pub end: u32,
+    pub kind: SubSpanKind,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SubSpanKind {
+    Same,
+    Changed,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum DiffOp {
-    Equal { a: LineNo, b: LineNo, text: String },
-    Delete { a: LineNo, text: String },
-    Insert { b: LineNo, text: String },
+    Equal {
+        a: LineNo,
+        b: LineNo,
+        text: String,
+    },
+    Delete {
+        a: LineNo,
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        spans: Option<Vec<SubSpan>>,
+    },
+    Insert {
+        b: LineNo,
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        spans: Option<Vec<SubSpan>>,
+    },
+}
+
+impl DiffOp {
+    pub fn delete(a: LineNo, text: String) -> Self {
+        DiffOp::Delete { a, text, spans: None }
+    }
+    pub fn insert(b: LineNo, text: String) -> Self {
+        DiffOp::Insert { b, text, spans: None }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -27,9 +76,125 @@ pub struct Anchor {
     pub b: LineNo,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Whitespace {
+    None,
+    IgnoreAll,
+    IgnoreLeading,
+    IgnoreTrailingEol,
+}
+
+impl Default for Whitespace {
+    fn default() -> Self { Whitespace::None }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SubLineGranularity {
+    None,
+    Word,
+    Char,
+    Grapheme,
+}
+
+impl Default for SubLineGranularity {
+    fn default() -> Self { SubLineGranularity::None }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DiffOptions {
+    pub whitespace: Whitespace,
+    pub sub_line: SubLineGranularity,
+    pub detect_moves: bool,
+    pub move_min_lines: u32,
+}
+
+impl Default for DiffOptions {
+    fn default() -> Self {
+        Self {
+            whitespace: Whitespace::None,
+            sub_line: SubLineGranularity::None,
+            detect_moves: false,
+            move_min_lines: 3,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct EngineCapabilities {
+    pub supports_moves: bool,
+}
+
 pub trait DiffEngine: Send + Sync {
     fn name(&self) -> &'static str;
-    fn diff(&self, a: &[&str], b: &[&str]) -> Vec<DiffOp>;
+    fn capabilities(&self) -> EngineCapabilities {
+        EngineCapabilities::default()
+    }
+    fn diff(&self, a: &[&str], b: &[&str], opts: &DiffOptions) -> Vec<DiffOp>;
+}
+
+/// Engine factory: produces a fresh boxed engine for a given name.
+pub type EngineFactory = fn() -> Box<dyn DiffEngine>;
+
+pub struct EngineRegistry {
+    entries: Vec<EngineEntry>,
+}
+
+pub struct EngineEntry {
+    pub name: &'static str,
+    pub capabilities: EngineCapabilities,
+    pub factory: EngineFactory,
+}
+
+impl EngineRegistry {
+    fn new() -> Self {
+        Self {
+            entries: vec![
+                EngineEntry {
+                    name: "myers",
+                    capabilities: EngineCapabilities::default(),
+                    factory: || Box::new(myers::MyersDiff),
+                },
+                EngineEntry {
+                    name: "patience",
+                    capabilities: EngineCapabilities::default(),
+                    factory: || Box::new(patience::PatienceDiff),
+                },
+                EngineEntry {
+                    name: "histogram",
+                    capabilities: EngineCapabilities::default(),
+                    factory: || Box::new(histogram::HistogramDiff),
+                },
+            ],
+        }
+    }
+
+    pub fn entries(&self) -> &[EngineEntry] { &self.entries }
+
+    pub fn get(&self, name: &str) -> Option<&EngineEntry> {
+        self.entries.iter().find(|e| e.name == name)
+    }
+}
+
+pub fn registry() -> &'static EngineRegistry {
+    static REG: OnceLock<EngineRegistry> = OnceLock::new();
+    REG.get_or_init(EngineRegistry::new)
+}
+
+/// List all registered engine names paired with their capabilities.
+pub fn available_engines() -> Vec<(String, EngineCapabilities)> {
+    registry()
+        .entries()
+        .iter()
+        .map(|e| (e.name.to_string(), e.capabilities))
+        .collect()
+}
+
+/// Build a fresh engine instance by name. Returns `None` if the name is
+/// not registered.
+pub fn build_engine(name: &str) -> Option<Box<dyn DiffEngine>> {
+    registry().get(name).map(|e| (e.factory)())
 }
 
 /// Group a flat list of ops into hunks. Equal runs become their own hunks
