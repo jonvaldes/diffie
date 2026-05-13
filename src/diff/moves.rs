@@ -363,6 +363,85 @@ mod tests {
     }
 
     #[test]
+    fn end_to_end_via_histogram_engine() {
+        use crate::diff::{build_engine, DiffOp};
+
+        // Histogram aligns the blk block as Equal (it finds the best anchors),
+        // so ftr1/ftr2 appear as a Delete/Insert pair representing the move.
+        // Use move_min_lines: 2 so the two-line footer run qualifies.
+        let a: Vec<&str> = vec![
+            "hdr1", "hdr2",
+            "blk1", "blk2", "blk3", "blk4", "blk5",
+            "ftr1", "ftr2",
+        ];
+        let b: Vec<&str> = vec![
+            "hdr1", "hdr2",
+            "ftr1", "ftr2",
+            "blk1", "blk2", "blk3", "blk4", "blk5",
+        ];
+
+        let engine = build_engine("histogram").expect("histogram registered");
+        let opts = DiffOptions {
+            detect_moves: true,
+            move_min_lines: 2,
+            ..DiffOptions::default()
+        };
+        let ops = engine.diff(&a, &b, &opts);
+
+        // The histogram engine itself does NOT call detect_moves; this test
+        // exercises the engine output directly and then runs the post-pass
+        // manually, matching what session.rs does.
+        let mut ops = ops;
+        crate::diff::moves::detect_moves(&mut ops, &opts);
+
+        let del_id = ops.iter().find_map(|op| match op {
+            DiffOp::Delete { move_id: Some(id), text, .. } if text.starts_with("ftr") => Some(*id),
+            _ => None,
+        });
+        let ins_id = ops.iter().find_map(|op| match op {
+            DiffOp::Insert { move_id: Some(id), text, .. } if text.starts_with("ftr") => Some(*id),
+            _ => None,
+        });
+        assert!(del_id.is_some(), "expected a tagged delete: {ops:?}");
+        assert_eq!(del_id, ins_id, "delete and insert should share move_id");
+    }
+
+    #[test]
+    fn session_pipeline_tags_moves_when_engine_supports_them() {
+        use crate::diff::DiffOp;
+        use crate::session::{SessionMode, SessionStore};
+
+        let a_text = "hdr1\nhdr2\nblk1\nblk2\nblk3\nblk4\nblk5\nftr1\nftr2\n";
+        let b_text = "hdr1\nhdr2\nftr1\nftr2\nblk1\nblk2\nblk3\nblk4\nblk5\n";
+
+        let store = SessionStore::new();
+        let opts = DiffOptions {
+            detect_moves: true,
+            move_min_lines: 2,
+            ..DiffOptions::default()
+        };
+        let id = store
+            .open_two_way_with(a_text, b_text, Some("histogram".into()), opts)
+            .expect("create session");
+        let session = store.snapshot(id).expect("snapshot");
+        let hunks = match &session.mode {
+            SessionMode::TwoWay { hunks, .. } => hunks.clone(),
+            _ => panic!("expected TwoWay session"),
+        };
+        let mut saw_move = false;
+        for h in &hunks {
+            for op in &h.ops {
+                if let DiffOp::Delete { move_id: Some(_), .. }
+                | DiffOp::Insert { move_id: Some(_), .. } = op
+                {
+                    saw_move = true;
+                }
+            }
+        }
+        assert!(saw_move, "session pipeline should produce at least one move_id tag");
+    }
+
+    #[test]
     fn multiple_independent_moves_get_distinct_ids() {
         let mut ops = vec![
             DiffOp::delete(1, "a1".into()),

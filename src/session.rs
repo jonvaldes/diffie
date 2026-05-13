@@ -144,6 +144,7 @@ fn recompute_two_way(
     opts: &DiffOptions,
 ) -> Result<Vec<Hunk>, SessionError> {
     let inner = build_engine(engine_name)?;
+    let caps = inner.capabilities();
     let a = refs(a_lines);
     let b = refs(b_lines);
     let ops: Vec<DiffOp> = if anchors.is_empty() {
@@ -166,6 +167,9 @@ fn recompute_two_way(
     };
     let mut ops = split_trivial_equals(ops);
     crate::diff::sub_line::populate_pair_spans(&mut ops, opts.sub_line);
+    if opts.detect_moves && caps.supports_moves {
+        crate::diff::moves::detect_moves(&mut ops, opts);
+    }
     Ok(group_into_hunks(&ops))
 }
 
