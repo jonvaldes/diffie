@@ -2201,6 +2201,13 @@ fn draw_row(
         // own advance width). For monospace fonts the result equals
         // `char_col * char_w` exactly; for proportional it's the only
         // way to keep the caret aligned with the rendered glyphs.
+        // `caret_pos` is a BYTE position (from imgui's stb_textedit).
+        // Use `calc_text_size` to convert it to a pixel offset rather
+        // than `char_col * char_w`: that handles UTF-8 correctly and
+        // also works for proportional fonts (where each glyph has its
+        // own advance width). For monospace fonts the result equals
+        // `char_col * char_w` exactly; for proportional it's the only
+        // way to keep the caret aligned with the rendered glyphs.
         let byte_pos = caret_pos.get().max(0) as usize;
         let take = byte_pos.min(buf.len());
         let mut idx = take;
@@ -2846,6 +2853,124 @@ mod headless_tests {
         ))
         .ok()?;
         Some((device, queue))
+    }
+
+    /// Render one frame to an offscreen texture and read the pixels
+    /// back into a CPU buffer. Returns tightly-packed RGBA bytes
+    /// (`width * height * 4`). `width` must be a multiple of 64 so
+    /// `bytes_per_row` (= `width * 4`) is already a multiple of 256
+    /// (wgpu's `copy_texture_to_buffer` alignment requirement).
+    fn capture_frame_pixels(
+        ctx: &mut imgui::Context,
+        renderer: &mut imgui_wgpu::Renderer,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        target_format: wgpu::TextureFormat,
+        store: &SessionStore,
+        id: crate::session::SessionId,
+        view_state: &mut DiffViewState,
+        mono_font: Option<imgui::FontId>,
+        width: u32,
+        height: u32,
+    ) -> Vec<u8> {
+        assert!(width % 64 == 0, "width {width} must be a multiple of 64");
+        ctx.io_mut().delta_time = 1.0 / 60.0;
+
+        let snap = store.snapshot(id).unwrap();
+        let hunks = match &snap.mode {
+            SessionMode::TwoWay { hunks, .. } => hunks.clone(),
+            _ => unreachable!(),
+        };
+        let ui = ctx.new_frame();
+        let mut status = String::new();
+        let mut focus_request: Option<crate::app::FocusedPane> = None;
+        let mut pending_edits: Vec<DiffEdit> = Vec::new();
+        ui.window("test")
+            .size([width as f32, height as f32], imgui::Condition::Always)
+            .position([0.0, 0.0], imgui::Condition::Always)
+            .build(|| {
+                render(
+                    ui, store, id, &hunks, &[], &mut status, view_state,
+                    mono_font, &mut focus_request, &mut pending_edits, &[], &[],
+                );
+            });
+        let draw_data = ctx.render();
+
+        let target = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("capture-target"),
+            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: target_format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = target.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let bytes_per_row = width * 4;
+        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("capture-buffer"),
+            size: (bytes_per_row * height) as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("capture-encoder"),
+        });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("capture-pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                multiview_mask: None,
+                occlusion_query_set: None,
+            });
+            renderer
+                .render(draw_data, queue, device, &mut pass)
+                .expect("imgui render");
+        }
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &target,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(bytes_per_row),
+                    rows_per_image: None,
+                },
+            },
+            wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+        );
+        queue.submit(Some(encoder.finish()));
+
+        let slice = buffer.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+        device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+        rx.recv().unwrap().expect("buffer map");
+        let data = slice.get_mapped_range();
+        let pixels: Vec<u8> = data.to_vec();
+        drop(data);
+        buffer.unmap();
+        pixels
     }
 
     /// One frame with the full imgui → wgpu pipeline: build the Ui,
@@ -3497,6 +3622,193 @@ mod headless_tests {
             .expect("Right arrow inside active row should queue a scroll-x pin");
         assert_eq!(pin.0, Side::Left);
         assert_eq!(pin.2, 4);
+    }
+
+    /// Pixel-readback regression for caret alignment with rendered
+    /// glyphs. Renders the same row twice, once with the caret at
+    /// column 0 and once at column 1, captures pixels in both, and
+    /// diffs them. The diff isolates caret pixels: two vertical
+    /// stripes, one at the col-0 position and one at the col-1
+    /// position. Their horizontal distance is the rendered advance
+    /// of the first character.
+    ///
+    /// Using a proportional font (Roboto) with "Mi" — `M` is much
+    /// wider than `m` and definitely much wider than `i` — guarantees
+    /// the advance is distinctly different from `calc_text_size("m")[0]`
+    /// (the old buggy `char_w` denominator). Asserts the measured
+    /// caret advance matches `calc_text_size("M")[0]` and NOT
+    /// `calc_text_size("m")[0]`.
+    #[test]
+    fn headless_wgpu_pixel_caret_advance_matches_calc_text_size() {
+        let _guard = imgui_lock();
+        let Some((device, queue)) = try_init_wgpu() else {
+            eprintln!("skipping: no wgpu adapter available");
+            return;
+        };
+
+        // 'W' is much wider than 'i' or 'm' in Roboto; this makes the
+        // proportional advance distinct from the `char_w = m_advance`
+        // value the old (buggy) formula would have used.
+        let text = "Wi\n";
+        let store = SessionStore::new();
+        let id = store.open_two_way(text, text, None).unwrap();
+
+        let mut ctx = imgui::Context::create();
+        // Sized so width is a multiple of 64 (capture helper requires
+        // it) and the diff view fits.
+        let w: u32 = 1024;
+        let h: u32 = 256;
+        ctx.io_mut().display_size = [w as f32, h as f32];
+        ctx.io_mut().delta_time = 1.0 / 60.0;
+        ctx.io_mut().config_flags |= imgui::ConfigFlags::NAV_ENABLE_KEYBOARD;
+        let font = load_proportional_font(&mut ctx, 16.0);
+        // Non-sRGB format so the readback bytes are linear and easy to
+        // compare against expected colors.
+        let target_format = wgpu::TextureFormat::Rgba8Unorm;
+        let mut renderer = imgui_wgpu::Renderer::new(
+            &mut ctx,
+            &device,
+            &queue,
+            imgui_wgpu::RendererConfig {
+                texture_format: target_format,
+                ..Default::default()
+            },
+        );
+
+        // Measure the expected glyph advances using imgui itself.
+        let expected_w_advance: Cell<f32> = Cell::new(0.0);
+        let m_advance: Cell<f32> = Cell::new(0.0);
+        {
+            let ui = ctx.new_frame();
+            ui.window("measure")
+                .size([200.0, 100.0], imgui::Condition::Always)
+                .build(|| {
+                    let _tok = ui.push_font(font);
+                    expected_w_advance.set(ui.calc_text_size("W")[0]);
+                    m_advance.set(ui.calc_text_size("m")[0]);
+                });
+            let _ = ctx.render();
+        }
+        let expected_advance = expected_w_advance.get();
+        let m_w = m_advance.get();
+        // Sanity: 'W' must be noticeably wider than 'm' for this test
+        // to distinguish the correct formula from the old buggy one.
+        assert!(
+            expected_advance > m_w + 0.5,
+            "Roboto's 'W' advance ({expected_advance}) should be \
+             noticeably wider than 'm' ({m_w}) for this test to mean anything",
+        );
+
+        // Scenario A: caret at column 0 (start of "Wi").
+        let mut state_a = DiffViewState::default();
+        focus_row_and_settle(
+            &mut ctx, &mut renderer, &device, &queue, target_format,
+            &store, id, &mut state_a, font, Side::Left, 1, 0,
+        );
+        let pixels_a = capture_frame_pixels(
+            &mut ctx, &mut renderer, &device, &queue, target_format,
+            &store, id, &mut state_a, Some(font), w, h,
+        );
+
+        // Scenario B: caret at column 1 (after 'W', before 'i').
+        // The widget is still active; press Right once to advance the
+        // cursor one character.
+        run_frame_with_wgpu(
+            &mut ctx, &mut renderer, &device, &queue, target_format,
+            &store, id, &mut state_a, Some(font),
+            FrameInput {
+                arrow: Some(imgui::Key::RightArrow),
+                ..Default::default()
+            },
+        );
+        // Let the keypress settle.
+        for _ in 0..2 {
+            run_frame_with_wgpu(
+                &mut ctx, &mut renderer, &device, &queue, target_format,
+                &store, id, &mut state_a, Some(font), FrameInput::default(),
+            );
+        }
+        let pixels_b = capture_frame_pixels(
+            &mut ctx, &mut renderer, &device, &queue, target_format,
+            &store, id, &mut state_a, Some(font), w, h,
+        );
+
+        // Diff the two pixel buffers and collect columns where any
+        // pixel differs significantly. The only thing that changed
+        // between A and B is the caret's position (and possibly a
+        // tiny side effect from scroll-pin counters, which manifest
+        // as scroll changes — the test's text is short enough that
+        // no scrolling happens).
+        let mut diff_x: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+        for y in 0..h {
+            for x in 0..w {
+                let i = ((y * w + x) * 4) as usize;
+                let a = &pixels_a[i..i + 4];
+                let b = &pixels_b[i..i + 4];
+                let max_d = a
+                    .iter()
+                    .zip(b.iter())
+                    .map(|(av, bv)| (*av as i32 - *bv as i32).abs())
+                    .max()
+                    .unwrap_or(0);
+                if max_d > 50 {
+                    diff_x.insert(x);
+                }
+            }
+        }
+        assert!(
+            !diff_x.is_empty(),
+            "no pixel differences found — caret may not be rendering",
+        );
+
+        // The caret is a 1-px vertical line; with blink+anti-aliasing
+        // the diff columns cluster into two narrow bands (one at the
+        // col-0 caret x, one at the col-1 caret x). Cluster by
+        // splitting where consecutive columns differ by more than a
+        // few pixels.
+        let mut bands: Vec<(u32, u32)> = Vec::new(); // (lo, hi)
+        let mut cur: Option<(u32, u32)> = None;
+        for x in &diff_x {
+            match cur {
+                None => cur = Some((*x, *x)),
+                Some((lo, hi)) => {
+                    if *x <= hi + 3 {
+                        cur = Some((lo, *x));
+                    } else {
+                        bands.push((lo, hi));
+                        cur = Some((*x, *x));
+                    }
+                }
+            }
+        }
+        if let Some(b) = cur {
+            bands.push(b);
+        }
+        assert_eq!(
+            bands.len(),
+            2,
+            "expected exactly 2 caret-position bands in the diff; got {} ({:?})",
+            bands.len(),
+            bands,
+        );
+        let band_center = |b: (u32, u32)| (b.0 + b.1) as f32 * 0.5;
+        let measured_advance = band_center(bands[1]) - band_center(bands[0]);
+
+        // The measured caret advance should match calc_text_size("W")
+        // (the actual rendered glyph advance), not char_w = calc_text_size("m").
+        let diff_correct = (measured_advance - expected_advance).abs();
+        let diff_buggy = (measured_advance - m_w).abs();
+        assert!(
+            diff_correct < diff_buggy,
+            "measured caret advance {measured_advance} is closer to the \
+             buggy `char_w` value {m_w} than to the correct \
+             `calc_text_size(\"W\")` value {expected_advance}",
+        );
+        assert!(
+            (measured_advance - expected_advance).abs() < 2.0,
+            "measured caret advance {measured_advance} differs from \
+             calc_text_size(\"W\") {expected_advance} by more than 2 px",
+        );
     }
 
     /// With a proportional font, `col * char_w` (where `char_w` is the
