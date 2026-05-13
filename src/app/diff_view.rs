@@ -97,6 +97,11 @@ pub struct DiffViewState {
     /// end_byte)`. Written by `draw_row`'s callback; read by tests to
     /// verify behaviors like double-click word-select.
     pub last_active_input_selection: Option<(Side, u32, usize, usize)>,
+    /// Last frame's caret x offset from `text_start_x` (the pane's text
+    /// column), in pixels. Equals `char_col * char_w` where `char_col`
+    /// is the character index (not byte index) of the caret. Tests use
+    /// this to verify the caret aligns with the rendered characters.
+    pub last_active_caret_offset: Option<(Side, f32)>,
 }
 
 /// One end of a selection. `line_no` is the source-line index on `side` of
@@ -607,6 +612,10 @@ pub fn render(
     // visible — same machinery, different target — so the pin doesn't
     // block the cursor-follow scroll users expect.
     let pin_scroll_x_request: Cell<Option<(Side, f32)>> = Cell::new(None);
+    // Filled by `draw_row` for the active row: `(side, caret_offset)`
+    // where caret_offset is the caret's x offset from the text-start
+    // column, in pixels. Read by tests to verify caret–text alignment.
+    let caret_offset_cell: Cell<Option<(Side, f32)>> = Cell::new(None);
 
     // Read the splice-induced scroll-x pin (if any) and decrement its
     // frame counter. We re-push it via `igSetNextWindowScroll` for the
@@ -736,6 +745,7 @@ pub fn render(
                     &shift_arrow_extend,
                     &clear_state_selection,
                     &pin_scroll_x_request,
+                    &caret_offset_cell,
                 );
             });
 
@@ -813,6 +823,7 @@ pub fn render(
                     &shift_arrow_extend,
                     &clear_state_selection,
                     &pin_scroll_x_request,
+                    &caret_offset_cell,
                 );
             });
 
@@ -877,6 +888,7 @@ pub fn render(
                     &shift_arrow_extend,
                     &clear_state_selection,
                     &pin_scroll_x_request,
+                    &caret_offset_cell,
                 );
             });
 
@@ -950,6 +962,7 @@ pub fn render(
                     &shift_arrow_extend,
                     &clear_state_selection,
                     &pin_scroll_x_request,
+                    &caret_offset_cell,
                 );
             });
 
@@ -1097,6 +1110,7 @@ pub fn render(
     state.last_left_scroll_x = left_scroll_x.get();
     state.last_right_scroll_x = right_scroll_x.get();
     state.last_active_input_selection = active_selection.get();
+    state.last_active_caret_offset = caret_offset_cell.get();
 
     draw_connector(
         ui,
@@ -1499,6 +1513,7 @@ fn draw_pane(
     shift_arrow_out: &Cell<Option<(Side, u32, usize, u32)>>,
     clear_state_selection_out: &Cell<bool>,
     pin_scroll_x_request_out: &Cell<Option<(Side, f32)>>,
+    caret_offset_out: &Cell<Option<(Side, f32)>>,
 ) {
     let total = rows.len() as i32;
     if total == 0 {
@@ -1546,6 +1561,7 @@ fn draw_pane(
                 shift_arrow_out,
                 clear_state_selection_out,
                 pin_scroll_x_request_out,
+                caret_offset_out,
             ) {
                 click_out.set(Some(clicked_line));
             }
@@ -1742,6 +1758,7 @@ fn draw_row(
     shift_arrow_out: &Cell<Option<(Side, u32, usize, u32)>>,
     clear_state_selection_out: &Cell<bool>,
     pin_scroll_x_request_out: &Cell<Option<(Side, f32)>>,
+    caret_offset_out: &Cell<Option<(Side, f32)>>,
 ) -> Option<u32> {
     let p0 = ui.cursor_screen_pos();
     let row_w = ui.content_region_avail()[0];
@@ -2143,19 +2160,36 @@ fn draw_row(
     // spans. We replay the caret here at the position the callback reported,
     // blinking on a ~1s cycle to roughly match imgui's default.
     if input_active && caret_pos.get() >= 0 {
+        // `caret_pos` is a BYTE position (from imgui's stb_textedit).
+        // `paint_row_text` positions text using CHAR indices, so the
+        // caret must convert byte → char to align with the rendered
+        // text. For ASCII the two are identical; for any UTF-8
+        // codepoint > 1 byte they diverge.
+        let byte_pos = caret_pos.get().max(0) as usize;
+        let take = byte_pos.min(buf.len());
+        let char_col = buf
+            .get(..take)
+            .map(|s| s.chars().count())
+            .unwrap_or_else(|| buf.chars().count());
+        let caret_offset = char_col as f32 * char_w;
         // Phase the blink off the most recent activation so the caret is on
         // for the first half-cycle after a line jump or click.
         let since = (ui.time() - caret_blink_reset.get()).max(0.0);
         let blink_on = (since % 1.06) < 0.53;
         if blink_on {
-            let col = caret_pos.get() as f32;
-            let cx = text_start_x + col * char_w;
+            let cx = text_start_x + caret_offset;
             let cy0 = p0[1] + 2.0;
             let cy1 = p0[1] + row_h() - 2.0;
             dl.add_line([cx, cy0], [cx, cy1], theme::TEXT)
                 .thickness(1.0)
                 .build();
         }
+        // Expose the caret's x offset within the text area so tests can
+        // verify it tracks the rendered characters. The offset is the
+        // caret's distance from `text_start_x`; for ASCII text this
+        // equals `byte_pos * char_w`, but for UTF-8 it equals
+        // `char_col * char_w` (the correct value).
+        caret_offset_out.set(Some((side, caret_offset)));
     }
 
     // Live commit: any change pushes a `SetTwoWayLine` onto the undo stack,
@@ -3391,6 +3425,88 @@ mod headless_tests {
             .expect("Right arrow inside active row should queue a scroll-x pin");
         assert_eq!(pin.0, Side::Left);
         assert_eq!(pin.2, 4);
+    }
+
+    /// The manually-drawn caret must align with the rendered text at
+    /// any cursor position. ImGui's `cursor_pos` is a BYTE offset, but
+    /// `paint_row_text` positions glyphs by CHAR index. For ASCII the
+    /// two are identical; for any UTF-8 codepoint > 1 byte they
+    /// diverge, and the caret ends up off by one char_w per multibyte
+    /// codepoint preceding it.
+    ///
+    /// Test: render a row containing `café` (where 'é' is 2 bytes),
+    /// park the caret at the end of the word, and assert the caret's
+    /// offset matches the rendered text's width (4 chars * char_w),
+    /// NOT the byte count (5 * char_w).
+    #[test]
+    fn headless_wgpu_caret_aligns_with_text_in_utf8_line() {
+        let _guard = imgui_lock();
+        let Some((device, queue)) = try_init_wgpu() else {
+            eprintln!("skipping: no wgpu adapter available");
+            return;
+        };
+
+        // 'é' is 2 bytes in UTF-8. So "café word" is 9 chars but 10
+        // bytes. Caret at char column 4 (end of "café") corresponds
+        // to byte position 5.
+        let text = "café word\n";
+        let store = SessionStore::new();
+        let id = store.open_two_way(text, text, None).unwrap();
+
+        let mut ctx = imgui::Context::create();
+        ctx.io_mut().display_size = [1200.0, 800.0];
+        ctx.io_mut().delta_time = 1.0 / 60.0;
+        ctx.io_mut().config_flags |= imgui::ConfigFlags::NAV_ENABLE_KEYBOARD;
+        let mono = load_mono_font(&mut ctx, 13.0);
+        let target_format = wgpu::TextureFormat::Rgba8UnormSrgb;
+        let mut renderer = imgui_wgpu::Renderer::new(
+            &mut ctx,
+            &device,
+            &queue,
+            imgui_wgpu::RendererConfig {
+                texture_format: target_format,
+                ..Default::default()
+            },
+        );
+
+        let mut view_state = DiffViewState::default();
+        // Park caret at char column 4 (end of "café"). The
+        // arrow_focus mechanism's `seed_byte` correctly converts this
+        // to byte position 5.
+        focus_row_and_settle(
+            &mut ctx, &mut renderer, &device, &queue, target_format,
+            &store, id, &mut view_state, mono, Side::Left, 1, 4,
+        );
+
+        let (side, caret_offset) = view_state
+            .last_active_caret_offset
+            .expect("caret offset should be exposed after activation");
+        assert_eq!(side, Side::Left);
+
+        // Expected: 4 chars * char_w. Compute char_w from the same
+        // mono font the production code uses.
+        let _font_tok = ctx.io_mut(); // no-op; we just need ctx in scope
+        // We can't easily call ui.calc_text_size outside a frame, so
+        // approximate: char_w ≈ 6 in headless RobotoMono @ size 13
+        // (verified by prior tests). 4 chars → 24. The bug would put
+        // the caret at 5 chars → 30 (one char further right).
+        let expected_4_chars = 4.0 * 6.0;
+        let bug_value_5_chars = 5.0 * 6.0;
+        let dist_to_correct = (caret_offset - expected_4_chars).abs();
+        let dist_to_bug = (caret_offset - bug_value_5_chars).abs();
+        assert!(
+            dist_to_correct < dist_to_bug,
+            "caret_offset {caret_offset} is closer to the bug value \
+             {bug_value_5_chars} (one char too far right) than to the \
+             correct value {expected_4_chars}",
+        );
+        // Tighter bound: caret offset should be within ~1 px of the
+        // 4-char width (char_w drift aside, in mono it's exact).
+        assert!(
+            (caret_offset - expected_4_chars).abs() < 3.0,
+            "caret_offset {caret_offset} should be ~{expected_4_chars} \
+             (4 chars * char_w), not based on byte count",
+        );
     }
 
     /// Right-edge variant: position the caret so that one more Right
