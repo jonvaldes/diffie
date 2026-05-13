@@ -2033,6 +2033,13 @@ fn draw_row(
             let left = ui.is_key_pressed(imgui::Key::LeftArrow);
             let right = ui.is_key_pressed(imgui::Key::RightArrow);
             let shift = ui.io().key_shift;
+            // Lateral motion within the row (Left/Right) is handled by
+            // imgui's input_text internally, so `is_item_activated`
+            // doesn't fire — we need an explicit blink-reset here so the
+            // caret is on for the first half-cycle after the move.
+            if left || right {
+                caret_blink_reset.set(ui.time());
+            }
             if up || down {
                 let cur_byte = caret_pos.get().max(0) as usize;
                 let take = cur_byte.min(buf.len());
@@ -3124,6 +3131,106 @@ mod headless_tests {
             sel.caret,
             SelPoint { line_no: 2, col: 4 },
             "caret should jump to same column on line 2",
+        );
+    }
+
+    /// Left or Right arrow inside an active row must reset
+    /// `state.caret_blink_reset` to the current imgui time so the
+    /// manually-drawn caret is on for the first half of the new
+    /// blink cycle — otherwise the user would press Left/Right and
+    /// see no caret for up to half a second.
+    #[test]
+    fn headless_wgpu_lateral_arrow_resets_caret_blink() {
+        let _guard = imgui_lock();
+        let Some((device, queue)) = try_init_wgpu() else {
+            eprintln!("skipping: no wgpu adapter available");
+            return;
+        };
+
+        let text = "abcdefghij\nklmnopqrst\n";
+        let store = SessionStore::new();
+        let id = store.open_two_way(text, text, None).unwrap();
+
+        let mut ctx = imgui::Context::create();
+        ctx.io_mut().display_size = [1200.0, 800.0];
+        ctx.io_mut().delta_time = 1.0 / 60.0;
+        ctx.io_mut().config_flags |= imgui::ConfigFlags::NAV_ENABLE_KEYBOARD;
+        let mono = load_mono_font(&mut ctx, 13.0);
+        let target_format = wgpu::TextureFormat::Rgba8UnormSrgb;
+        let mut renderer = imgui_wgpu::Renderer::new(
+            &mut ctx,
+            &device,
+            &queue,
+            imgui_wgpu::RendererConfig {
+                texture_format: target_format,
+                ..Default::default()
+            },
+        );
+
+        let mut view_state = DiffViewState::default();
+        // Activate line 1 column 4. After settle, blink_reset is set
+        // to the activation frame's time.
+        focus_row_and_settle(
+            &mut ctx, &mut renderer, &device, &queue, target_format,
+            &store, id, &mut view_state, mono, Side::Left, 1, 4,
+        );
+        let blink_at_activation = view_state.caret_blink_reset;
+
+        // Run several idle frames so imgui's clock advances well past
+        // the activation timestamp. blink_reset should NOT change —
+        // idle time with no input doesn't reset the blink.
+        for _ in 0..10 {
+            run_frame_with_wgpu(
+                &mut ctx, &mut renderer, &device, &queue, target_format,
+                &store, id, &mut view_state, Some(mono), FrameInput::default(),
+            );
+        }
+        assert_eq!(
+            view_state.caret_blink_reset, blink_at_activation,
+            "idle frames must not reset blink",
+        );
+
+        // Press RightArrow. This should bump blink_reset to a later
+        // imgui time so the caret is visible at the new position.
+        run_frame_with_wgpu(
+            &mut ctx, &mut renderer, &device, &queue, target_format,
+            &store, id, &mut view_state, Some(mono),
+            FrameInput {
+                arrow: Some(imgui::Key::RightArrow),
+                ..Default::default()
+            },
+        );
+        let blink_after_right = view_state.caret_blink_reset;
+        assert!(
+            blink_after_right > blink_at_activation,
+            "RightArrow should reset blink_reset to a later time \
+             (was {blink_at_activation}, now {blink_after_right})",
+        );
+
+        // Idle frames again — blink_reset should hold steady.
+        for _ in 0..5 {
+            run_frame_with_wgpu(
+                &mut ctx, &mut renderer, &device, &queue, target_format,
+                &store, id, &mut view_state, Some(mono), FrameInput::default(),
+            );
+        }
+        assert_eq!(
+            view_state.caret_blink_reset, blink_after_right,
+            "idle frames after RightArrow must not reset again",
+        );
+
+        // LeftArrow likewise resets.
+        run_frame_with_wgpu(
+            &mut ctx, &mut renderer, &device, &queue, target_format,
+            &store, id, &mut view_state, Some(mono),
+            FrameInput {
+                arrow: Some(imgui::Key::LeftArrow),
+                ..Default::default()
+            },
+        );
+        assert!(
+            view_state.caret_blink_reset > blink_after_right,
+            "LeftArrow should reset blink_reset",
         );
     }
 
