@@ -2083,12 +2083,16 @@ fn draw_row(
                     .map(|s| s.chars().count())
                     .unwrap_or_else(|| buf.chars().count());
                 let cur_scroll = ui.scroll_x();
-                // The pane's visible width. `row_w` (from content_region_avail
-                // at top of draw_row) is misleading because the child
-                // window's explicit content_size makes content_region_avail
-                // report the wide content width, not the visible width.
-                // `ui.window_size()` is the child's actual rect.
-                let viewport_w = ui.window_size()[0];
+                // True visible content width. `window_size()` includes
+                // WindowPadding (~8 px each side), and `content_region`
+                // returns the explicit content size (3076 px) rather
+                // than the visible width because we set `content_size`
+                // on the child window. So compute it manually:
+                //   visible = window_size - 2 * WindowPadding.x.
+                // Without this the cursor goes ~1 char past the right
+                // edge before the scroll-follow triggers.
+                let style_pad_x = unsafe { ui.style() }.window_padding[0];
+                let viewport_w = (ui.window_size()[0] - 2.0 * style_pad_x).max(1.0);
                 let cursor_content_x = gutter_w() + (new_col as f32) * char_w;
                 // Two-character margin: scroll when the cursor gets
                 // within 2 chars of either edge, and land it 2 chars
@@ -3387,6 +3391,108 @@ mod headless_tests {
             .expect("Right arrow inside active row should queue a scroll-x pin");
         assert_eq!(pin.0, Side::Left);
         assert_eq!(pin.2, 4);
+    }
+
+    /// Right-edge variant: position the caret so that one more Right
+    /// press pushes it past the visible right edge, then press Right
+    /// and verify the cursor-follow scroll engaged AND the resulting
+    /// caret position is at least 2 chars inside the right edge.
+    /// Previously the trigger used `window_size()` for the viewport
+    /// width, which includes padding/scrollbar, so the cursor went
+    /// out of view by ~1 char before the scroll kicked in.
+    #[test]
+    fn headless_wgpu_right_arrow_keeps_margin_from_right_edge() {
+        let _guard = imgui_lock();
+        let Some((device, queue)) = try_init_wgpu() else {
+            eprintln!("skipping: no wgpu adapter available");
+            return;
+        };
+
+        let long = "x".repeat(500);
+        let text = format!("{long}\n");
+        let store = SessionStore::new();
+        let id = store.open_two_way(&text, &text, None).unwrap();
+
+        let mut ctx = imgui::Context::create();
+        ctx.io_mut().display_size = [1200.0, 800.0];
+        ctx.io_mut().delta_time = 1.0 / 60.0;
+        ctx.io_mut().config_flags |= imgui::ConfigFlags::NAV_ENABLE_KEYBOARD;
+        let mono = load_mono_font(&mut ctx, 13.0);
+        let target_format = wgpu::TextureFormat::Rgba8UnormSrgb;
+        let mut renderer = imgui_wgpu::Renderer::new(
+            &mut ctx,
+            &device,
+            &queue,
+            imgui_wgpu::RendererConfig {
+                texture_format: target_format,
+                ..Default::default()
+            },
+        );
+
+        let mut view_state = DiffViewState::default();
+        // Park caret far to the right (col 90 — past where a single
+        // pane can show with scroll_x=0).
+        focus_row_and_settle(
+            &mut ctx, &mut renderer, &device, &queue, target_format,
+            &store, id, &mut view_state, mono, Side::Left, 1, 90,
+        );
+        // Force scroll_x to 0 so the caret at col 90 is now off the
+        // RIGHT edge of the visible pane.
+        view_state.pin_scroll_x_after_splice = Some((Side::Left, 0.0, 4));
+        for _ in 0..6 {
+            run_frame_with_wgpu(
+                &mut ctx, &mut renderer, &device, &queue, target_format,
+                &store, id, &mut view_state, Some(mono), FrameInput::default(),
+            );
+        }
+
+        // Press Right. Caret advances to col 91; cursor-follow scroll
+        // must engage to bring the cursor back into view with the
+        // 2-char right margin.
+        run_frame_with_wgpu(
+            &mut ctx, &mut renderer, &device, &queue, target_format,
+            &store, id, &mut view_state, Some(mono),
+            FrameInput {
+                arrow: Some(imgui::Key::RightArrow),
+                ..Default::default()
+            },
+        );
+        for _ in 0..6 {
+            run_frame_with_wgpu(
+                &mut ctx, &mut renderer, &device, &queue, target_format,
+                &store, id, &mut view_state, Some(mono), FrameInput::default(),
+            );
+        }
+
+        // Cursor at col 91 has content x ≈ 60 + 91*6 = 606. With the
+        // 2-char margin, scroll_x should be set so the cursor lands
+        // ~2 chars (12 px) inside the right visible edge.
+        //
+        // Compute the cursor's in-viewport screen offset measured
+        // from the LEFT of the visible content area, then subtract
+        // from the visible width to get distance from right edge.
+        let scroll_x = view_state.last_left_scroll_x;
+        let cursor_content_x = 60.0 + 91.0 * 6.0; // ≈606
+        let cursor_in_viewport = cursor_content_x - scroll_x;
+        // Approximate the live visible content width — content_region
+        // accounts for WindowPadding (and scrollbar reservation). For
+        // a 1200×800 display with two panes + connector, each pane is
+        // ~568 px and visible content within ~552 after padding. We
+        // assert with a generous range below.
+        let approx_visible_w = 552.0;
+        let dist_from_right = approx_visible_w - cursor_in_viewport;
+
+        assert!(
+            dist_from_right >= 8.0,
+            "cursor went too close to (or past) right edge: cursor_x={cursor_content_x}, \
+             scroll_x={scroll_x}, in-viewport={cursor_in_viewport}, \
+             dist-from-right={dist_from_right} (want ≥8 px ≈ >1 char)",
+        );
+        assert!(
+            dist_from_right <= 20.0,
+            "cursor landed too far from right edge: dist-from-right={dist_from_right} \
+             (want ≤20 px for ~2-char margin)",
+        );
     }
 
     /// The cursor-follow scroll keeps a 2-character margin from the
