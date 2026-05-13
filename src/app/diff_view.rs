@@ -599,6 +599,12 @@ pub fn render(
     // cross-row selection. Standard editor behavior — the caret moves
     // and the selection collapses.
     let clear_state_selection: Cell<bool> = Cell::new(false);
+    // Set by `draw_row` when a Left/Right keypress in an active row
+    // would trigger imgui's nav-scroll (same gutter-sized horizontal
+    // drift the splice path produces). Drained after the panes render
+    // into `state.pin_scroll_x_after_splice` so subsequent frames pin
+    // the scroll back.
+    let pin_scroll_x_request: Cell<Option<Side>> = Cell::new(None);
 
     // Read the splice-induced scroll-x pin (if any) and decrement its
     // frame counter. We re-push it via `igSetNextWindowScroll` for the
@@ -727,6 +733,7 @@ pub fn render(
                     &active_selection,
                     &shift_arrow_extend,
                     &clear_state_selection,
+                    &pin_scroll_x_request,
                 );
             });
 
@@ -803,6 +810,7 @@ pub fn render(
                     &active_selection,
                     &shift_arrow_extend,
                     &clear_state_selection,
+                    &pin_scroll_x_request,
                 );
             });
 
@@ -866,6 +874,7 @@ pub fn render(
                     &active_selection,
                     &shift_arrow_extend,
                     &clear_state_selection,
+                    &pin_scroll_x_request,
                 );
             });
 
@@ -938,6 +947,7 @@ pub fn render(
                     &active_selection,
                     &shift_arrow_extend,
                     &clear_state_selection,
+                    &pin_scroll_x_request,
                 );
             });
 
@@ -976,6 +986,18 @@ pub fn render(
         // existing cross-row selection. Mutually exclusive with the
         // shift-extend branch above.
         state.selection = None;
+    }
+    // If a lateral arrow press requested a scroll-x pin, capture the
+    // current scroll_x of that side (snapshotted at the top of the
+    // matching pane's build) and queue the pin. Same field + countdown
+    // as the splice pin; same `igSetNextWindowScroll` machinery on
+    // subsequent frames neutralizes imgui's nav-scroll-set ScrollTarget.
+    if let Some(side) = pin_scroll_x_request.take() {
+        let cur_x = match side {
+            Side::Left => left_scroll_x.get(),
+            Side::Right => right_scroll_x.get(),
+        };
+        state.pin_scroll_x_after_splice = Some((side, cur_x, 4));
     }
     if let Some(edit) = line_remove.take() {
         pending_edits.push(edit);
@@ -1479,6 +1501,7 @@ fn draw_pane(
     active_selection_out: &Cell<Option<(Side, u32, usize, usize)>>,
     shift_arrow_out: &Cell<Option<(Side, u32, usize, u32)>>,
     clear_state_selection_out: &Cell<bool>,
+    pin_scroll_x_request_out: &Cell<Option<Side>>,
 ) {
     let total = rows.len() as i32;
     if total == 0 {
@@ -1525,6 +1548,7 @@ fn draw_pane(
                 active_selection_out,
                 shift_arrow_out,
                 clear_state_selection_out,
+                pin_scroll_x_request_out,
             ) {
                 click_out.set(Some(clicked_line));
             }
@@ -1720,6 +1744,7 @@ fn draw_row(
     active_selection_out: &Cell<Option<(Side, u32, usize, usize)>>,
     shift_arrow_out: &Cell<Option<(Side, u32, usize, u32)>>,
     clear_state_selection_out: &Cell<bool>,
+    pin_scroll_x_request_out: &Cell<Option<Side>>,
 ) -> Option<u32> {
     let p0 = ui.cursor_screen_pos();
     let row_w = ui.content_region_avail()[0];
@@ -2037,8 +2062,14 @@ fn draw_row(
             // imgui's input_text internally, so `is_item_activated`
             // doesn't fire — we need an explicit blink-reset here so the
             // caret is on for the first half-cycle after the move.
+            // We also request a scroll-x pin: imgui's nav-scroll fires
+            // on the focused widget after a keypress, snapping the
+            // pane's scroll_x to gutter_w (same gutter-sized drift the
+            // splice path produces). The pin holds scroll_x at its
+            // pre-key value for the next few frames.
             if left || right {
                 caret_blink_reset.set(ui.time());
+                pin_scroll_x_request_out.set(Some(side));
             }
             if up || down {
                 let cur_byte = caret_pos.get().max(0) as usize;
@@ -3132,6 +3163,96 @@ mod headless_tests {
             SelPoint { line_no: 2, col: 4 },
             "caret should jump to same column on line 2",
         );
+    }
+
+    /// Pressing Left or Right inside an active row triggers imgui's
+    /// nav-scroll on the focused widget — same root cause as the
+    /// splice-refocus bug, snapping scroll_x to gutter_w. The fix
+    /// queues a scroll-x pin (same field + countdown as the splice
+    /// pin) so subsequent frames push `igSetNextWindowScroll` with
+    /// the pre-key scroll_x, neutralizing the nav-scroll.
+    ///
+    /// **Caveat:** the imgui-side nav-scroll for a Left/Right keypress
+    /// (as opposed to `set_keyboard_focus_here`, which DOES fire in
+    /// headless and is verified by `headless_wgpu_splice_preserves_*`)
+    /// doesn't reliably reproduce here — same kind of limitation we hit
+    /// with the splice scroll bug before adding the wgpu pipeline. This
+    /// test catches state-wiring regressions (the pin field gets set
+    /// with the right side and a fresh countdown) rather than the
+    /// imgui-side drift itself. Manual verification: in the live GUI,
+    /// open a long line, scroll horizontally to the left edge, press
+    /// Left — view must not shift.
+    #[test]
+    fn headless_wgpu_left_arrow_queues_scroll_pin() {
+        let _guard = imgui_lock();
+        let Some((device, queue)) = try_init_wgpu() else {
+            eprintln!("skipping: no wgpu adapter available");
+            return;
+        };
+
+        let long = "x".repeat(500);
+        let text = format!("{long}\n{long}\n");
+        let store = SessionStore::new();
+        let id = store.open_two_way(&text, &text, None).unwrap();
+
+        let mut ctx = imgui::Context::create();
+        ctx.io_mut().display_size = [1200.0, 800.0];
+        ctx.io_mut().delta_time = 1.0 / 60.0;
+        ctx.io_mut().config_flags |= imgui::ConfigFlags::NAV_ENABLE_KEYBOARD;
+        let mono = load_mono_font(&mut ctx, 13.0);
+        let target_format = wgpu::TextureFormat::Rgba8UnormSrgb;
+        let mut renderer = imgui_wgpu::Renderer::new(
+            &mut ctx,
+            &device,
+            &queue,
+            imgui_wgpu::RendererConfig {
+                texture_format: target_format,
+                ..Default::default()
+            },
+        );
+
+        let mut view_state = DiffViewState::default();
+        focus_row_and_settle(
+            &mut ctx, &mut renderer, &device, &queue, target_format,
+            &store, id, &mut view_state, mono, Side::Left, 1, 10,
+        );
+        // Drain whatever pin the activation set; clear state so we
+        // can detect the new pin set by Left arrow.
+        view_state.pin_scroll_x_after_splice = None;
+
+        run_frame_with_wgpu(
+            &mut ctx, &mut renderer, &device, &queue, target_format,
+            &store, id, &mut view_state, Some(mono),
+            FrameInput {
+                arrow: Some(imgui::Key::LeftArrow),
+                ..Default::default()
+            },
+        );
+
+        // The Left press should have queued a scroll-x pin for the
+        // left pane with a fresh countdown of 4.
+        let pin = view_state
+            .pin_scroll_x_after_splice
+            .expect("Left arrow inside active row should queue a scroll-x pin");
+        assert_eq!(pin.0, Side::Left, "pin should be for the left pane");
+        assert_eq!(pin.2, 4, "pin countdown should be the standard 4 frames");
+
+        // Verify Right arrow also queues the pin (clearing first so
+        // the countdown reset is observable).
+        view_state.pin_scroll_x_after_splice = None;
+        run_frame_with_wgpu(
+            &mut ctx, &mut renderer, &device, &queue, target_format,
+            &store, id, &mut view_state, Some(mono),
+            FrameInput {
+                arrow: Some(imgui::Key::RightArrow),
+                ..Default::default()
+            },
+        );
+        let pin = view_state
+            .pin_scroll_x_after_splice
+            .expect("Right arrow inside active row should queue a scroll-x pin");
+        assert_eq!(pin.0, Side::Left);
+        assert_eq!(pin.2, 4);
     }
 
     /// Left or Right arrow inside an active row must reset
