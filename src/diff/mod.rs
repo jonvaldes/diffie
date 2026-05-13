@@ -1,5 +1,6 @@
 pub mod anchored;
 pub mod histogram;
+pub mod moves;
 pub mod myers;
 pub mod normalize;
 pub mod patience;
