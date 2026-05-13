@@ -1666,10 +1666,10 @@ fn draw_control_overlay(
 /// Adjacent chars that resolve to the same color are coalesced into a single
 /// `add_text` call so unchanged stretches don't pay per-char overhead.
 fn paint_row_text(
+    ui: &Ui,
     dl: &imgui::DrawListMut<'_>,
     segments: &[Segment],
     origin: [f32; 2],
-    char_w: f32,
     spans: &[super::syntax::LineSpan],
     row_cls: Cls,
 ) {
@@ -1710,21 +1710,28 @@ fn paint_row_text(
 
     let pick = |c: usize| -> [f32; 4] { table_at(c).get(kind_at[c]) };
 
-    // Coalesce contiguous same-color runs.
+    // Coalesce contiguous same-color runs. Walk the chars with an
+    // accumulator that advances by each chunk's actual rendered width
+    // (calc_text_size) — same machinery imgui uses to position glyphs.
+    // The previous formula `run_start * char_w` only worked for
+    // monospace fonts, and even there drifted out of sync with the
+    // per-segment highlight rects (which already used calc_text_size).
+    let mut x_offset = 0.0_f32;
     let mut run_start = 0usize;
     let mut run_color = pick(0);
     for c in 1..n {
         let color = pick(c);
         if color != run_color {
             let chunk: String = chars[run_start..c].iter().collect();
-            let pos = [origin[0] + run_start as f32 * char_w, origin[1]];
+            let pos = [origin[0] + x_offset, origin[1]];
             dl.add_text(pos, run_color, &chunk);
+            x_offset += ui.calc_text_size(&chunk)[0];
             run_start = c;
             run_color = color;
         }
     }
     let chunk: String = chars[run_start..].iter().collect();
-    let pos = [origin[0] + run_start as f32 * char_w, origin[1]];
+    let pos = [origin[0] + x_offset, origin[1]];
     dl.add_text(pos, run_color, &chunk);
 }
 
@@ -1877,10 +1884,10 @@ fn draw_row(
     let mut buf: String = row.segments.iter().map(|s| s.text.as_str()).collect();
     let was_empty = buf.is_empty();
     paint_row_text(
+        ui,
         &dl,
         &row.segments,
         [text_start_x, p0[1] + 3.0],
-        char_w,
         line_hl,
         row.cls,
     );
