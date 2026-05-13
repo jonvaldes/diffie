@@ -44,21 +44,25 @@ pub enum DiffOp {
         text: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         spans: Option<Vec<SubSpan>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        move_id: Option<u32>,
     },
     Insert {
         b: LineNo,
         text: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         spans: Option<Vec<SubSpan>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        move_id: Option<u32>,
     },
 }
 
 impl DiffOp {
     pub fn delete(a: LineNo, text: String) -> Self {
-        DiffOp::Delete { a, text, spans: None }
+        DiffOp::Delete { a, text, spans: None, move_id: None }
     }
     pub fn insert(b: LineNo, text: String) -> Self {
-        DiffOp::Insert { b, text, spans: None }
+        DiffOp::Insert { b, text, spans: None, move_id: None }
     }
 }
 

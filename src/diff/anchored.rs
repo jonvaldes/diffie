@@ -117,11 +117,17 @@ fn push_offset(out: &mut Vec<DiffOp>, ops: &[DiffOp], a_off: LineNo, b_off: Line
             DiffOp::Equal { a, b, text } => out.push(DiffOp::Equal {
                 a: a + a_off, b: b + b_off, text: text.clone(),
             }),
-            DiffOp::Delete { a, text, spans } => out.push(DiffOp::Delete {
-                a: a + a_off, text: text.clone(), spans: spans.clone(),
+            DiffOp::Delete { a, text, spans, move_id } => out.push(DiffOp::Delete {
+                a: a + a_off,
+                text: text.clone(),
+                spans: spans.clone(),
+                move_id: *move_id,
             }),
-            DiffOp::Insert { b, text, spans } => out.push(DiffOp::Insert {
-                b: b + b_off, text: text.clone(), spans: spans.clone(),
+            DiffOp::Insert { b, text, spans, move_id } => out.push(DiffOp::Insert {
+                b: b + b_off,
+                text: text.clone(),
+                spans: spans.clone(),
+                move_id: *move_id,
             }),
         }
     }
