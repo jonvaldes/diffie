@@ -340,6 +340,10 @@ pub(super) struct Row {
     /// Used to position the hover overlay at the top of the hunk rather
     /// than at the cursor.
     pub(super) hunk_first_row: usize,
+    /// True iff this row's hunk is a moved hunk (i.e.
+    /// `hunk_move_id(hunk).is_some()`). All rows in a moved hunk share
+    /// the same value. Equal hunks always have `moved: false`.
+    pub(super) moved: bool,
 }
 
 pub(super) struct Pane {
@@ -392,6 +396,7 @@ pub(super) fn build_pane(hunks: &[Hunk], side: Side) -> Pane {
                 })
                 .collect();
             let n_pairs = dels.len().min(inss.len());
+            let moved = hunk_move_id(h).is_some();
 
             let segments_for = |text: &str, spans: Option<&Vec<SubSpan>>, other: &str, is_left: bool| -> Vec<Segment> {
                 if let Some(sp) = spans {
@@ -412,6 +417,7 @@ pub(super) fn build_pane(hunks: &[Hunk], side: Side) -> Pane {
                             hunk_id: h.id,
                             is_change: true,
                             hunk_first_row,
+                            moved,
                         });
                         line_ys.insert(dels[i].0, y);
                         y += row_h();
@@ -427,6 +433,7 @@ pub(super) fn build_pane(hunks: &[Hunk], side: Side) -> Pane {
                             hunk_id: h.id,
                             is_change: true,
                             hunk_first_row,
+                            moved,
                         });
                         line_ys.insert(dels[i].0, y);
                         y += row_h();
@@ -442,6 +449,7 @@ pub(super) fn build_pane(hunks: &[Hunk], side: Side) -> Pane {
                             hunk_id: h.id,
                             is_change: true,
                             hunk_first_row,
+                            moved,
                         });
                         line_ys.insert(inss[i].0, y);
                         y += row_h();
@@ -457,6 +465,7 @@ pub(super) fn build_pane(hunks: &[Hunk], side: Side) -> Pane {
                             hunk_id: h.id,
                             is_change: true,
                             hunk_first_row,
+                            moved,
                         });
                         line_ys.insert(inss[i].0, y);
                         y += row_h();
@@ -477,6 +486,7 @@ pub(super) fn build_pane(hunks: &[Hunk], side: Side) -> Pane {
                         hunk_id: h.id,
                         is_change: false,
                         hunk_first_row,
+                        moved: false,
                     });
                     line_ys.insert(line_no, y);
                     y += row_h();
@@ -735,6 +745,17 @@ pub(super) fn find_paired_hunk(
     })
 }
 
+/// Test-only thin wrapper around `build_pane` that discards `ranges` and
+/// returns `(rows, line_ys)` so unit tests can inspect the built rows.
+#[cfg(test)]
+pub(super) fn build_rows_for_test(
+    hunks: &[crate::diff::Hunk],
+    side: Side,
+) -> (Vec<Row>, std::collections::HashMap<u32, f32>) {
+    let pane = build_pane(hunks, side);
+    (pane.rows, pane.line_ys)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -816,5 +837,46 @@ mod tests {
         let hunks = vec![delete_hunk(10, Some(0))];
         assert!(find_paired_hunk(&hunks, 0, Side::Left).is_none());
         assert!(find_paired_hunk(&hunks, 99, Side::Right).is_none());
+    }
+
+    #[test]
+    fn row_builder_sets_moved_on_moved_hunks() {
+        let hunks = vec![
+            Hunk {
+                id: 0,
+                a_range: (1, 2),
+                b_range: (0, 0),
+                ops: vec![
+                    DiffOp::Delete { a: 1, text: "ftr1".into(), spans: None, move_id: Some(0) },
+                    DiffOp::Delete { a: 2, text: "ftr2".into(), spans: None, move_id: Some(0) },
+                ],
+            },
+            Hunk {
+                id: 1,
+                a_range: (3, 3),
+                b_range: (3, 3),
+                ops: vec![DiffOp::Equal { a: 3, b: 3, text: "ctx".into() }],
+            },
+            Hunk {
+                id: 2,
+                a_range: (0, 0),
+                b_range: (1, 2),
+                ops: vec![
+                    DiffOp::Insert { b: 1, text: "ftr1".into(), spans: None, move_id: Some(0) },
+                    DiffOp::Insert { b: 2, text: "ftr2".into(), spans: None, move_id: Some(0) },
+                ],
+            },
+        ];
+        let (left_rows, _left_line_ys) = super::build_rows_for_test(&hunks, Side::Left);
+        let moved_left: Vec<bool> = left_rows.iter().filter(|r| r.is_change).map(|r| r.moved).collect();
+        assert!(moved_left.iter().all(|m| *m), "all left change rows should be moved");
+
+        let (right_rows, _right_line_ys) = super::build_rows_for_test(&hunks, Side::Right);
+        let moved_right: Vec<bool> = right_rows.iter().filter(|r| r.is_change).map(|r| r.moved).collect();
+        assert!(moved_right.iter().all(|m| *m), "all right change rows should be moved");
+
+        let equal_rows: Vec<&Row> = left_rows.iter().chain(right_rows.iter())
+            .filter(|r| !r.is_change).collect();
+        assert!(equal_rows.iter().all(|r| !r.moved), "equal rows must not be moved");
     }
 }
