@@ -2208,6 +2208,13 @@ fn draw_row(
         // own advance width). For monospace fonts the result equals
         // `char_col * char_w` exactly; for proportional it's the only
         // way to keep the caret aligned with the rendered glyphs.
+        // `caret_pos` is a BYTE position (from imgui's stb_textedit).
+        // Use `calc_text_size` to convert it to a pixel offset rather
+        // than `char_col * char_w`: that handles UTF-8 correctly and
+        // also works for proportional fonts (where each glyph has its
+        // own advance width). For monospace fonts the result equals
+        // `char_col * char_w` exactly; for proportional it's the only
+        // way to keep the caret aligned with the rendered glyphs.
         let byte_pos = caret_pos.get().max(0) as usize;
         let take = byte_pos.min(buf.len());
         let mut idx = take;
@@ -3622,6 +3629,152 @@ mod headless_tests {
             .expect("Right arrow inside active row should queue a scroll-x pin");
         assert_eq!(pin.0, Side::Left);
         assert_eq!(pin.2, 4);
+    }
+
+    /// Direct pixel-level alignment check between the caret and the
+    /// highlight rect's right edge. Sets up a diff where a single
+    /// trailing character is marked hl=true, focuses the row, and
+    /// places the caret at the END of the highlighted region. If
+    /// caret and highlight both use calc_text_size correctly, the
+    /// caret pixel column should equal the highlight rect's right
+    /// edge pixel column (modulo 1 px AA).
+    ///
+    /// Localizes the caret via diff with a baseline (focused vs not),
+    /// and the highlight rect via the same red-pixel filter as the
+    /// width test.
+    #[test]
+    fn headless_wgpu_pixel_caret_aligns_with_highlight_right_edge() {
+        let _guard = imgui_lock();
+        let Some((device, queue)) = try_init_wgpu() else {
+            eprintln!("skipping: no wgpu adapter available");
+            return;
+        };
+
+        // Char-diff scenario: 5 of 6 chars match, 'w' (last char of
+        // line a) differs from 'X' in b. The Delete row's segments:
+        //   ["hello" hl=false, "w" hl=true]
+        // So the hl rect covers JUST 'w' at the END of the line.
+        let a = "hellow\n";
+        let b = "helloX\n";
+        let store = SessionStore::new();
+        let id = store.open_two_way(a, b, None).unwrap();
+
+        let mut ctx = imgui::Context::create();
+        let w: u32 = 1024;
+        let h: u32 = 256;
+        ctx.io_mut().display_size = [w as f32, h as f32];
+        ctx.io_mut().delta_time = 1.0 / 60.0;
+        ctx.io_mut().config_flags |= imgui::ConfigFlags::NAV_ENABLE_KEYBOARD;
+        let font = load_proportional_font(&mut ctx, 16.0);
+        let target_format = wgpu::TextureFormat::Rgba8Unorm;
+        let mut renderer = imgui_wgpu::Renderer::new(
+            &mut ctx,
+            &device,
+            &queue,
+            imgui_wgpu::RendererConfig {
+                texture_format: target_format,
+                ..Default::default()
+            },
+        );
+
+        // Baseline: no caret (no focus). Captures the hl rect at its
+        // natural position.
+        let mut state_no_caret = DiffViewState::default();
+        run_frame_with_wgpu(
+            &mut ctx, &mut renderer, &device, &queue, target_format,
+            &store, id, &mut state_no_caret, Some(font), FrameInput::default(),
+        );
+        let pixels_baseline = capture_frame_pixels(
+            &mut ctx, &mut renderer, &device, &queue, target_format,
+            &store, id, &mut state_no_caret, Some(font), w, h,
+        );
+
+        // With caret: focus the Delete row at col 6 (end of "hellow").
+        // The caret renders at the rightmost edge of the hl segment.
+        let mut state_with_caret = DiffViewState::default();
+        focus_row_and_settle(
+            &mut ctx, &mut renderer, &device, &queue, target_format,
+            &store, id, &mut state_with_caret, font, Side::Left, 1, 6,
+        );
+        let pixels_with_caret = capture_frame_pixels(
+            &mut ctx, &mut renderer, &device, &queue, target_format,
+            &store, id, &mut state_with_caret, Some(font), w, h,
+        );
+
+        // Find the hl rect's right edge in the baseline (no caret).
+        let mut hl_cols: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+        for y in 0..h {
+            for x in 0..w {
+                let i = ((y * w + x) * 4) as usize;
+                let r = pixels_baseline[i] as i32;
+                let g = pixels_baseline[i + 1] as i32;
+                let b = pixels_baseline[i + 2] as i32;
+                if r > 35 && (r - g) > 25 && (r - b) > 25 {
+                    hl_cols.insert(x);
+                }
+            }
+        }
+        assert!(!hl_cols.is_empty(), "no highlight pixels in baseline");
+        let hl_right = *hl_cols.iter().last().unwrap();
+
+        // Find the caret column via diff between with-caret and
+        // baseline (only caret pixels differ — same text, same hl).
+        let mut diff_x: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+        for y in 0..h {
+            for x in 0..w {
+                let i = ((y * w + x) * 4) as usize;
+                let a = &pixels_baseline[i..i + 4];
+                let b = &pixels_with_caret[i..i + 4];
+                let max_d = a
+                    .iter()
+                    .zip(b.iter())
+                    .map(|(av, bv)| (*av as i32 - *bv as i32).abs())
+                    .max()
+                    .unwrap_or(0);
+                if max_d > 50 {
+                    diff_x.insert(x);
+                }
+            }
+        }
+        assert!(!diff_x.is_empty(), "no caret pixels found");
+        // Cluster diff columns; expect ONE band (the caret's only
+        // position differs between scenarios).
+        let mut bands: Vec<(u32, u32)> = Vec::new();
+        let mut cur: Option<(u32, u32)> = None;
+        for x in &diff_x {
+            match cur {
+                None => cur = Some((*x, *x)),
+                Some((lo, hi)) => {
+                    if *x <= hi + 3 {
+                        cur = Some((lo, *x));
+                    } else {
+                        bands.push((lo, hi));
+                        cur = Some((*x, *x));
+                    }
+                }
+            }
+        }
+        if let Some(b) = cur {
+            bands.push(b);
+        }
+        assert_eq!(
+            bands.len(),
+            1,
+            "expected one caret band; got {} ({:?})",
+            bands.len(),
+            bands,
+        );
+        let caret_x = (bands[0].0 + bands[0].1) as f32 * 0.5;
+
+        // The caret should land at the right edge of the hl rect
+        // (col 6 = end of "hellow", and the hl segment is the last
+        // char). Tolerate 1 px for anti-aliasing / band-center drift.
+        let diff_px = (caret_x - hl_right as f32).abs();
+        assert!(
+            diff_px <= 2.0,
+            "caret x ({caret_x}) does not align with hl rect right edge \
+             ({hl_right}); diff = {diff_px} px",
+        );
     }
 
     /// Pixel-readback regression for highlight-rect alignment with
