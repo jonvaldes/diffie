@@ -2062,13 +2062,17 @@ fn draw_row(
             // imgui's input_text internally, so `is_item_activated`
             // doesn't fire — we need an explicit blink-reset here so the
             // caret is on for the first half-cycle after the move.
-            // We also request a scroll-x pin: imgui's nav-scroll fires
-            // on the focused widget after a keypress, snapping the
-            // pane's scroll_x to gutter_w (same gutter-sized drift the
-            // splice path produces). The pin holds scroll_x at its
-            // pre-key value for the next few frames.
             if left || right {
                 caret_blink_reset.set(ui.time());
+            }
+            // Any arrow keypress on an active row queues the scroll-x
+            // pin to neutralize imgui's nav-scroll-induced gutter drift:
+            //   - Left/Right: imgui's input_text fires nav-scroll on
+            //     the still-focused widget after the cursor moves.
+            //   - Up/Down: arrow_focus → set_keyboard_focus_here on the
+            //     adjacent row's widget, same nav-scroll path that the
+            //     splice-refocus bug triggers.
+            if up || down || left || right {
                 pin_scroll_x_request_out.set(Some(side));
             }
             if up || down {
@@ -3162,6 +3166,106 @@ mod headless_tests {
             sel.caret,
             SelPoint { line_no: 2, col: 4 },
             "caret should jump to same column on line 2",
+        );
+    }
+
+    /// Pressing Up or Down (which sets `arrow_focus` so the adjacent
+    /// row's input_text gets `set_keyboard_focus_here` on the next
+    /// frame) triggers the same imgui nav-scroll path as the splice
+    /// fix, snapping scroll_x to gutter_w. This is the path that DOES
+    /// reproduce in headless (verified by the existing splice scroll
+    /// test). The new lateral-arrow pin trigger also covers Up/Down,
+    /// so scroll_x stays at the pre-key baseline.
+    #[test]
+    fn headless_wgpu_up_arrow_doesnt_drift_scroll_x() {
+        check_vertical_arrow_no_drift(imgui::Key::UpArrow, /*start_line=*/ 2);
+    }
+
+    #[test]
+    fn headless_wgpu_down_arrow_doesnt_drift_scroll_x() {
+        check_vertical_arrow_no_drift(imgui::Key::DownArrow, /*start_line=*/ 1);
+    }
+
+    /// Shared body for the Up/Down drift tests. Activates `start_line`,
+    /// forces scroll_x to 0 (so any drift to gutter_w is observable),
+    /// presses the requested vertical arrow, and asserts scroll_x stays
+    /// at the forced baseline.
+    fn check_vertical_arrow_no_drift(arrow: imgui::Key, start_line: u32) {
+        let _guard = imgui_lock();
+        let Some((device, queue)) = try_init_wgpu() else {
+            eprintln!("skipping: no wgpu adapter available");
+            return;
+        };
+
+        let long = "x".repeat(500);
+        let text = format!("{long}\n{long}\n{long}\n");
+        let store = SessionStore::new();
+        let id = store.open_two_way(&text, &text, None).unwrap();
+
+        let mut ctx = imgui::Context::create();
+        ctx.io_mut().display_size = [1200.0, 800.0];
+        ctx.io_mut().delta_time = 1.0 / 60.0;
+        ctx.io_mut().config_flags |= imgui::ConfigFlags::NAV_ENABLE_KEYBOARD;
+        let mono = load_mono_font(&mut ctx, 13.0);
+        let target_format = wgpu::TextureFormat::Rgba8UnormSrgb;
+        let mut renderer = imgui_wgpu::Renderer::new(
+            &mut ctx,
+            &device,
+            &queue,
+            imgui_wgpu::RendererConfig {
+                texture_format: target_format,
+                ..Default::default()
+            },
+        );
+
+        let mut view_state = DiffViewState::default();
+        focus_row_and_settle(
+            &mut ctx, &mut renderer, &device, &queue, target_format,
+            &store, id, &mut view_state, mono, Side::Left, start_line, 10,
+        );
+
+        // Activation snapped scroll_x to gutter_w (≈60). Force it back
+        // to 0 by queueing the pin manually and running long enough
+        // for the pin to take effect and expire.
+        view_state.pin_scroll_x_after_splice = Some((Side::Left, 0.0, 4));
+        for _ in 0..6 {
+            run_frame_with_wgpu(
+                &mut ctx, &mut renderer, &device, &queue, target_format,
+                &store, id, &mut view_state, Some(mono), FrameInput::default(),
+            );
+        }
+        let baseline_x = view_state.last_left_scroll_x;
+        assert!(
+            baseline_x.abs() < 1.0,
+            "expected forced baseline near 0, got {baseline_x}",
+        );
+
+        // Press the vertical arrow. set_keyboard_focus_here on the
+        // adjacent row would fire imgui's nav-scroll without the pin
+        // (this is the same path the splice test exercises).
+        run_frame_with_wgpu(
+            &mut ctx, &mut renderer, &device, &queue, target_format,
+            &store, id, &mut view_state, Some(mono),
+            FrameInput {
+                arrow: Some(arrow),
+                ..Default::default()
+            },
+        );
+        for _ in 0..6 {
+            run_frame_with_wgpu(
+                &mut ctx, &mut renderer, &device, &queue, target_format,
+                &store, id, &mut view_state, Some(mono), FrameInput::default(),
+            );
+        }
+
+        // Same drift bound as the splice test: gutter_w is 60 px,
+        // anything within 10 of baseline is acceptable.
+        const MAX_DRIFT: f32 = 10.0;
+        assert!(
+            (view_state.last_left_scroll_x - baseline_x).abs() < MAX_DRIFT,
+            "{arrow:?} drifted scroll_x from {baseline_x} to {} (>{MAX_DRIFT}px) — \
+             pin failed for vertical arrow",
+            view_state.last_left_scroll_x,
         );
     }
 
