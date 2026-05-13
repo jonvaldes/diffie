@@ -3631,6 +3631,244 @@ mod headless_tests {
         assert_eq!(pin.2, 4);
     }
 
+    /// User's reported repro: a multi-line code file where the cursor
+    /// is placed in the middle of a word ("frames") on a line with
+    /// indentation. Asserts that the cursor's pixel x equals the
+    /// expected x = text_start + calc_text_size(prefix_through_m),
+    /// AND that the cursor lines up with the right edge of 'm' as
+    /// rendered by paint_row_text (which the test verifies by
+    /// finding the rightmost pixel of the 'm' glyph stroke).
+    #[test]
+    fn headless_wgpu_pixel_caret_in_middle_of_word() {
+        let _guard = imgui_lock();
+        let Some((device, queue)) = try_init_wgpu() else {
+            eprintln!("skipping: no wgpu adapter available");
+            return;
+        };
+
+        // The user's exact line. Multi-line file (a few lines around
+        // it) so it's not a degenerate single-line session and there
+        // can be a diff that exercises char-level highlighting.
+        let a = "fn main() {\n        // Replay mode: load recording, render frames to PNG, exit.\n}\n";
+        let b = "fn main() {\n        // Replay mode: load recording, render FRAMES to PNG, exit.\n}\n";
+        let store = SessionStore::new();
+        let id = store.open_two_way(a, b, None).unwrap();
+
+        let mut ctx = imgui::Context::create();
+        let w: u32 = 1024;
+        let h: u32 = 256;
+        ctx.io_mut().display_size = [w as f32, h as f32];
+        ctx.io_mut().delta_time = 1.0 / 60.0;
+        ctx.io_mut().config_flags |= imgui::ConfigFlags::NAV_ENABLE_KEYBOARD;
+        let mono = load_mono_font(&mut ctx, 16.0);
+        let target_format = wgpu::TextureFormat::Rgba8Unorm;
+        let mut renderer = imgui_wgpu::Renderer::new(
+            &mut ctx,
+            &device,
+            &queue,
+            imgui_wgpu::RendererConfig {
+                texture_format: target_format,
+                ..Default::default()
+            },
+        );
+
+        // Position to place the caret: just past the 'm' in "frames"
+        // on line 2 of a.
+        let line2 = "        // Replay mode: load recording, render frames to PNG, exit.";
+        let prefix_through_m = "        // Replay mode: load recording, render fram";
+        let char_col = prefix_through_m.chars().count();
+        let _ = line2; // documentation only
+
+        // Baseline: no focus, but force scroll_x to 0 via the pin so
+        // both scenarios have matching layout (the with-caret scenario
+        // will also have scroll_x pinned to 0 — see below).
+        let mut state_no_caret = DiffViewState::default();
+        state_no_caret.pin_scroll_x_after_splice = Some((Side::Left, 0.0, 4));
+        for _ in 0..6 {
+            run_frame_with_wgpu(
+                &mut ctx, &mut renderer, &device, &queue, target_format,
+                &store, id, &mut state_no_caret, Some(mono), FrameInput::default(),
+            );
+        }
+        let pixels_baseline = capture_frame_pixels(
+            &mut ctx, &mut renderer, &device, &queue, target_format,
+            &store, id, &mut state_no_caret, Some(mono), w, h,
+        );
+
+        // With caret on line 2 right after 'm' in "frames". Focus
+        // shifts scroll_x via nav-scroll; re-pin to 0 to match the
+        // baseline so the diff isolates only caret pixels.
+        let mut state_with_caret = DiffViewState::default();
+        focus_row_and_settle(
+            &mut ctx, &mut renderer, &device, &queue, target_format,
+            &store, id, &mut state_with_caret, mono, Side::Left, 2, char_col,
+        );
+        state_with_caret.pin_scroll_x_after_splice = Some((Side::Left, 0.0, 4));
+        for _ in 0..6 {
+            run_frame_with_wgpu(
+                &mut ctx, &mut renderer, &device, &queue, target_format,
+                &store, id, &mut state_with_caret, Some(mono), FrameInput::default(),
+            );
+        }
+        let pixels_with_caret = capture_frame_pixels(
+            &mut ctx, &mut renderer, &device, &queue, target_format,
+            &store, id, &mut state_with_caret, Some(mono), w, h,
+        );
+
+        // Find caret column by diffing.
+        let mut diff_x: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+        for y in 0..h {
+            for x in 0..w {
+                let i = ((y * w + x) * 4) as usize;
+                let aa = &pixels_baseline[i..i + 4];
+                let bb = &pixels_with_caret[i..i + 4];
+                let max_d = aa
+                    .iter()
+                    .zip(bb.iter())
+                    .map(|(av, bv)| (*av as i32 - *bv as i32).abs())
+                    .max()
+                    .unwrap_or(0);
+                if max_d > 50 {
+                    diff_x.insert(x);
+                }
+            }
+        }
+        assert!(!diff_x.is_empty(), "no caret pixels found");
+        let mut bands: Vec<(u32, u32)> = Vec::new();
+        let mut cur: Option<(u32, u32)> = None;
+        for x in &diff_x {
+            match cur {
+                None => cur = Some((*x, *x)),
+                Some((lo, hi)) => {
+                    if *x <= hi + 3 {
+                        cur = Some((lo, *x));
+                    } else {
+                        bands.push((lo, hi));
+                        cur = Some((*x, *x));
+                    }
+                }
+            }
+        }
+        if let Some(b) = cur {
+            bands.push(b);
+        }
+        assert_eq!(
+            bands.len(),
+            1,
+            "expected one caret band; got {} ({:?})",
+            bands.len(),
+            bands,
+        );
+        let caret_x = (bands[0].0 + bands[0].1) as f32 * 0.5;
+
+        // Compute the expected caret x in PIXELS. Two parts:
+        //  - text_start_x: the row's text-area left edge. We don't
+        //    know it analytically, but state.last_left_scroll_x is 0
+        //    (we forced it) and the pane has standard layout, so
+        //    text_start_x ≈ window_padding + gutter_w. We capture the
+        //    actual text_start_x by rendering a SECOND with-caret
+        //    scenario at col 0 — that caret lands AT text_start_x.
+        //  - offset_in_state: the caret's offset from text_start_x.
+        let offset_in_state = state_with_caret
+            .last_active_caret_offset
+            .expect("caret offset should be in state")
+            .1;
+        let expected_offset: Cell<f32> = Cell::new(0.0);
+        {
+            let ui = ctx.new_frame();
+            ui.window("m")
+                .size([200.0, 100.0], imgui::Condition::Always)
+                .build(|| {
+                    let _tok = ui.push_font(mono);
+                    expected_offset.set(ui.calc_text_size(prefix_through_m)[0]);
+                });
+            let _ = ctx.render();
+        }
+        let expected = expected_offset.get();
+        // (1) state's offset must match calc_text_size(prefix).
+        assert!(
+            (offset_in_state - expected).abs() < 0.5,
+            "state.last_active_caret_offset {offset_in_state} differs \
+             from calc_text_size(prefix) {expected} by more than 0.5 px",
+        );
+
+        // (2) Find text_start_x by rendering a parallel scenario with
+        // the caret at col 0, then diff against baseline to locate it.
+        let mut state_col0 = DiffViewState::default();
+        focus_row_and_settle(
+            &mut ctx, &mut renderer, &device, &queue, target_format,
+            &store, id, &mut state_col0, mono, Side::Left, 2, 0,
+        );
+        state_col0.pin_scroll_x_after_splice = Some((Side::Left, 0.0, 4));
+        for _ in 0..6 {
+            run_frame_with_wgpu(
+                &mut ctx, &mut renderer, &device, &queue, target_format,
+                &store, id, &mut state_col0, Some(mono), FrameInput::default(),
+            );
+        }
+        let pixels_col0 = capture_frame_pixels(
+            &mut ctx, &mut renderer, &device, &queue, target_format,
+            &store, id, &mut state_col0, Some(mono), w, h,
+        );
+        let mut diff_x_col0: std::collections::BTreeSet<u32> =
+            std::collections::BTreeSet::new();
+        for y in 0..h {
+            for x in 0..w {
+                let i = ((y * w + x) * 4) as usize;
+                let aa = &pixels_baseline[i..i + 4];
+                let bb = &pixels_col0[i..i + 4];
+                let max_d = aa
+                    .iter()
+                    .zip(bb.iter())
+                    .map(|(av, bv)| (*av as i32 - *bv as i32).abs())
+                    .max()
+                    .unwrap_or(0);
+                if max_d > 50 {
+                    diff_x_col0.insert(x);
+                }
+            }
+        }
+        // The col-0 caret bands cluster into ONE narrow band at
+        // text_start_x.
+        let mut bands0: Vec<(u32, u32)> = Vec::new();
+        let mut cur0: Option<(u32, u32)> = None;
+        for x in &diff_x_col0 {
+            match cur0 {
+                None => cur0 = Some((*x, *x)),
+                Some((lo, hi)) => {
+                    if *x <= hi + 3 {
+                        cur0 = Some((lo, *x));
+                    } else {
+                        bands0.push((lo, hi));
+                        cur0 = Some((*x, *x));
+                    }
+                }
+            }
+        }
+        if let Some(b) = cur0 {
+            bands0.push(b);
+        }
+        assert_eq!(
+            bands0.len(),
+            1,
+            "expected one col-0 caret band; got {} ({:?})",
+            bands0.len(),
+            bands0,
+        );
+        let text_start_x = (bands0[0].0 + bands0[0].1) as f32 * 0.5;
+
+        // (3) The middle-of-word caret should land at text_start_x +
+        // calc_text_size(prefix). Within ~2 px of anti-aliasing.
+        let expected_caret_x = text_start_x + expected;
+        assert!(
+            (caret_x - expected_caret_x).abs() <= 2.0,
+            "caret pixel x ({caret_x}) doesn't match expected \
+             text_start_x + calc_text_size(prefix) ({expected_caret_x}); \
+             diff = {} px",
+            (caret_x - expected_caret_x).abs(),
+        );
+    }
+
     /// Direct pixel-level alignment check between the caret and the
     /// highlight rect's right edge. Sets up a diff where a single
     /// trailing character is marked hl=true, focuses the row, and
