@@ -706,6 +706,16 @@ fn draw_row(
     let drag_on_this_side_past_threshold = drag_active
         .map(|(s, past)| s == side && past)
         .unwrap_or(false);
+    // Also suppress when our cross-row `state.selection` exists on this
+    // side and spans multiple rows. Without this, Ctrl+C would route
+    // through the focused row's `input_text` widget — which only knows
+    // about a single-line slice of our selection — and overwrite the
+    // multi-line text we wrote to the clipboard. Single-row selections
+    // (collapsed click point, same-row drag) leave imgui's selection
+    // alone so double-click word-select still works.
+    let multi_row_selection_on_this_side = selection.map_or(false, |s| {
+        s.side == side && s.anchor.line_no != s.caret.line_no
+    });
     let caret_pos: Cell<i32> = Cell::new(-1);
     // Filled after the callback with imgui's post-mutation selection bounds
     // (start_byte, end_byte). Read after `build()` so we know whether
@@ -773,7 +783,8 @@ fn draw_row(
                 selection_out: &caret_selection,
                 clear_selection: arrow_match,
                 seed_byte,
-                suppress_imgui_selection: drag_on_this_side_past_threshold,
+                suppress_imgui_selection: drag_on_this_side_past_threshold
+                    || multi_row_selection_on_this_side,
                 dbl_click_override,
             },
         )

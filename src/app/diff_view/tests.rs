@@ -3389,6 +3389,392 @@ mod headless_tests {
         );
     }
 
+    /// `TestClipboard` shared across frames so we can read back what was
+    /// written by Ctrl+C. Standard `TestClipboard` is moved into the
+    /// imgui context; this variant keeps the storage outside the context
+    /// so the test can inspect it.
+    #[derive(Default)]
+    struct SharedClipboard(std::sync::Arc<std::sync::Mutex<String>>);
+    impl SharedClipboard {
+        fn handle(&self) -> std::sync::Arc<std::sync::Mutex<String>> {
+            self.0.clone()
+        }
+    }
+    impl imgui::ClipboardBackend for SharedClipboard {
+        fn get(&mut self) -> Option<String> {
+            Some(self.0.lock().unwrap().clone())
+        }
+        fn set(&mut self, value: &str) {
+            *self.0.lock().unwrap() = value.to_string();
+        }
+    }
+
+    /// Ctrl+C on a multi-line cross-row selection must put the entire
+    /// multi-line text on the clipboard. Regression check for
+    /// "multiline copies only copy a single line" — imgui's input_text
+    /// widget on the press row processes Ctrl+C natively and overwrites
+    /// the clipboard with its own (single-line) selection.
+    #[test]
+    fn headless_wgpu_ctrl_c_copies_full_multiline_selection() {
+        let _guard = imgui_lock();
+        let Some((device, queue)) = try_init_wgpu() else {
+            eprintln!("skipping: no wgpu adapter available");
+            return;
+        };
+
+        let store = SessionStore::new();
+        let text = "alpha\nbeta\ngamma\ndelta\n";
+        let id = store.open_two_way(text, text, None).unwrap();
+
+        let mut ctx = imgui::Context::create();
+        ctx.io_mut().display_size = [1200.0, 800.0];
+        ctx.io_mut().delta_time = 1.0 / 60.0;
+        ctx.io_mut().config_flags |= imgui::ConfigFlags::NAV_ENABLE_KEYBOARD;
+        let clipboard = SharedClipboard::default();
+        let clip_handle = clipboard.handle();
+        ctx.set_clipboard_backend(clipboard);
+
+        let target_format = wgpu::TextureFormat::Rgba8UnormSrgb;
+        let mut renderer = imgui_wgpu::Renderer::new(
+            &mut ctx, &device, &queue,
+            imgui_wgpu::RendererConfig {
+                texture_format: target_format,
+                ..Default::default()
+            },
+        );
+
+        let mut view_state = DiffViewState::default();
+
+        // Force a multi-row drag selection via the same flow the drag
+        // tests use: press, drag, release.
+        let press_pos = [80.0, 40.0];
+        let drag_pos = [120.0, 100.0];
+        for input in [
+            FrameInput {
+                mouse_pos: Some(press_pos),
+                left_button: Some(true),
+                ..Default::default()
+            },
+            FrameInput { mouse_pos: Some(drag_pos), ..Default::default() },
+            FrameInput { mouse_pos: Some(drag_pos), ..Default::default() },
+            FrameInput { left_button: Some(false), ..Default::default() },
+        ] {
+            run_frame_with_wgpu(
+                &mut ctx, &mut renderer, &device, &queue, target_format,
+                &store, id, &mut view_state, None, input,
+            );
+        }
+        let sel = view_state.selection.as_ref().expect("drag should produce a selection");
+        eprintln!(
+            "selection: anchor=(line {}, col {}) caret=(line {}, col {})",
+            sel.anchor.line_no, sel.anchor.col, sel.caret.line_no, sel.caret.col,
+        );
+        assert!(
+            sel.caret.line_no > sel.anchor.line_no,
+            "test setup failure: drag must cross rows; got anchor {} caret {}",
+            sel.anchor.line_no, sel.caret.line_no,
+        );
+
+        // Simulate the app's Ctrl+C handler: extract our cross-row
+        // selection and write it to the clipboard via the imgui ctx.
+        let snap = store.snapshot(id).unwrap();
+        let our_text = crate::app::diff_view::extract_selection_text(&snap, sel);
+        ctx.io_mut(); // touch io so the borrow is brief
+        {
+            // Acquire a Ui to call set_clipboard_text.
+            let ui_ctx = &mut ctx;
+            let ui = ui_ctx.new_frame();
+            ui.set_clipboard_text(&our_text);
+            let _ = ui_ctx.render();
+        }
+        // Now run the render frame WITH Ctrl+C pressed. Imgui's
+        // input_text on the focused row (the press row) processes
+        // Ctrl+C natively and writes its single-line selection to the
+        // clipboard, OVERWRITING our cross-row text. That's the bug.
+        ctx.io_mut().add_key_event(imgui::Key::ModCtrl, true);
+        ctx.io_mut().add_key_event(imgui::Key::C, true);
+        run_frame_with_wgpu(
+            &mut ctx, &mut renderer, &device, &queue, target_format,
+            &store, id, &mut view_state, None, FrameInput::default(),
+        );
+        ctx.io_mut().add_key_event(imgui::Key::C, false);
+        ctx.io_mut().add_key_event(imgui::Key::ModCtrl, false);
+
+        let final_clip = clip_handle.lock().unwrap().clone();
+        eprintln!("final clipboard = {final_clip:?}");
+        assert!(
+            final_clip.contains('\n'),
+            "multi-line selection should write multi-line text to clipboard; got {final_clip:?}",
+        );
+        // The exact extracted text depends on geometry; the invariant we
+        // assert is that it spans the selection range (matches what
+        // extract_selection_text produces).
+        assert_eq!(
+            final_clip, our_text,
+            "clipboard should match our cross-row text, not imgui's single-line copy",
+        );
+    }
+
+    /// Variant: Shift+Down to extend the selection (keyboard path)
+    /// before Ctrl+C. This mirrors the workflow a user takes when
+    /// they're typing/navigating with the keyboard rather than dragging
+    /// with the mouse. The active row's `input_text` widget receives
+    /// Shift+Down → moves its caret to end of line → its selection
+    /// extends to that point. Our `state.selection` ALSO extends across
+    /// rows. On Ctrl+C, the widget would overwrite our cross-row text
+    /// with its single-line selection unless we suppress it.
+    #[test]
+    fn headless_wgpu_ctrl_c_shift_down_then_copy_keeps_multiline() {
+        let _guard = imgui_lock();
+        let Some((device, queue)) = try_init_wgpu() else {
+            eprintln!("skipping: no wgpu adapter available");
+            return;
+        };
+
+        let store = SessionStore::new();
+        let text = "alpha\nbeta\ngamma\ndelta\n";
+        let id = store.open_two_way(text, text, None).unwrap();
+
+        let mut ctx = imgui::Context::create();
+        ctx.io_mut().display_size = [1200.0, 800.0];
+        ctx.io_mut().delta_time = 1.0 / 60.0;
+        ctx.io_mut().config_flags |= imgui::ConfigFlags::NAV_ENABLE_KEYBOARD;
+        let clipboard = SharedClipboard::default();
+        let clip_handle = clipboard.handle();
+        ctx.set_clipboard_backend(clipboard);
+
+        let target_format = wgpu::TextureFormat::Rgba8UnormSrgb;
+        let mut renderer = imgui_wgpu::Renderer::new(
+            &mut ctx, &device, &queue,
+            imgui_wgpu::RendererConfig {
+                texture_format: target_format,
+                ..Default::default()
+            },
+        );
+
+        let mut view_state = DiffViewState::default();
+
+        // Click row 1 and activate its input_text (two clicks + idle).
+        let click_pos = [80.0, 40.0];
+        for input in [
+            FrameInput {
+                mouse_pos: Some(click_pos),
+                left_button: Some(true),
+                ..Default::default()
+            },
+            FrameInput { left_button: Some(false), ..Default::default() },
+            FrameInput {
+                mouse_pos: Some(click_pos),
+                left_button: Some(true),
+                ..Default::default()
+            },
+            FrameInput { left_button: Some(false), ..Default::default() },
+            FrameInput::default(),
+            FrameInput::default(),
+        ] {
+            run_frame_with_wgpu(
+                &mut ctx, &mut renderer, &device, &queue, target_format,
+                &store, id, &mut view_state, None, input,
+            );
+        }
+        assert!(
+            view_state.last_active_caret_offset.is_some(),
+            "test setup: row didn't become active after click",
+        );
+
+        // Shift+Down twice — extends state.selection across two rows.
+        for _ in 0..2 {
+            run_frame_with_wgpu(
+                &mut ctx, &mut renderer, &device, &queue, target_format,
+                &store, id, &mut view_state, None,
+                FrameInput {
+                    arrow: Some(imgui::Key::DownArrow),
+                    shift: true,
+                    ..Default::default()
+                },
+            );
+        }
+        let sel = view_state.selection.as_ref()
+            .expect("Shift+Down should create a state.selection");
+        eprintln!(
+            "after shift+down: anchor=(line {}, col {}) caret=(line {}, col {})",
+            sel.anchor.line_no, sel.anchor.col, sel.caret.line_no, sel.caret.col,
+        );
+        assert!(
+            sel.caret.line_no > sel.anchor.line_no,
+            "shift+down should cross rows: anchor {} caret {}",
+            sel.anchor.line_no, sel.caret.line_no,
+        );
+
+        // Write our cross-row text to the clipboard (mirrors what
+        // `do_copy` does in `app::mod`).
+        let snap = store.snapshot(id).unwrap();
+        let our_text = crate::app::diff_view::extract_selection_text(&snap, sel);
+        eprintln!("our extracted text = {our_text:?}");
+        {
+            let ui = ctx.new_frame();
+            ui.set_clipboard_text(&our_text);
+            let _ = ctx.render();
+        }
+
+        // Now press Ctrl+C inside the render frame. If imgui's input_text
+        // on the focused row has a selection, it will overwrite the
+        // clipboard with its single-line copy.
+        ctx.io_mut().add_key_event(imgui::Key::ModCtrl, true);
+        ctx.io_mut().add_key_event(imgui::Key::C, true);
+        run_frame_with_wgpu(
+            &mut ctx, &mut renderer, &device, &queue, target_format,
+            &store, id, &mut view_state, None, FrameInput::default(),
+        );
+        ctx.io_mut().add_key_event(imgui::Key::C, false);
+        ctx.io_mut().add_key_event(imgui::Key::ModCtrl, false);
+
+        let final_clip = clip_handle.lock().unwrap().clone();
+        eprintln!("final clipboard = {final_clip:?}");
+        assert!(
+            final_clip.contains('\n'),
+            "multi-line selection should write multi-line text to clipboard; got {final_clip:?}",
+        );
+    }
+
+    /// Scenario most likely to trigger the user's "multiline copies
+    /// only copy a single line" bug: double-click to give imgui's
+    /// input_text widget a non-collapsed single-line selection (the
+    /// clicked word), THEN Shift+Down to extend our `state.selection`
+    /// across rows. Without the multi-row suppression in the input_text
+    /// callback, Ctrl+C would write our cross-row text first, then
+    /// imgui's widget would overwrite it with the single-line word.
+    #[test]
+    fn headless_wgpu_ctrl_c_after_word_select_then_extend_keeps_multiline() {
+        let _guard = imgui_lock();
+        let Some((device, queue)) = try_init_wgpu() else {
+            eprintln!("skipping: no wgpu adapter available");
+            return;
+        };
+
+        let store = SessionStore::new();
+        let text = "alpha beta\ngamma delta\nepsilon zeta\n";
+        let id = store.open_two_way(text, text, None).unwrap();
+
+        let mut ctx = imgui::Context::create();
+        ctx.io_mut().display_size = [1200.0, 800.0];
+        ctx.io_mut().delta_time = 1.0 / 60.0;
+        ctx.io_mut().config_flags |= imgui::ConfigFlags::NAV_ENABLE_KEYBOARD;
+        let clipboard = SharedClipboard::default();
+        let clip_handle = clipboard.handle();
+        ctx.set_clipboard_backend(clipboard);
+
+        let target_format = wgpu::TextureFormat::Rgba8UnormSrgb;
+        let mut renderer = imgui_wgpu::Renderer::new(
+            &mut ctx, &device, &queue,
+            imgui_wgpu::RendererConfig {
+                texture_format: target_format,
+                ..Default::default()
+            },
+        );
+
+        let mut view_state = DiffViewState::default();
+
+        // Double-click to select "beta" (the word at x≈120 on row 1).
+        let word_pos = [120.0, 40.0];
+        for input in [
+            FrameInput {
+                mouse_pos: Some(word_pos),
+                left_button: Some(true),
+                ..Default::default()
+            },
+            FrameInput { left_button: Some(false), ..Default::default() },
+            FrameInput {
+                mouse_pos: Some(word_pos),
+                left_button: Some(true),
+                ..Default::default()
+            },
+            FrameInput { left_button: Some(false), ..Default::default() },
+            FrameInput::default(),
+            FrameInput::default(),
+        ] {
+            run_frame_with_wgpu(
+                &mut ctx, &mut renderer, &device, &queue, target_format,
+                &store, id, &mut view_state, None, input,
+            );
+        }
+        // Imgui should have selected a word.
+        let imgui_sel_before = view_state.last_active_input_selection;
+        eprintln!("imgui widget selection after double-click: {imgui_sel_before:?}");
+        assert!(
+            imgui_sel_before.is_some(),
+            "double-click should leave imgui's input_text with a word selection",
+        );
+
+        // Now Shift+Down to extend our state.selection cross-row.
+        run_frame_with_wgpu(
+            &mut ctx, &mut renderer, &device, &queue, target_format,
+            &store, id, &mut view_state, None,
+            FrameInput {
+                arrow: Some(imgui::Key::DownArrow),
+                shift: true,
+                ..Default::default()
+            },
+        );
+        let sel = view_state.selection.as_ref()
+            .expect("Shift+Down should produce a cross-row state.selection")
+            .clone();
+        assert!(
+            sel.caret.line_no > sel.anchor.line_no,
+            "state.selection should cross rows: anchor {} caret {}",
+            sel.anchor.line_no, sel.caret.line_no,
+        );
+        // One idle frame so the next draw_row sees the new (multi-row)
+        // state.selection and the suppression callback collapses imgui's
+        // widget selection.
+        run_frame_with_wgpu(
+            &mut ctx, &mut renderer, &device, &queue, target_format,
+            &store, id, &mut view_state, None, FrameInput::default(),
+        );
+        let imgui_sel_after = view_state.last_active_input_selection;
+        eprintln!("imgui widget selection after Shift+Down+idle: {imgui_sel_after:?}");
+        // INVARIANT under fix: once state.selection spans multiple rows
+        // on this side, the multi-row suppression must collapse imgui's
+        // widget selection so Ctrl+C doesn't route through it.
+        assert!(
+            imgui_sel_after.is_none(),
+            "with multi-row state.selection active, imgui's widget selection \
+             must be suppressed to prevent it from overwriting Ctrl+C output; \
+             got {imgui_sel_after:?}",
+        );
+
+        // Mirror the real app's do_copy: write the cross-row text first.
+        let snap = store.snapshot(id).unwrap();
+        let our_text = crate::app::diff_view::extract_selection_text(&snap, &sel);
+        eprintln!("our extracted text = {our_text:?}");
+        {
+            let ui = ctx.new_frame();
+            ui.set_clipboard_text(&our_text);
+            let _ = ctx.render();
+        }
+
+        // Ctrl+C. With the suppression, imgui's widget cannot overwrite.
+        ctx.io_mut().add_key_event(imgui::Key::ModCtrl, true);
+        ctx.io_mut().add_key_event(imgui::Key::C, true);
+        run_frame_with_wgpu(
+            &mut ctx, &mut renderer, &device, &queue, target_format,
+            &store, id, &mut view_state, None, FrameInput::default(),
+        );
+        ctx.io_mut().add_key_event(imgui::Key::C, false);
+        ctx.io_mut().add_key_event(imgui::Key::ModCtrl, false);
+
+        let final_clip = clip_handle.lock().unwrap().clone();
+        eprintln!("final clipboard = {final_clip:?}");
+        assert!(
+            final_clip.contains('\n'),
+            "multi-line selection should keep multi-line text on clipboard; got {final_clip:?}",
+        );
+        assert_eq!(
+            final_clip, our_text,
+            "clipboard should match our cross-row text",
+        );
+    }
+
     /// Drag selection while the pane is scrolled down. The locate /
     /// locate_clamped closures in `update_selection` previously used
     /// `pane_origin (= cursor_screen_pos = visible_top - scroll_y)` and
