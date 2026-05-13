@@ -8,7 +8,40 @@ use std::collections::HashMap;
 use imgui::Ui;
 
 use super::super::char_diff::{char_diff, left_segments, right_segments, Segment};
-use crate::diff::{DiffOp, Hunk};
+use crate::diff::{DiffOp, Hunk, SubSpan, SubSpanKind};
+
+/// Convert engine-supplied sub-line spans into renderer `Segment`s. Each
+/// `Changed` span becomes a highlighted segment and each `Same` span
+/// becomes an un-highlighted segment, using byte indices into `text`.
+fn segments_from_spans(text: &str, spans: &[SubSpan]) -> Vec<Segment> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(spans.len());
+    for s in spans {
+        let start = (s.start as usize).min(bytes.len());
+        let end = (s.end as usize).min(bytes.len()).max(start);
+        // Slicing on byte ranges may split a multibyte codepoint if the engine
+        // produced bad ranges; defensively snap to char boundaries.
+        let slice = match text.get(start..end) {
+            Some(s) => s.to_string(),
+            None => {
+                // Fall back: nearest char boundaries.
+                let s = nearest_boundary(text, start);
+                let e = nearest_boundary(text, end).max(s);
+                text[s..e].to_string()
+            }
+        };
+        out.push(Segment {
+            text: slice,
+            hl: matches!(s.kind, SubSpanKind::Changed),
+        });
+    }
+    out
+}
+
+fn nearest_boundary(s: &str, mut i: usize) -> usize {
+    while i > 0 && !s.is_char_boundary(i) { i -= 1; }
+    i
+}
 
 /// Tall enough for the 1.5x Roboto Mono used in code rows at zoom=1.0.
 pub(super) const ROW_H_BASE: f32 = 24.0;
@@ -339,29 +372,39 @@ pub(super) fn build_pane(hunks: &[Hunk], side: Side) -> Pane {
         let is_change = is_change_hunk(h);
         if is_change {
             // Pair deletes with inserts to drive character-level highlights.
-            let dels: Vec<(u32, &str)> = h
+            // Engine-supplied spans (DiffOp.spans) take precedence when present
+            // — they reflect the session's chosen sub-line granularity. Otherwise
+            // fall back to the local char_diff helper.
+            let dels: Vec<(u32, &str, Option<&Vec<SubSpan>>)> = h
                 .ops
                 .iter()
                 .filter_map(|op| match op {
-                    DiffOp::Delete { a, text, .. } => Some((*a, text.as_str())),
+                    DiffOp::Delete { a, text, spans } => Some((*a, text.as_str(), spans.as_ref())),
                     _ => None,
                 })
                 .collect();
-            let inss: Vec<(u32, &str)> = h
+            let inss: Vec<(u32, &str, Option<&Vec<SubSpan>>)> = h
                 .ops
                 .iter()
                 .filter_map(|op| match op {
-                    DiffOp::Insert { b, text, .. } => Some((*b, text.as_str())),
+                    DiffOp::Insert { b, text, spans } => Some((*b, text.as_str(), spans.as_ref())),
                     _ => None,
                 })
                 .collect();
             let n_pairs = dels.len().min(inss.len());
 
+            let segments_for = |text: &str, spans: Option<&Vec<SubSpan>>, other: &str, is_left: bool| -> Vec<Segment> {
+                if let Some(sp) = spans {
+                    return segments_from_spans(text, sp);
+                }
+                let runs = char_diff(text, other);
+                if is_left { left_segments(&runs) } else { right_segments(&runs) }
+            };
+
             match side {
                 Side::Left => {
                     for i in 0..n_pairs {
-                        let runs = char_diff(dels[i].1, inss[i].1);
-                        let segments = left_segments(&runs);
+                        let segments = segments_for(dels[i].1, dels[i].2, inss[i].1, true);
                         rows.push(Row {
                             line_no: Some(dels[i].0),
                             segments,
@@ -391,8 +434,7 @@ pub(super) fn build_pane(hunks: &[Hunk], side: Side) -> Pane {
                 }
                 Side::Right => {
                     for i in 0..n_pairs {
-                        let runs = char_diff(dels[i].1, inss[i].1);
-                        let segments = right_segments(&runs);
+                        let segments = segments_for(inss[i].1, inss[i].2, dels[i].1, false);
                         rows.push(Row {
                             line_no: Some(inss[i].0),
                             segments,
