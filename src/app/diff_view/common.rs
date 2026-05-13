@@ -671,3 +671,150 @@ pub(super) fn target_scroll(
 }
 
 // Note: build_selection_splice lives in input.rs.
+
+/// Background tint and ribbon base color for moved hunks. Returns the
+/// project theme's `PEACH` so individual call sites do not hard-code a
+/// palette pick.
+pub(super) fn move_color() -> [f32; 4] {
+    super::super::theme::PEACH
+}
+
+/// Ribbon alpha for a moved hunk, faded by the vertical distance
+/// between the two paired halves on screen.
+///
+/// Near pairs render at `RIBBON_ALPHA_NEAR` (same alpha as the
+/// existing change ribbon). Pairs separated by `RIBBON_FADE_RANGE_PX`
+/// or more clamp to `RIBBON_ALPHA_FAR`. Linear interpolation in
+/// between; negative dy is treated as |dy|.
+pub(super) fn move_ribbon_alpha(dy_px: f32) -> f32 {
+    const RIBBON_ALPHA_NEAR: f32 = 0.30;
+    const RIBBON_ALPHA_FAR: f32 = 0.08;
+    const RIBBON_FADE_RANGE_PX: f32 = 800.0;
+    let t = (dy_px.abs() / RIBBON_FADE_RANGE_PX).clamp(0.0, 1.0);
+    RIBBON_ALPHA_NEAR + (RIBBON_ALPHA_FAR - RIBBON_ALPHA_NEAR) * t
+}
+
+/// Return the `move_id` of the first non-Equal op in the hunk, or
+/// `None` for pure-Equal hunks and change hunks whose ops are
+/// untagged.
+pub(super) fn hunk_move_id(hunk: &crate::diff::Hunk) -> Option<u32> {
+    use crate::diff::DiffOp;
+    for op in &hunk.ops {
+        match op {
+            DiffOp::Delete { move_id, .. } | DiffOp::Insert { move_id, .. } => {
+                return *move_id;
+            }
+            DiffOp::Equal { .. } => continue,
+        }
+    }
+    None
+}
+
+/// Find the hunk on the opposite side that carries the same `move_id`.
+/// `my_side` is the side of the caller's hunk; the returned hunk is
+/// the one on the OTHER side. Returns `None` if no pair exists in the
+/// list.
+///
+/// Determining "which side" a hunk belongs to: a hunk's `a_range` is
+/// `(0, 0)` for an Insert-only hunk (nothing on side A) and its
+/// `b_range` is `(0, 0)` for a Delete-only hunk. Pairs cross sides:
+/// Delete-only on A pairs with Insert-only on B.
+pub(super) fn find_paired_hunk(
+    hunks: &[crate::diff::Hunk],
+    move_id: u32,
+    my_side: Side,
+) -> Option<&crate::diff::Hunk> {
+    let opposite_is_delete_only = matches!(my_side, Side::Right);
+    hunks.iter().find(|h| {
+        if hunk_move_id(h) != Some(move_id) {
+            return false;
+        }
+        let is_delete_only = h.b_range == (0, 0);
+        let is_insert_only = h.a_range == (0, 0);
+        if opposite_is_delete_only { is_delete_only } else { is_insert_only }
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::diff::{DiffOp, Hunk};
+
+    fn equal_hunk(id: u32) -> Hunk {
+        Hunk {
+            id,
+            a_range: (1, 1),
+            b_range: (1, 1),
+            ops: vec![DiffOp::Equal { a: 1, b: 1, text: "x".into() }],
+        }
+    }
+
+    fn delete_hunk(id: u32, move_id: Option<u32>) -> Hunk {
+        let op = DiffOp::Delete {
+            a: 1, text: "d".into(), spans: None, move_id,
+        };
+        Hunk { id, a_range: (1, 1), b_range: (0, 0), ops: vec![op] }
+    }
+
+    fn insert_hunk(id: u32, move_id: Option<u32>) -> Hunk {
+        let op = DiffOp::Insert {
+            b: 1, text: "i".into(), spans: None, move_id,
+        };
+        Hunk { id, a_range: (0, 0), b_range: (1, 1), ops: vec![op] }
+    }
+
+    #[test]
+    fn move_ribbon_alpha_at_zero_returns_near() {
+        assert!((move_ribbon_alpha(0.0) - 0.30).abs() < 1e-6);
+    }
+
+    #[test]
+    fn move_ribbon_alpha_at_fade_range_returns_far() {
+        assert!((move_ribbon_alpha(800.0) - 0.08).abs() < 1e-6);
+    }
+
+    #[test]
+    fn move_ribbon_alpha_clamps_above_fade_range() {
+        assert!((move_ribbon_alpha(5000.0) - 0.08).abs() < 1e-6);
+    }
+
+    #[test]
+    fn move_ribbon_alpha_clamps_below_zero() {
+        assert!((move_ribbon_alpha(-100.0) - move_ribbon_alpha(100.0)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn hunk_move_id_pure_equal_returns_none() {
+        assert_eq!(hunk_move_id(&equal_hunk(0)), None);
+    }
+
+    #[test]
+    fn hunk_move_id_untagged_change_returns_none() {
+        assert_eq!(hunk_move_id(&delete_hunk(0, None)), None);
+    }
+
+    #[test]
+    fn hunk_move_id_reads_first_change_op() {
+        assert_eq!(hunk_move_id(&delete_hunk(0, Some(7))), Some(7));
+        assert_eq!(hunk_move_id(&insert_hunk(0, Some(7))), Some(7));
+    }
+
+    #[test]
+    fn find_paired_hunk_returns_opposite_side_match() {
+        let hunks = vec![
+            delete_hunk(10, Some(0)),
+            insert_hunk(11, Some(0)),
+        ];
+        let paired = find_paired_hunk(&hunks, 0, Side::Left);
+        assert_eq!(paired.map(|h| h.id), Some(11));
+        let paired = find_paired_hunk(&hunks, 0, Side::Right);
+        assert_eq!(paired.map(|h| h.id), Some(10));
+    }
+
+    #[test]
+    fn find_paired_hunk_returns_none_for_unpaired_id() {
+        let hunks = vec![delete_hunk(10, Some(0))];
+        assert!(find_paired_hunk(&hunks, 0, Side::Left).is_none());
+        assert!(find_paired_hunk(&hunks, 99, Side::Right).is_none());
+    }
+}
