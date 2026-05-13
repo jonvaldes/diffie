@@ -64,6 +64,141 @@ pub(super) fn build_selection_splice(
     })
 }
 
+/// Build the replacement vec for splitting `buf` at a character position.
+/// Returns `[prefix, suffix]` where `prefix` is `buf` up to (exclusive)
+/// `caret_char` and `suffix` is the rest. `caret_char` is a 0-based
+/// character index (not a byte offset) — UTF-8 multi-byte chars count
+/// as one position each.
+pub(super) fn compute_enter_split(buf: &str, caret_char: usize) -> Vec<String> {
+    let total = buf.chars().count();
+    let caret_char = caret_char.min(total);
+    let prefix: String = buf.chars().take(caret_char).collect();
+    let suffix: String = buf.chars().skip(caret_char).collect();
+    vec![prefix, suffix]
+}
+
+/// Build the replacement vec for inserting multi-line `paste` text at
+/// `caret_char` in `buf`. Always returns at least one line. For paste
+/// text without any `'\n'` the result is a single-line vec with `paste`
+/// inserted in place. For N lines in `paste`, returns N replacement
+/// lines: `[prefix + paste_line_0, paste_line_1, ..., paste_line_{N-1}
+/// + suffix]`.
+pub(super) fn compute_paste_split(buf: &str, caret_char: usize, paste: &str) -> Vec<String> {
+    let total = buf.chars().count();
+    let caret_char = caret_char.min(total);
+    let prefix: String = buf.chars().take(caret_char).collect();
+    let suffix: String = buf.chars().skip(caret_char).collect();
+    let lines: Vec<&str> = paste.split('\n').collect();
+    if lines.len() == 1 {
+        return vec![format!("{prefix}{paste}{suffix}")];
+    }
+    let mut out: Vec<String> = Vec::with_capacity(lines.len());
+    out.push(format!("{prefix}{}", lines[0]));
+    for line in &lines[1..lines.len() - 1] {
+        out.push((*line).to_string());
+    }
+    out.push(format!("{}{suffix}", lines[lines.len() - 1]));
+    out
+}
+
+#[cfg(test)]
+mod splice_helper_tests {
+    use super::{compute_enter_split, compute_paste_split};
+
+    #[test]
+    fn enter_at_zero_produces_empty_prefix() {
+        assert_eq!(
+            compute_enter_split("abc", 0),
+            vec![String::new(), "abc".to_string()],
+        );
+    }
+
+    #[test]
+    fn enter_in_middle_splits_around_caret() {
+        assert_eq!(
+            compute_enter_split("abc", 1),
+            vec!["a".to_string(), "bc".to_string()],
+        );
+    }
+
+    #[test]
+    fn enter_at_end_produces_empty_suffix() {
+        assert_eq!(
+            compute_enter_split("abc", 3),
+            vec!["abc".to_string(), String::new()],
+        );
+    }
+
+    #[test]
+    fn enter_clamps_past_end() {
+        assert_eq!(
+            compute_enter_split("abc", 99),
+            vec!["abc".to_string(), String::new()],
+        );
+    }
+
+    #[test]
+    fn enter_splits_by_chars_not_bytes_for_multibyte() {
+        // "αβγ" = 3 chars, 6 bytes. Caret_char=2 splits to "αβ" / "γ".
+        assert_eq!(
+            compute_enter_split("αβγ", 2),
+            vec!["αβ".to_string(), "γ".to_string()],
+        );
+    }
+
+    #[test]
+    fn paste_with_no_newline_inserts_inline() {
+        assert_eq!(
+            compute_paste_split("abc", 1, "X"),
+            vec!["aXbc".to_string()],
+        );
+    }
+
+    #[test]
+    fn paste_two_line_at_zero_attaches_suffix_to_last_line() {
+        assert_eq!(
+            compute_paste_split("xyz", 0, "foo\nbar"),
+            vec!["foo".to_string(), "barxyz".to_string()],
+        );
+    }
+
+    #[test]
+    fn paste_two_line_at_end_attaches_prefix_to_first_line() {
+        assert_eq!(
+            compute_paste_split("xyz", 3, "foo\nbar"),
+            vec!["xyzfoo".to_string(), "bar".to_string()],
+        );
+    }
+
+    #[test]
+    fn paste_three_line_middles_pass_through() {
+        assert_eq!(
+            compute_paste_split("xyz", 1, "a\nb\nc"),
+            vec!["xa".to_string(), "b".to_string(), "cyz".to_string()],
+        );
+    }
+
+    #[test]
+    fn paste_trailing_newline_produces_trailing_empty_line() {
+        // "foo\n" splits into ["foo", ""]. The trailing empty line carries
+        // the suffix.
+        assert_eq!(
+            compute_paste_split("xyz", 1, "foo\n"),
+            vec!["xfoo".to_string(), "yz".to_string()],
+        );
+    }
+
+    #[test]
+    fn paste_splits_by_chars_not_bytes_for_multibyte() {
+        // Buf "αβγ" (3 chars). Caret_char=2 between β and γ. Paste "δ\nε".
+        // Expected: ["αβδ", "εγ"].
+        assert_eq!(
+            compute_paste_split("αβγ", 2, "δ\nε"),
+            vec!["αβδ".to_string(), "εγ".to_string()],
+        );
+    }
+}
+
 /// Single owner of the selection state machine. Reads frame-global mouse
 /// events plus the captured pane geometry and decides what `state.selection`
 /// and `state.drag` look like at the end of this frame.

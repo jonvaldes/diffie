@@ -14,6 +14,7 @@ use super::super::char_diff::Segment;
 use super::super::syntax::LineSpans;
 use super::super::theme;
 use super::super::undo_stack::DiffEdit;
+use super::input::{compute_enter_split, compute_paste_split};
 use crate::diff::{Anchor, Hunk};
 use crate::session::{SessionId, TwoWaySide};
 
@@ -744,6 +745,17 @@ fn draw_row(
             self.selection_out.set(Some((sel.start, sel.end)));
         }
     }
+    // Capture clipboard text BEFORE the widget builds. Imgui's
+    // input_text is single-line, so Ctrl+V strips newlines from the
+    // clipboard and inserts the rest. If the user pasted multi-line
+    // text we'll detect that after the build and emit a multi-line
+    // splice ourselves instead of letting the stripped insert stand.
+    let ctrl_v_active = ui.io().key_ctrl && ui.is_key_pressed(imgui::Key::V);
+    let pending_paste: Option<String> = if ctrl_v_active {
+        ui.clipboard_text().filter(|s| s.contains('\n'))
+    } else {
+        None
+    };
     let changed = ui
         .input_text(input_id, &mut buf)
         // imgui's input_text has its own per-char undo stack on Ctrl+Z. If
@@ -912,10 +924,58 @@ fn draw_row(
         caret_offset_out.set(Some((side, caret_offset)));
     }
 
+    // Enter / multi-line paste: imgui's input_text is single-line, so
+    // Enter is a no-op and Ctrl+V strips newlines. Detect both and
+    // emit a `SpliceTwoWayLines` that produces the correct multi-line
+    // result. The standard `SetTwoWayLine` emit below is skipped when
+    // a splice fires.
+    // Enter on a single-line `input_text` deactivates the widget the
+    // same frame it's pressed, so `input_active` is already false here.
+    // `is_item_deactivated()` catches the just-deactivated row.
+    let just_deactivated = ui.is_item_deactivated();
+    let enter_pressed = ui.is_key_pressed(imgui::Key::Enter)
+        && (input_active || just_deactivated);
+    // Only the row whose input_text actually received the key event
+    // emits a splice; otherwise BOTH panes' rows for this line would
+    // compete for `line_remove` and the wrong-side splice could win.
+    let paste_target = input_active.then_some(pending_paste).flatten();
+    let mut emit_splice: Option<Vec<String>> = None;
+    if enter_pressed {
+        // Imgui ignored Enter — `buf` and `caret_pos` are unchanged.
+        let caret_byte = (caret_pos.get().max(0) as usize).min(buf.len());
+        let caret_char = buf[..caret_byte].chars().count();
+        emit_splice = Some(compute_enter_split(&buf, caret_char));
+    } else if let Some(paste) = paste_target {
+        // Imgui already inserted the newline-stripped paste at the caret.
+        // Reconstruct the original (pre-paste) line by removing the
+        // inserted slice, then re-split with the un-stripped clipboard.
+        let caret_byte = (caret_pos.get().max(0) as usize).min(buf.len());
+        let caret_char_end = buf[..caret_byte].chars().count();
+        let stripped_chars = paste.chars().filter(|c| *c != '\n').count();
+        let paste_start_char = caret_char_end.saturating_sub(stripped_chars);
+        let prefix: String = buf.chars().take(paste_start_char).collect();
+        let suffix: String = buf.chars().skip(caret_char_end).collect();
+        let original = format!("{prefix}{suffix}");
+        emit_splice = Some(compute_paste_split(&original, paste_start_char, &paste));
+    }
+    if let (Some(replacement), Some(ln)) = (emit_splice, row.line_no) {
+        let two_way_side = match side {
+            Side::Left => TwoWaySide::A,
+            Side::Right => TwoWaySide::B,
+        };
+        let line_idx = (ln as usize).saturating_sub(1);
+        line_remove.set(Some(DiffEdit::SpliceTwoWayLines {
+            session_id,
+            side: two_way_side,
+            start: line_idx,
+            end: line_idx + 1,
+            replacement,
+            old_target_lines: None,
+        }));
     // Live commit: any change pushes a `SetTwoWayLine` onto the undo stack,
     // and the next frame's diff reflects it. Equivalent edits on the same
     // line coalesce via `DiffEdit::merge` so the undo stack stays compact.
-    if changed {
+    } else if changed {
         if let Some(ln) = row.line_no {
             let two_way_side = match side {
                 Side::Left => TwoWaySide::A,

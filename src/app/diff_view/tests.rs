@@ -767,8 +767,20 @@ mod headless_tests {
             ctx.io_mut().add_key_event(imgui::Key::ModShift, false);
         }
 
+        // Mirror the real app's epoch bump: any non-SetTwoWayLine edit
+        // (e.g. SpliceTwoWayLines) invalidates the active row's imgui
+        // input_text internal state, so we bump input_epoch to force a
+        // fresh widget ID. Without this, imgui's stale stb buffer writes
+        // back across frames and pushes spurious SetTwoWayLines.
+        let mut needs_epoch_bump = false;
         for edit in pending_edits {
+            if !matches!(edit, DiffEdit::SetTwoWayLine { .. }) {
+                needs_epoch_bump = true;
+            }
             apply_edit(store, edit);
+        }
+        if needs_epoch_bump {
+            view_state.input_epoch = view_state.input_epoch.wrapping_add(1);
         }
     }
 
@@ -3145,6 +3157,235 @@ mod headless_tests {
             sel.caret.line_no > sel.anchor.line_no,
             "drag on change rows should cross rows: anchor {} caret {}",
             sel.anchor.line_no, sel.caret.line_no,
+        );
+    }
+
+    /// Test-only `ClipboardBackend` that returns a canned string. Used by
+    /// the multi-line paste test so Ctrl+V has a defined clipboard payload
+    /// without depending on the platform clipboard.
+    struct TestClipboard {
+        text: String,
+    }
+    impl imgui::ClipboardBackend for TestClipboard {
+        fn get(&mut self) -> Option<String> {
+            Some(self.text.clone())
+        }
+        fn set(&mut self, value: &str) {
+            self.text = value.to_string();
+        }
+    }
+
+    /// Pressing Enter inside a focused row splits the row at the caret
+    /// into two source lines.
+    #[test]
+    fn headless_wgpu_enter_splits_line_at_caret() {
+        let _guard = imgui_lock();
+        let Some((device, queue)) = try_init_wgpu() else {
+            eprintln!("skipping: no wgpu adapter available");
+            return;
+        };
+
+        let store = SessionStore::new();
+        // Single line "alpha". Caret will be placed via click at column ~2.
+        let text = "alpha\n";
+        let id = store.open_two_way(text, text, None).unwrap();
+
+        let mut ctx = imgui::Context::create();
+        ctx.io_mut().display_size = [1200.0, 800.0];
+        ctx.io_mut().delta_time = 1.0 / 60.0;
+        ctx.io_mut().config_flags |= imgui::ConfigFlags::NAV_ENABLE_KEYBOARD;
+
+        let target_format = wgpu::TextureFormat::Rgba8UnormSrgb;
+        let mut renderer = imgui_wgpu::Renderer::new(
+            &mut ctx, &device, &queue,
+            imgui_wgpu::RendererConfig {
+                texture_format: target_format,
+                ..Default::default()
+            },
+        );
+
+        let mut view_state = DiffViewState::default();
+
+        // Click between 'a' and 'l' in "alpha" to focus the row's
+        // input_text. Chars start at x≈68; char_w≈7. Caret between char 1
+        // and 2 → x≈82. Imgui's input_text activation in the headless
+        // harness needs two press+release cycles plus idle frames, same
+        // pattern as the existing double-click test.
+        let click_pos = [82.0, 40.0];
+        for input in [
+            FrameInput {
+                mouse_pos: Some(click_pos),
+                left_button: Some(true),
+                ..Default::default()
+            },
+            FrameInput { left_button: Some(false), ..Default::default() },
+            FrameInput {
+                mouse_pos: Some(click_pos),
+                left_button: Some(true),
+                ..Default::default()
+            },
+            FrameInput { left_button: Some(false), ..Default::default() },
+            FrameInput::default(),
+            FrameInput::default(),
+        ] {
+            run_frame_with_wgpu(
+                &mut ctx, &mut renderer, &device, &queue, target_format,
+                &store, id, &mut view_state, None, input,
+            );
+        }
+        eprintln!(
+            "pre-enter: last_active_caret_offset = {:?}",
+            view_state.last_active_caret_offset,
+        );
+        assert!(
+            view_state.last_active_caret_offset.is_some(),
+            "test setup failure: row didn't become active after click",
+        );
+
+        // Press Enter. Queue the event AND re-push the mouse position so
+        // imgui doesn't drop the widget's active state on this frame.
+        ctx.io_mut().add_key_event(imgui::Key::Enter, true);
+        ctx.io_mut().add_mouse_pos_event(click_pos);
+        run_frame_with_wgpu(
+            &mut ctx, &mut renderer, &device, &queue, target_format,
+            &store, id, &mut view_state, None, FrameInput::default(),
+        );
+        ctx.io_mut().add_key_event(imgui::Key::Enter, false);
+        // Idle frame so the queued splice edit is applied to the session.
+        run_frame_with_wgpu(
+            &mut ctx, &mut renderer, &device, &queue, target_format,
+            &store, id, &mut view_state, None, FrameInput::default(),
+        );
+
+        let snap = store.snapshot(id).unwrap();
+        let a_lines = match snap.mode {
+            SessionMode::TwoWay { a_lines, .. } => a_lines,
+            _ => panic!("expected two-way"),
+        };
+        eprintln!("after enter: a_lines = {a_lines:?}");
+        // The split point depends on where the click landed (col 1, 2, or 3
+        // depending on hit precision). The invariant we assert: the single
+        // input line became TWO lines, and joining them with "" yields the
+        // original text "alpha".
+        assert_eq!(a_lines.len(), 2, "Enter should split the line into two");
+        assert_eq!(
+            format!("{}{}", a_lines[0], a_lines[1]),
+            "alpha",
+            "the two halves concatenated must equal the original line",
+        );
+        // The exact column depends on imgui's caret placement after the
+        // double-click that activates the widget; the invariant we care
+        // about is "split at some char boundary in/after the line".
+    }
+
+    /// Pasting multi-line text inserts one extra source line per `\n` in
+    /// the clipboard. The first line of the paste attaches to the prefix
+    /// of the caret row; the last line attaches to the suffix.
+    #[test]
+    fn headless_wgpu_multiline_paste_splits_into_lines() {
+        let _guard = imgui_lock();
+        let Some((device, queue)) = try_init_wgpu() else {
+            eprintln!("skipping: no wgpu adapter available");
+            return;
+        };
+
+        let store = SessionStore::new();
+        // Single line "xyz". Paste "foo\nbar" at the start (col 0) →
+        // result should be ["foo", "barxyz"].
+        let text = "xyz\n";
+        let id = store.open_two_way(text, text, None).unwrap();
+
+        let mut ctx = imgui::Context::create();
+        ctx.io_mut().display_size = [1200.0, 800.0];
+        ctx.io_mut().delta_time = 1.0 / 60.0;
+        ctx.io_mut().config_flags |= imgui::ConfigFlags::NAV_ENABLE_KEYBOARD;
+        ctx.set_clipboard_backend(TestClipboard {
+            text: "foo\nbar".into(),
+        });
+
+        let target_format = wgpu::TextureFormat::Rgba8UnormSrgb;
+        let mut renderer = imgui_wgpu::Renderer::new(
+            &mut ctx, &device, &queue,
+            imgui_wgpu::RendererConfig {
+                texture_format: target_format,
+                ..Default::default()
+            },
+        );
+
+        let mut view_state = DiffViewState::default();
+
+        // Double-click on "xyz" to activate the row's input_text. (Single
+        // click doesn't reliably activate the widget in the headless
+        // harness — same constraint as the Enter test above.) The
+        // double-click selects "xyz" and places the caret at end-of-word;
+        // Ctrl+V then replaces the selection with the pasted content.
+        let click_pos = [82.0, 40.0];
+        for input in [
+            FrameInput {
+                mouse_pos: Some(click_pos),
+                left_button: Some(true),
+                ..Default::default()
+            },
+            FrameInput { left_button: Some(false), ..Default::default() },
+            FrameInput {
+                mouse_pos: Some(click_pos),
+                left_button: Some(true),
+                ..Default::default()
+            },
+            FrameInput { left_button: Some(false), ..Default::default() },
+            FrameInput::default(),
+            FrameInput::default(),
+        ] {
+            run_frame_with_wgpu(
+                &mut ctx, &mut renderer, &device, &queue, target_format,
+                &store, id, &mut view_state, None, input,
+            );
+        }
+        assert!(
+            view_state.last_active_caret_offset.is_some(),
+            "test setup failure: row didn't become active after click",
+        );
+
+        // Synthesize Ctrl+V. Re-push the mouse pos so the widget stays
+        // active through the key-event frame.
+        ctx.io_mut().add_key_event(imgui::Key::ModCtrl, true);
+        ctx.io_mut().add_key_event(imgui::Key::V, true);
+        ctx.io_mut().add_mouse_pos_event(click_pos);
+        run_frame_with_wgpu(
+            &mut ctx, &mut renderer, &device, &queue, target_format,
+            &store, id, &mut view_state, None, FrameInput::default(),
+        );
+        ctx.io_mut().add_key_event(imgui::Key::V, false);
+        ctx.io_mut().add_key_event(imgui::Key::ModCtrl, false);
+        // Idle frame so the splice edit is applied.
+        run_frame_with_wgpu(
+            &mut ctx, &mut renderer, &device, &queue, target_format,
+            &store, id, &mut view_state, None, FrameInput::default(),
+        );
+
+        let snap = store.snapshot(id).unwrap();
+        let a_lines = match snap.mode {
+            SessionMode::TwoWay { a_lines, .. } => a_lines,
+            _ => panic!("expected two-way"),
+        };
+        eprintln!("after paste: a_lines = {a_lines:?}");
+        assert_eq!(a_lines.len(), 2, "paste of \"foo\\nbar\" should produce 2 lines");
+        // The double-click prior to Ctrl+V selects the row's word, so the
+        // paste replaces that selection. The invariant the test checks:
+        // the source line got split into a vec carrying the paste lines
+        // (first line ends with the first paste line, last line starts
+        // with the last paste line). The exact preserved prefix/suffix
+        // depends on imgui's caret/selection state after the activation
+        // double-click.
+        assert!(
+            a_lines[0].ends_with("foo"),
+            "first replacement line should end with the first paste line; got {:?}",
+            a_lines[0],
+        );
+        assert!(
+            a_lines[1].starts_with("bar"),
+            "last replacement line should start with the last paste line; got {:?}",
+            a_lines[1],
         );
     }
 
