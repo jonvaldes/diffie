@@ -154,15 +154,49 @@ fn whitespace_ignore_trailing_eol_folds_crlf() {
 }
 
 #[test]
-fn engines_with_supports_moves_false_emit_no_move_tag() {
-    // Sanity check on the capability matrix: no initial engine claims moves,
-    // and DiffOp has no Moved variant yet, so nothing to assert beyond the
-    // capability declaration itself.
+fn capability_matrix_matches_expectations() {
+    use std::collections::HashMap;
+    let expected: HashMap<&str, bool> = [
+        ("myers", false),
+        ("patience", false),
+        ("histogram", true),
+    ]
+    .into_iter()
+    .collect();
     for (name, caps) in available_engines() {
+        let want = *expected
+            .get(name.as_str())
+            .unwrap_or_else(|| panic!("unexpected engine in registry: {name}"));
         assert_eq!(
             caps,
-            EngineCapabilities { supports_moves: false },
-            "engine={name}: unexpected capabilities"
+            EngineCapabilities { supports_moves: want },
+            "engine={name}"
         );
+    }
+}
+
+#[test]
+fn engines_without_move_capability_never_emit_move_ids() {
+    use crate::diff::DiffOp;
+    let a = ["alpha", "beta", "gamma", "delta"];
+    let b = ["delta", "gamma", "beta", "alpha"];
+    let opts = DiffOptions {
+        detect_moves: true,
+        move_min_lines: 1,
+        ..DiffOptions::default()
+    };
+    for (name, caps) in available_engines() {
+        if caps.supports_moves {
+            continue;
+        }
+        let engine = build_engine(&name).expect("registered engine");
+        let ops = engine.diff(&a, &b, &opts);
+        for op in &ops {
+            let mid = match op {
+                DiffOp::Delete { move_id, .. } | DiffOp::Insert { move_id, .. } => *move_id,
+                _ => None,
+            };
+            assert_eq!(mid, None, "engine={name} emitted move_id={mid:?}");
+        }
     }
 }

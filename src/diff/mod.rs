@@ -168,7 +168,7 @@ impl EngineRegistry {
                 },
                 EngineEntry {
                     name: "histogram",
-                    capabilities: EngineCapabilities::default(),
+                    capabilities: EngineCapabilities { supports_moves: true },
                     factory: || Box::new(histogram::HistogramDiff),
                 },
             ],

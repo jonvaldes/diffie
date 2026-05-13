@@ -11,6 +11,10 @@ pub struct HistogramDiff;
 impl DiffEngine for HistogramDiff {
     fn name(&self) -> &'static str { "histogram" }
 
+    fn capabilities(&self) -> super::EngineCapabilities {
+        super::EngineCapabilities { supports_moves: true }
+    }
+
     fn diff(&self, a: &[&str], b: &[&str], opts: &DiffOptions) -> Vec<DiffOp> {
         if matches!(opts.whitespace, Whitespace::None) {
             run_histogram(a, b)
