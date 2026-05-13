@@ -86,6 +86,8 @@ pub(super) fn update_selection(
     right_origin: [f32; 2],
     left_visible_h: f32,
     right_visible_h: f32,
+    left_scroll_y: f32,
+    right_scroll_y: f32,
     pane_w: f32,
     char_w: f32,
     focus_request: &mut Option<crate::app::FocusedPane>,
@@ -96,10 +98,22 @@ pub(super) fn update_selection(
         return;
     }
 
-    let pane_bounds = |side: Side| -> ([f32; 2], f32) {
+    // `origin` is `cursor_screen_pos` captured INSIDE the child window —
+    // i.e. the SCREEN y of content row 0 after scroll has been applied.
+    // When scrolled by `scroll_y`, content row 0 sits at `screen_top -
+    // scroll_y` (potentially off-screen above the visible band). The
+    // visible band in screen coords is therefore
+    // `[origin[1] + scroll_y, origin[1] + scroll_y + visible_h]`.
+    //
+    // Previously this code used `[origin[1], origin[1] + visible_h]` as
+    // the band, which is correct at scroll_y = 0 but rejects (or pins)
+    // mouse positions in the lower `scroll_y` pixels of the visible
+    // area once scrolled — drag selection then collapsed to the press
+    // row.
+    let pane_bounds = |side: Side| -> ([f32; 2], f32, f32) {
         match side {
-            Side::Left => (left_origin, left_visible_h),
-            Side::Right => (right_origin, right_visible_h),
+            Side::Left => (left_origin, left_visible_h, left_scroll_y),
+            Side::Right => (right_origin, right_visible_h, right_scroll_y),
         }
     };
     let rows_for = |side: Side| -> &[Row] {
@@ -112,10 +126,12 @@ pub(super) fn update_selection(
     // Strict hit-test for the initial press.
     let locate = |pos: [f32; 2]| -> Option<(input::Side, input::SelPoint)> {
         for side in [Side::Left, Side::Right] {
-            let (origin, visible_h) = pane_bounds(side);
+            let (origin, visible_h, scroll_y) = pane_bounds(side);
             if pos[0] < origin[0] || pos[0] >= origin[0] + pane_w { continue; }
+            let visible_top = origin[1] + scroll_y;
+            let visible_bot = visible_top + visible_h;
+            if pos[1] < visible_top || pos[1] >= visible_bot { continue; }
             let dy = pos[1] - origin[1];
-            if dy < 0.0 || dy >= visible_h { continue; }
             let rows = rows_for(side);
             let row_idx = (dy / row_h()) as usize;
             if row_idx >= rows.len() { continue; }
@@ -135,15 +151,15 @@ pub(super) fn update_selection(
     // row/column on the active side.
     let locate_clamped = |side: input::Side, pos: [f32; 2]| -> Option<input::SelPoint> {
         let side = side_from_input(side);
-        let (origin, visible_h) = pane_bounds(side);
+        let (origin, visible_h, scroll_y) = pane_bounds(side);
         let rows = rows_for(side);
         if rows.is_empty() {
             return None;
         }
+        let visible_top = origin[1] + scroll_y;
+        let visible_bot = visible_top + visible_h - 1.0;
         let clamped_x = pos[0].clamp(origin[0] + gutter_w(), origin[0] + pane_w - 1.0);
-        let clamped_y = pos[1]
-            .clamp(origin[1], origin[1] + visible_h - 1.0)
-            .max(origin[1]);
+        let clamped_y = pos[1].clamp(visible_top, visible_bot);
         let row_idx = ((clamped_y - origin[1]) / row_h()) as usize;
         let row_idx = row_idx.min(rows.len() - 1);
         let row = &rows[row_idx];

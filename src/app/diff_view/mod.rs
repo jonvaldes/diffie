@@ -603,6 +603,8 @@ pub fn render(
         right_origin.get(),
         left_visible.get(),
         right_visible.get(),
+        left_scroll.get(),
+        right_scroll.get(),
         pane_w,
         char_w_cell.get(),
         focus_request,

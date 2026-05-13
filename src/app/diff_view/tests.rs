@@ -2956,6 +2956,320 @@ mod headless_tests {
         );
         assert!(view_state.pin_scroll_x_after_splice.is_none());
     }
+
+    /// Press LMB at row 1, drag with button held to row 3, release. The
+    /// resulting `state.selection` must have anchor on line 1 and caret on
+    /// or past line 3 — i.e. a multi-row drag selection actually crosses
+    /// rows instead of collapsing to a single line.
+    ///
+    /// Regression check: "multi-line text selection by dragging with the
+    /// mouse is broken" — the failure mode is `state.selection` either
+    /// being `None` after release or having `anchor.line_no == caret.line_no`
+    /// (collapsed at the press row) despite the cursor moving across rows.
+    #[test]
+    fn headless_wgpu_multiline_drag_extends_selection() {
+        let _guard = imgui_lock();
+        let Some((device, queue)) = try_init_wgpu() else {
+            eprintln!("skipping: no wgpu adapter available");
+            return;
+        };
+
+        let store = SessionStore::new();
+        let text = "alpha\nbeta\ngamma\ndelta\n";
+        let id = store.open_two_way(text, text, None).unwrap();
+
+        let mut ctx = imgui::Context::create();
+        ctx.io_mut().display_size = [1200.0, 800.0];
+        ctx.io_mut().delta_time = 1.0 / 60.0;
+        ctx.io_mut().config_flags |= imgui::ConfigFlags::NAV_ENABLE_KEYBOARD;
+
+        let target_format = wgpu::TextureFormat::Rgba8UnormSrgb;
+        let mut renderer = imgui_wgpu::Renderer::new(
+            &mut ctx,
+            &device,
+            &queue,
+            imgui_wgpu::RendererConfig {
+                texture_format: target_format,
+                ..Default::default()
+            },
+        );
+
+        let mut view_state = DiffViewState::default();
+
+        // Calibration mirrors the double-click test: chars start at x ≈ 68;
+        // row_h ≈ 24; the first pane row sits around y ≈ 33.
+        // Press inside row 1; drag down across at least two row heights so
+        // the caret lands on row 3 or later.
+        let press_pos = [80.0, 40.0];
+        let drag_pos = [120.0, 100.0];
+
+        // Frame 1: press inside the left pane.
+        run_frame_with_wgpu(
+            &mut ctx, &mut renderer, &device, &queue, target_format,
+            &store, id, &mut view_state, None,
+            FrameInput {
+                mouse_pos: Some(press_pos),
+                left_button: Some(true),
+                ..Default::default()
+            },
+        );
+
+        // Frame 2: move with button still held (no new button event).
+        run_frame_with_wgpu(
+            &mut ctx, &mut renderer, &device, &queue, target_format,
+            &store, id, &mut view_state, None,
+            FrameInput {
+                mouse_pos: Some(drag_pos),
+                ..Default::default()
+            },
+        );
+
+        // Frame 3: a second frame at the drag target lets the threshold
+        // logic settle and the caret update propagate.
+        run_frame_with_wgpu(
+            &mut ctx, &mut renderer, &device, &queue, target_format,
+            &store, id, &mut view_state, None,
+            FrameInput {
+                mouse_pos: Some(drag_pos),
+                ..Default::default()
+            },
+        );
+
+        // Frame 4: release.
+        run_frame_with_wgpu(
+            &mut ctx, &mut renderer, &device, &queue, target_format,
+            &store, id, &mut view_state, None,
+            FrameInput {
+                left_button: Some(false),
+                ..Default::default()
+            },
+        );
+
+        let sel = view_state
+            .selection
+            .as_ref()
+            .expect("multi-line drag should produce a selection");
+        assert_eq!(sel.side, Side::Left);
+        let anchor_line = sel.anchor.line_no;
+        let caret_line = sel.caret.line_no;
+        // Print the actual values for diagnostic purposes; assertions below
+        // pin the cross-row invariant without locking exact line numbers
+        // (precise geometry depends on font metrics in the headless context).
+        eprintln!(
+            "drag selection: anchor=(line {}, col {}), caret=(line {}, col {})",
+            anchor_line, sel.anchor.col, caret_line, sel.caret.col,
+        );
+        assert!(
+            caret_line > anchor_line,
+            "drag should cross rows: anchor line {anchor_line}, caret line {caret_line}",
+        );
+
+        // The extracted selection text must span multiple lines.
+        let snap = store.snapshot(id).unwrap();
+        let text = crate::app::diff_view::extract_selection_text(&snap, sel);
+        eprintln!("selection text = {text:?}");
+        assert!(
+            text.contains('\n'),
+            "multi-line selection text should contain a newline, got {text:?}",
+        );
+    }
+
+    /// Same as the equal-text drag test, but on a 2-way diff where the
+    /// rows live inside a change hunk that has a hover overlay panel.
+    /// Verifies that the overlay panel doesn't swallow the press or the
+    /// subsequent drag events.
+    #[test]
+    fn headless_wgpu_multiline_drag_works_on_change_rows() {
+        let _guard = imgui_lock();
+        let Some((device, queue)) = try_init_wgpu() else {
+            eprintln!("skipping: no wgpu adapter available");
+            return;
+        };
+
+        let store = SessionStore::new();
+        // Both files have the same 4-line shape so all lines align as a
+        // single Equal hunk on one side, but we force a Delete hunk on the
+        // other so the rendered rows are change rows with a hover overlay.
+        let a_text = "alpha\nbeta\ngamma\ndelta\n";
+        let b_text = "ALPHA\nBETA\nGAMMA\nDELTA\n";
+        let id = store.open_two_way(a_text, b_text, None).unwrap();
+
+        let mut ctx = imgui::Context::create();
+        ctx.io_mut().display_size = [1200.0, 800.0];
+        ctx.io_mut().delta_time = 1.0 / 60.0;
+        ctx.io_mut().config_flags |= imgui::ConfigFlags::NAV_ENABLE_KEYBOARD;
+
+        let target_format = wgpu::TextureFormat::Rgba8UnormSrgb;
+        let mut renderer = imgui_wgpu::Renderer::new(
+            &mut ctx, &device, &queue,
+            imgui_wgpu::RendererConfig {
+                texture_format: target_format,
+                ..Default::default()
+            },
+        );
+
+        let mut view_state = DiffViewState::default();
+
+        // Press well to the right of the panel's small_button hit boxes,
+        // so the hover overlay can't swallow the click. The panel sits at
+        // x in [pane_x+4, pane_x+4+200] roughly; pressing at x=300
+        // is well inside the row text but outside the button hit area.
+        let press_pos = [300.0, 40.0];
+        let drag_pos = [320.0, 100.0];
+
+        for input in [
+            FrameInput {
+                mouse_pos: Some(press_pos),
+                left_button: Some(true),
+                ..Default::default()
+            },
+            FrameInput { mouse_pos: Some(drag_pos), ..Default::default() },
+            FrameInput { mouse_pos: Some(drag_pos), ..Default::default() },
+            FrameInput { left_button: Some(false), ..Default::default() },
+        ] {
+            run_frame_with_wgpu(
+                &mut ctx, &mut renderer, &device, &queue, target_format,
+                &store, id, &mut view_state, None, input,
+            );
+        }
+
+        let sel = view_state
+            .selection
+            .as_ref()
+            .expect("multi-line drag on change rows should produce a selection");
+        eprintln!(
+            "drag on change rows: side={:?} anchor=({}, {}) caret=({}, {})",
+            sel.side, sel.anchor.line_no, sel.anchor.col, sel.caret.line_no, sel.caret.col,
+        );
+        assert!(
+            sel.caret.line_no > sel.anchor.line_no,
+            "drag on change rows should cross rows: anchor {} caret {}",
+            sel.anchor.line_no, sel.caret.line_no,
+        );
+    }
+
+    /// Drag selection while the pane is scrolled down. The locate /
+    /// locate_clamped closures in `update_selection` previously used
+    /// `pane_origin (= cursor_screen_pos = visible_top - scroll_y)` and
+    /// `visible_h` to bound mouse positions, which works at scroll_y=0
+    /// but rejects (or pins) anything in the lower half of the visible
+    /// band once the pane is scrolled — so drag selection collapses to
+    /// the press row.
+    ///
+    /// Reproduction: open a long file, scroll down ~10 rows via
+    /// `state.pending_left`, then press near the top of the visible
+    /// area and drag down to the bottom. The selection must cross
+    /// rows; before the fix it stays on a single row.
+    #[test]
+    fn headless_wgpu_multiline_drag_works_while_scrolled() {
+        let _guard = imgui_lock();
+        let Some((device, queue)) = try_init_wgpu() else {
+            eprintln!("skipping: no wgpu adapter available");
+            return;
+        };
+
+        // 40 lines so there's plenty of content to scroll past.
+        let mut lines = String::new();
+        for i in 1..=40u32 {
+            lines.push_str(&format!("line{i:02}\n"));
+        }
+        let store = SessionStore::new();
+        let id = store.open_two_way(&lines, &lines, None).unwrap();
+
+        let mut ctx = imgui::Context::create();
+        ctx.io_mut().display_size = [1200.0, 800.0];
+        ctx.io_mut().delta_time = 1.0 / 60.0;
+        ctx.io_mut().config_flags |= imgui::ConfigFlags::NAV_ENABLE_KEYBOARD;
+
+        let target_format = wgpu::TextureFormat::Rgba8UnormSrgb;
+        let mut renderer = imgui_wgpu::Renderer::new(
+            &mut ctx, &device, &queue,
+            imgui_wgpu::RendererConfig {
+                texture_format: target_format,
+                ..Default::default()
+            },
+        );
+
+        let mut view_state = DiffViewState::default();
+
+        // Warm up: a couple of idle frames so the child windows fully
+        // initialize their scroll state before we try to push a scroll.
+        for _ in 0..2 {
+            run_frame_with_wgpu(
+                &mut ctx, &mut renderer, &device, &queue, target_format,
+                &store, id, &mut view_state, None, FrameInput::default(),
+            );
+        }
+        // Queue a scroll of ~240 px on both panes (≈ 10 rows of 24 px).
+        view_state.pending_left = Some(240.0);
+        view_state.pending_right = Some(240.0);
+        // Idle frames so the scroll is applied; state.last_left will be
+        // updated on the second frame after the scroll fires.
+        for _ in 0..2 {
+            run_frame_with_wgpu(
+                &mut ctx, &mut renderer, &device, &queue, target_format,
+                &store, id, &mut view_state, None, FrameInput::default(),
+            );
+        }
+
+        // Sanity: confirm the pane really scrolled (state.last_left holds
+        // the most recent scroll_y captured during render).
+        eprintln!("after pre-scroll: state.last_left = {}", view_state.last_left);
+        assert!(
+            view_state.last_left > 100.0,
+            "pre-scroll didn't take effect: state.last_left = {}",
+            view_state.last_left,
+        );
+
+        // Press deep in the visible band (well below the visible top) and
+        // drag to a different deep-y position. The buggy `locate` rejects
+        // clicks at content-y >= visible_h, which when scrolled translates
+        // to anything in the lower `scroll_y` pixels of the visible area.
+        // With scroll_y ≈ 211 and visible_h ≈ 770, the bottom ~211 px of
+        // the visible area is unreachable for drag-start. Press at y=650
+        // (likely inside that unreachable zone) and drag down by a few rows.
+        let press_pos = [120.0, 650.0];
+        let drag_pos = [180.0, 750.0];
+
+        for input in [
+            FrameInput {
+                mouse_pos: Some(press_pos),
+                left_button: Some(true),
+                ..Default::default()
+            },
+            FrameInput { mouse_pos: Some(drag_pos), ..Default::default() },
+            FrameInput { mouse_pos: Some(drag_pos), ..Default::default() },
+            FrameInput { left_button: Some(false), ..Default::default() },
+        ] {
+            run_frame_with_wgpu(
+                &mut ctx, &mut renderer, &device, &queue, target_format,
+                &store, id, &mut view_state, None, input,
+            );
+        }
+
+        let sel = view_state
+            .selection
+            .as_ref()
+            .expect("scrolled drag should produce a selection");
+        eprintln!(
+            "scrolled drag: side={:?} anchor=({}, {}) caret=({}, {})",
+            sel.side, sel.anchor.line_no, sel.anchor.col,
+            sel.caret.line_no, sel.caret.col,
+        );
+        assert!(
+            sel.caret.line_no > sel.anchor.line_no,
+            "scrolled drag should cross rows: anchor line {}, caret line {} \
+             (regression: with scroll engaged, drag was clamped to one row)",
+            sel.anchor.line_no, sel.caret.line_no,
+        );
+        // The anchor should be ~10 rows past line 1 because we scrolled.
+        assert!(
+            sel.anchor.line_no > 5,
+            "anchor should land on a scrolled-into-view row, got line {} \
+             (regression: locate ignored scroll_y and returned the top row)",
+            sel.anchor.line_no,
+        );
+    }
 }
 
 mod move_pairing_tests {
