@@ -26,10 +26,12 @@ use crate::session::{SessionId, SessionMode, SessionStore};
 
 mod char_diff;
 mod diff_view;
+mod engine_bar;
 pub mod input;
 #[cfg(feature = "gui")]
 mod input_imgui;
 mod merge_view;
+mod preferences;
 mod recents;
 mod result_pane;
 mod syntax;
@@ -155,6 +157,15 @@ struct AppState {
     /// the last source hash + per-line highlight spans so unchanged buffers
     /// don't re-parse every frame.
     syntax: syntax::HighlightCache,
+    /// Default engine + DiffOptions applied to new tabs. Persisted to
+    /// `settings.json` via the Preferences dialog.
+    preferences: preferences::AppPreferences,
+    /// True while the Preferences modal is open. The modal is rendered
+    /// each frame inside `render` and closes when the user clicks OK
+    /// or presses Escape.
+    preferences_open: bool,
+    /// Working copy of preferences while the dialog is open.
+    preferences_draft: preferences::AppPreferences,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -196,6 +207,9 @@ impl Default for AppState {
             recents: recents::load(),
             undo_stacks: HashMap::new(),
             syntax: syntax::HighlightCache::default(),
+            preferences: preferences::load(),
+            preferences_open: false,
+            preferences_draft: preferences::AppPreferences::default(),
         }
     }
 }
@@ -462,6 +476,7 @@ fn render(gpu: &mut Gpu, state: &mut AppState) {
 fn frame_ui(ui: &imgui::Ui, state: &mut AppState) {
     keyboard_shortcuts(ui, state);
     menu_bar(ui, state);
+    preferences_modal(ui, state);
 
     // Position the root window inside the viewport's "work area" so it sits
     // below the main menu bar instead of overlapping it. Reading directly
@@ -565,6 +580,11 @@ fn menu_bar(ui: &imgui::Ui, state: &mut AppState) {
                 .build()
             {
                 close_active_tab(state);
+            }
+            ui.separator();
+            if ui.menu_item("Preferences...") {
+                state.preferences_draft = state.preferences.clone();
+                state.preferences_open = true;
             }
             ui.separator();
             if ui
@@ -1030,6 +1050,103 @@ fn tab_bar(ui: &imgui::Ui, state: &mut AppState) {
     }
 }
 
+/// Render the Preferences modal when `state.preferences_open` is true.
+/// On OK we save to disk; on Cancel/Escape we discard the draft.
+fn preferences_modal(ui: &imgui::Ui, state: &mut AppState) {
+    if !state.preferences_open {
+        return;
+    }
+    ui.open_popup("Preferences");
+
+    let mut still_open = true;
+    if let Some(_token) = ui
+        .modal_popup_config("Preferences")
+        .opened(&mut still_open)
+        .always_auto_resize(true)
+        .begin_popup()
+    {
+        let engines = crate::diff::available_engines();
+        let engine_names: Vec<String> = engines.iter().map(|(n, _)| n.clone()).collect();
+        let mut engine_idx = engines
+            .iter()
+            .position(|(n, _)| *n == state.preferences_draft.default_engine)
+            .unwrap_or(0);
+        ui.text("Default engine for new tabs:");
+        ui.set_next_item_width(200.0);
+        if ui.combo_simple_string("##pref_engine", &mut engine_idx, &engine_names) {
+            if let Some(n) = engine_names.get(engine_idx) {
+                state.preferences_draft.default_engine = n.clone();
+            }
+        }
+
+        ui.separator();
+        ui.text("Default diff options for new tabs:");
+
+        use crate::diff::{SubLineGranularity, Whitespace};
+        const WS: &[(&str, Whitespace)] = &[
+            ("Significant", Whitespace::None),
+            ("Ignore all", Whitespace::IgnoreAll),
+            ("Ignore leading", Whitespace::IgnoreLeading),
+            ("Ignore trailing+EOL", Whitespace::IgnoreTrailingEol),
+        ];
+        const GR: &[(&str, SubLineGranularity)] = &[
+            ("None", SubLineGranularity::None),
+            ("Word", SubLineGranularity::Word),
+            ("Char", SubLineGranularity::Char),
+            ("Grapheme", SubLineGranularity::Grapheme),
+        ];
+
+        let mut ws_idx = WS
+            .iter()
+            .position(|(_, v)| *v == state.preferences_draft.default_options.whitespace)
+            .unwrap_or(0);
+        ui.text("Whitespace:");
+        ui.same_line();
+        ui.set_next_item_width(180.0);
+        let ws_labels: Vec<&str> = WS.iter().map(|(l, _)| *l).collect();
+        if ui.combo_simple_string("##pref_ws", &mut ws_idx, &ws_labels) {
+            state.preferences_draft.default_options.whitespace = WS[ws_idx].1;
+        }
+
+        let mut g_idx = GR
+            .iter()
+            .position(|(_, v)| *v == state.preferences_draft.default_options.sub_line)
+            .unwrap_or(0);
+        ui.text("Sub-line granularity:");
+        ui.same_line();
+        ui.set_next_item_width(140.0);
+        let g_labels: Vec<&str> = GR.iter().map(|(l, _)| *l).collect();
+        if ui.combo_simple_string("##pref_sub", &mut g_idx, &g_labels) {
+            state.preferences_draft.default_options.sub_line = GR[g_idx].1;
+        }
+
+        ui.checkbox(
+            "Detect moves (when supported by engine)",
+            &mut state.preferences_draft.default_options.detect_moves,
+        );
+
+        ui.separator();
+        if ui.button("OK") {
+            state.preferences = state.preferences_draft.clone();
+            if let Err(e) = preferences::save(&state.preferences) {
+                state.status = format!("preferences save error: {e}");
+            } else {
+                state.status = "preferences saved".into();
+            }
+            state.preferences_open = false;
+            ui.close_current_popup();
+        }
+        ui.same_line();
+        if ui.button("Cancel") {
+            state.preferences_open = false;
+            ui.close_current_popup();
+        }
+    }
+    if !still_open {
+        state.preferences_open = false;
+    }
+}
+
 fn anchor_bar_two_way(
     ui: &imgui::Ui,
     store: &SessionStore,
@@ -1149,6 +1266,15 @@ fn current_session_summary(ui: &imgui::Ui, state: &mut AppState) {
     if let Some(t) = tab {
         ui.text(format!("Tab: {} (id={})", t.label, t.session_id));
     }
+    engine_bar::render(
+        ui,
+        &state.sessions,
+        id,
+        &snap.engine,
+        snap.options,
+        &mut state.status,
+    );
+    ui.separator();
     match &snap.mode {
         SessionMode::TwoWay { hunks, anchors, a_lines, b_lines, .. } => {
             anchor_bar_two_way(ui, &state.sessions, id, anchors, &mut state.status);
@@ -1342,7 +1468,9 @@ fn open_two_way_paths(state: &mut AppState, a: PathBuf, b: PathBuf) {
             return;
         }
     };
-    match state.sessions.open_two_way(&a_text, &b_text, None) {
+    let engine = Some(state.preferences.default_engine.clone());
+    let opts = state.preferences.default_options;
+    match state.sessions.open_two_way_with(&a_text, &b_text, engine, opts) {
         Ok(id) => {
             let label = format!("{} ↔ {}", basename(&a), basename(&b));
             let recent = recents::RecentEntry::TwoWay {
@@ -1403,9 +1531,11 @@ fn open_three_way_paths(
             return;
         }
     };
+    let engine = Some(state.preferences.default_engine.clone());
+    let opts = state.preferences.default_options;
     match state
         .sessions
-        .open_three_way(&base_text, &local_text, &remote_text, None)
+        .open_three_way_with(&base_text, &local_text, &remote_text, engine, opts)
     {
         Ok(id) => {
             let label = format!("{} (3-way)", basename(&base));
