@@ -18,8 +18,8 @@ use crate::diff::{Anchor, Hunk};
 use crate::session::{SessionId, TwoWaySide};
 
 use super::common::{
-    fill_bezier_ribbon, gutter_w, is_change_hunk, ordered_endpoints, ribbon_color, row_h,
-    stroke_bezier_curve, target_scroll, text_x_at_byte, double_click_word_bounds, Cls,
+    fill_bezier_ribbon, gutter_w, is_change_hunk, move_color, ordered_endpoints, ribbon_color,
+    row_h, stroke_bezier_curve, target_scroll, text_x_at_byte, double_click_word_bounds, Cls,
     DiffViewState, Row, Selection, Side,
 };
 
@@ -406,10 +406,16 @@ fn draw_row(
     let buf: String = row.segments.iter().map(|s| s.text.as_str()).collect();
 
     // ---- backgrounds: hunk color → hover tint → selection ----
-    let bg = match row.cls {
-        Cls::Equal => None,
-        Cls::Delete => Some([0.55, 0.18, 0.18, 0.30]),
-        Cls::Insert => Some([0.18, 0.50, 0.22, 0.30]),
+    // Moved rows replace the standard red/green tint with the move
+    // color (peach @ 0.30 alpha). Equal rows are never moved.
+    let bg = if row.moved {
+        Some(theme::with_alpha(move_color(), 0.30))
+    } else {
+        match row.cls {
+            Cls::Equal => None,
+            Cls::Delete => Some([0.55, 0.18, 0.18, 0.30]),
+            Cls::Insert => Some([0.18, 0.50, 0.22, 0.30]),
+        }
     };
     if let Some(bg_rgba) = bg {
         dl.add_rect(p0, p1, bg_rgba).filled(true).build();
