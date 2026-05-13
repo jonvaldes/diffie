@@ -2161,17 +2161,26 @@ fn draw_row(
     // blinking on a ~1s cycle to roughly match imgui's default.
     if input_active && caret_pos.get() >= 0 {
         // `caret_pos` is a BYTE position (from imgui's stb_textedit).
-        // `paint_row_text` positions text using CHAR indices, so the
-        // caret must convert byte → char to align with the rendered
-        // text. For ASCII the two are identical; for any UTF-8
-        // codepoint > 1 byte they diverge.
+        // Use `calc_text_size` to convert it to a pixel offset rather
+        // than `char_col * char_w`: that handles UTF-8 correctly and
+        // also works for proportional fonts (where each glyph has its
+        // own advance width). For monospace fonts the result equals
+        // `char_col * char_w` exactly; for proportional it's the only
+        // way to keep the caret aligned with the rendered glyphs.
+        // `caret_pos` is a BYTE position (from imgui's stb_textedit).
+        // Use `calc_text_size` to convert it to a pixel offset rather
+        // than `char_col * char_w`: that handles UTF-8 correctly and
+        // also works for proportional fonts (where each glyph has its
+        // own advance width). For monospace fonts the result equals
+        // `char_col * char_w` exactly; for proportional it's the only
+        // way to keep the caret aligned with the rendered glyphs.
         let byte_pos = caret_pos.get().max(0) as usize;
         let take = byte_pos.min(buf.len());
-        let char_col = buf
-            .get(..take)
-            .map(|s| s.chars().count())
-            .unwrap_or_else(|| buf.chars().count());
-        let caret_offset = char_col as f32 * char_w;
+        let mut idx = take;
+        while idx > 0 && !buf.is_char_boundary(idx) {
+            idx -= 1;
+        }
+        let caret_offset = ui.calc_text_size(&buf[..idx])[0];
         // Phase the blink off the most recent activation so the caret is on
         // for the first half-cycle after a line jump or click.
         let since = (ui.time() - caret_blink_reset.get()).max(0.0);
@@ -3153,6 +3162,42 @@ mod headless_tests {
         line_no: u32,
         col: usize,
     ) {
+        focus_row_and_settle_opt(
+            ctx, renderer, device, queue, target_format,
+            store, id, view_state, Some(mono), side, line_no, col,
+        );
+    }
+
+    /// Load the proportional Roboto font (the live app's UI font) into
+    /// the context. Used by tests that need to exercise proportional
+    /// glyph widths.
+    fn load_proportional_font(ctx: &mut imgui::Context, size_pixels: f32) -> imgui::FontId {
+        ctx.fonts().add_font(&[imgui::FontSource::TtfData {
+            data: aetna_fonts_roboto::ROBOTO_REGULAR,
+            size_pixels,
+            config: Some(imgui::FontConfig {
+                size_pixels,
+                ..Default::default()
+            }),
+        }])
+    }
+
+    /// Like `focus_row_and_settle` but allows omitting the mono font
+    /// (uses imgui's default proportional font instead).
+    fn focus_row_and_settle_opt(
+        ctx: &mut imgui::Context,
+        renderer: &mut imgui_wgpu::Renderer,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        target_format: wgpu::TextureFormat,
+        store: &SessionStore,
+        id: crate::session::SessionId,
+        view_state: &mut DiffViewState,
+        mono: Option<imgui::FontId>,
+        side: Side,
+        line_no: u32,
+        col: usize,
+    ) {
         view_state.arrow_focus = Some((side, line_no, col));
         // Several frames: set_keyboard_focus_here takes a couple of
         // frames to make the widget active; selection state stabilizes
@@ -3160,7 +3205,7 @@ mod headless_tests {
         for _ in 0..5 {
             run_frame_with_wgpu(
                 ctx, renderer, device, queue, target_format,
-                store, id, view_state, Some(mono), FrameInput::default(),
+                store, id, view_state, mono, FrameInput::default(),
             );
         }
     }
@@ -3425,6 +3470,97 @@ mod headless_tests {
             .expect("Right arrow inside active row should queue a scroll-x pin");
         assert_eq!(pin.0, Side::Left);
         assert_eq!(pin.2, 4);
+    }
+
+    /// With a proportional font, `col * char_w` (where `char_w` is the
+    /// "m" advance) doesn't equal the actual text width — narrower
+    /// glyphs like "i" or "l" make the real width less than `col *
+    /// char_w`, wider glyphs like "M" make it more. The caret must use
+    /// `calc_text_size` to track the rendered glyphs in either case.
+    ///
+    /// Test setup: don't load a mono font; use imgui's built-in default
+    /// proportional font. Park the caret at the end of "lllll iiiii"
+    /// (a string of narrow chars), then assert the caret offset matches
+    /// the actual rendered width of the prefix, NOT `chars_so_far *
+    /// calc_text_size("m")[0]` (which the old formula computed).
+    #[test]
+    fn headless_wgpu_caret_aligns_with_proportional_font() {
+        let _guard = imgui_lock();
+        let Some((device, queue)) = try_init_wgpu() else {
+            eprintln!("skipping: no wgpu adapter available");
+            return;
+        };
+
+        let line = "lllll iiiii"; // 11 narrow chars
+        let text = format!("{line}\n");
+        let store = SessionStore::new();
+        let id = store.open_two_way(&text, &text, None).unwrap();
+
+        let mut ctx = imgui::Context::create();
+        ctx.io_mut().display_size = [1200.0, 800.0];
+        ctx.io_mut().delta_time = 1.0 / 60.0;
+        ctx.io_mut().config_flags |= imgui::ConfigFlags::NAV_ENABLE_KEYBOARD;
+        // Use Roboto Regular — the live app's UI font. Truly
+        // proportional: `i` and `l` are much narrower than `m`.
+        let prop_font = load_proportional_font(&mut ctx, 13.0);
+        let target_format = wgpu::TextureFormat::Rgba8UnormSrgb;
+        let mut renderer = imgui_wgpu::Renderer::new(
+            &mut ctx,
+            &device,
+            &queue,
+            imgui_wgpu::RendererConfig {
+                texture_format: target_format,
+                ..Default::default()
+            },
+        );
+
+        let mut view_state = DiffViewState::default();
+        // Park caret at char column 11 (end of line) with Roboto as
+        // the row font.
+        focus_row_and_settle(
+            &mut ctx, &mut renderer, &device, &queue, target_format,
+            &store, id, &mut view_state, prop_font, Side::Left, 1, 11,
+        );
+
+        let (_, caret_offset) = view_state
+            .last_active_caret_offset
+            .expect("caret offset should be exposed after activation");
+
+        // Measure the EXACT rendered width of `line` and `m`-strings via
+        // imgui inside a one-off frame. The caret offset must match the
+        // line width to within sub-pixel tolerance.
+        let measure_actual: Cell<f32> = Cell::new(0.0);
+        let measure_naive: Cell<f32> = Cell::new(0.0);
+        {
+            let ui = ctx.new_frame();
+            ui.window("measure")
+                .size([200.0, 100.0], imgui::Condition::Always)
+                .build(|| {
+                    let _tok = ui.push_font(prop_font);
+                    measure_actual.set(ui.calc_text_size(line)[0]);
+                    let char_w = ui.calc_text_size("m")[0];
+                    measure_naive.set(11.0 * char_w);
+                });
+            let _ = ctx.render();
+        }
+        let line_w_actual = measure_actual.get();
+        let line_w_naive = measure_naive.get();
+
+        // For a truly proportional font with mostly narrow chars,
+        // actual rendered width is much smaller than the naive
+        // `col * char_w("m")` estimate. Confirm the two diverge —
+        // otherwise the test doesn't exercise the proportional path.
+        assert!(
+            line_w_naive - line_w_actual > 10.0,
+            "Roboto should be proportional: actual={line_w_actual} \
+             naive={line_w_naive} — too close for a meaningful test",
+        );
+        assert!(
+            (caret_offset - line_w_actual).abs() < 1.5,
+            "caret_offset {caret_offset} should match the actual rendered \
+             width {line_w_actual}, not the naive `col * char_w` value \
+             {line_w_naive}",
+        );
     }
 
     /// The manually-drawn caret must align with the rendered text at
