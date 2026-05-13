@@ -870,6 +870,11 @@ fn load_fonts(imgui: &mut Context, ui_font_size: f32) -> FontId {
 /// Basic Latin, which leaves UI strings full of `→ ↔ — … ✕ ⇒ ≥ Δ` rendering
 /// as missing-glyph boxes. Each pair is an inclusive [start, end]; the slice
 /// is zero-terminated as imgui requires.
+///
+/// Note: Roboto Regular does not cover every codepoint in these ranges (e.g.
+/// U+2715 ✕ is missing even though Dingbats is requested). Imgui shows `?`
+/// for unmapped codepoints, so prefer characters Roboto actually ships
+/// (e.g. × U+00D7) for UI labels.
 #[rustfmt::skip]
 static EXTRA_GLYPH_RANGES: &[u32] = &[
     0x0020, 0x00FF, // Basic Latin + Latin-1 Supplement
@@ -1024,7 +1029,7 @@ fn tab_bar(ui: &imgui::Ui, state: &mut AppState) {
         }
         drop(_col);
         ui.same_line_with_spacing(0.0, 2.0);
-        if ui.small_button(format!("✕##close_{}", tab.session_id)) {
+        if ui.small_button(format!("×##close_{}", tab.session_id)) {
             close = Some(tab.session_id);
         }
         ui.same_line();
