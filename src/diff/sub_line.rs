@@ -1,4 +1,4 @@
-use super::{SubLineGranularity, SubSpan, SubSpanKind};
+use super::{DiffOp, SubLineGranularity, SubSpan, SubSpanKind};
 
 /// Compute sub-line spans for a paired (deletion, insertion) line.
 /// Returns `(del_spans, ins_spans)`. Each Vec covers the full line text
@@ -48,6 +48,52 @@ pub fn compute_pair(del_text: &str, ins_text: &str, granularity: SubLineGranular
     (del_spans, ins_spans)
 }
 
+/// Walk a `DiffOp` stream and populate `spans` on paired Delete/Insert ops
+/// (deletes paired with inserts inside the same change run). Equal ops and
+/// unpaired Deletes/Inserts are left untouched.
+pub fn populate_pair_spans(ops: &mut Vec<DiffOp>, granularity: SubLineGranularity) {
+    if matches!(granularity, SubLineGranularity::None) {
+        return;
+    }
+
+    // Walk consecutive Delete/Insert runs; within a run, pair up positionally.
+    let mut i = 0;
+    while i < ops.len() {
+        if matches!(ops[i], DiffOp::Equal { .. }) {
+            i += 1;
+            continue;
+        }
+        // Find the end of this change run.
+        let mut j = i;
+        while j < ops.len() && !matches!(ops[j], DiffOp::Equal { .. }) {
+            j += 1;
+        }
+
+        // Collect indices of Deletes and Inserts in this run.
+        let dels: Vec<usize> = (i..j).filter(|k| matches!(ops[*k], DiffOp::Delete { .. })).collect();
+        let inss: Vec<usize> = (i..j).filter(|k| matches!(ops[*k], DiffOp::Insert { .. })).collect();
+        let pairs = dels.len().min(inss.len());
+        for p in 0..pairs {
+            let del_text = match &ops[dels[p]] {
+                DiffOp::Delete { text, .. } => text.clone(),
+                _ => unreachable!(),
+            };
+            let ins_text = match &ops[inss[p]] {
+                DiffOp::Insert { text, .. } => text.clone(),
+                _ => unreachable!(),
+            };
+            let (d_spans, i_spans) = compute_pair(&del_text, &ins_text, granularity);
+            if let DiffOp::Delete { spans, .. } = &mut ops[dels[p]] {
+                *spans = Some(d_spans);
+            }
+            if let DiffOp::Insert { spans, .. } = &mut ops[inss[p]] {
+                *spans = Some(i_spans);
+            }
+        }
+        i = j;
+    }
+}
+
 fn push_span(out: &mut Vec<SubSpan>, start: u32, end: u32, kind: SubSpanKind) {
     if start == end { return; }
     if let Some(last) = out.last_mut() {
@@ -95,5 +141,29 @@ mod tests {
         let (d, i) = compute_pair("a", "b", SubLineGranularity::None);
         assert!(d.is_empty());
         assert!(i.is_empty());
+    }
+
+    #[test]
+    fn populate_fills_paired_ops_only() {
+        let mut ops = vec![
+            DiffOp::Equal { a: 1, b: 1, text: "keep".into() },
+            DiffOp::delete(2, "foo bar".into()),
+            DiffOp::insert(2, "foo baz".into()),
+            DiffOp::delete(3, "lonely".into()),
+            DiffOp::Equal { a: 4, b: 3, text: "end".into() },
+        ];
+        populate_pair_spans(&mut ops, SubLineGranularity::Word);
+        match &ops[1] {
+            DiffOp::Delete { spans, .. } => assert!(spans.is_some()),
+            _ => panic!(),
+        }
+        match &ops[2] {
+            DiffOp::Insert { spans, .. } => assert!(spans.is_some()),
+            _ => panic!(),
+        }
+        match &ops[3] {
+            DiffOp::Delete { spans, .. } => assert!(spans.is_none(), "unpaired delete should stay None"),
+            _ => panic!(),
+        }
     }
 }

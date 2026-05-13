@@ -164,7 +164,9 @@ fn recompute_two_way(
         let wrapper = AnchoredDiff::new(DynEngine(inner.as_ref()), anchors.to_vec());
         wrapper.diff_checked(&a, &b, opts)?
     };
-    Ok(group_into_hunks(&split_trivial_equals(ops)))
+    let mut ops = split_trivial_equals(ops);
+    crate::diff::sub_line::populate_pair_spans(&mut ops, opts.sub_line);
+    Ok(group_into_hunks(&ops))
 }
 
 /// Reject Myers matches on whitespace-only lines. Such "matches" between
