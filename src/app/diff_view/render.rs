@@ -18,9 +18,9 @@ use crate::diff::{Anchor, Hunk};
 use crate::session::{SessionId, TwoWaySide};
 
 use super::common::{
-    fill_bezier_ribbon, gutter_w, is_change_hunk, move_color, ordered_endpoints, ribbon_color,
-    row_h, stroke_bezier_curve, target_scroll, text_x_at_byte, double_click_word_bounds, Cls,
-    DiffViewState, Row, Selection, Side,
+    fill_bezier_ribbon, find_paired_hunk, gutter_w, hunk_move_id, is_change_hunk, move_color,
+    move_ribbon_alpha, ordered_endpoints, ribbon_color, row_h, stroke_bezier_curve, target_scroll,
+    text_x_at_byte, double_click_word_bounds, Cls, DiffViewState, Row, Selection, Side,
 };
 
 #[allow(clippy::too_many_arguments)]
@@ -63,6 +63,31 @@ pub(super) fn draw_connector(
                 continue;
             }
             let color = ribbon_color(is_change_hunk(h_obj));
+            fill_bezier_ribbon(x_l, x_r, a1, a2, b1, b2, color);
+        }
+
+        // Moved-hunk ribbons. Pair Delete-only and Insert-only hunks sharing
+        // a move_id; paint each pair as a distance-faded peach ribbon.
+        for h_obj in hunks {
+            // Only iterate Delete-only moved hunks to avoid double-painting.
+            let Some(move_id) = hunk_move_id(h_obj) else { continue };
+            let is_delete_only = h_obj.b_range == (0, 0);
+            if !is_delete_only { continue; }
+            let Some(paired) = find_paired_hunk(hunks, move_id, Side::Left) else { continue };
+            let Some(lr) = left_ranges.iter().find(|r| r.0 == h_obj.id) else { continue };
+            let Some(rr) = right_ranges.iter().find(|r| r.0 == paired.id) else { continue };
+            let a1 = left_origin_y + lr.1;
+            let a2 = left_origin_y + lr.2;
+            let b1 = right_origin_y + rr.1;
+            let b2 = right_origin_y + rr.2;
+            if (a2 < band_top && b2 < band_top) || (a1 > band_bot && b1 > band_bot) {
+                continue;
+            }
+            let mid_a = (a1 + a2) * 0.5;
+            let mid_b = (b1 + b2) * 0.5;
+            let dy = mid_a - mid_b;
+            let alpha = move_ribbon_alpha(dy);
+            let color = theme::with_alpha(move_color(), alpha);
             fill_bezier_ribbon(x_l, x_r, a1, a2, b1, b2, color);
         }
 
