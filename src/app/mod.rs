@@ -501,6 +501,21 @@ fn frame_ui(ui: &imgui::Ui, state: &mut AppState) {
             ui.separator();
             current_session_summary(ui, state);
         });
+
+    // Re-apply our cross-row clipboard write AFTER all input_text widgets
+    // have built. ImGui's input_text processes Ctrl+C inside stb_textedit
+    // BEFORE our suppression callback fires, so a focused row's widget
+    // can write its single-line selection to the clipboard mid-frame and
+    // overwrite the multi-line text `keyboard_shortcuts → do_copy` wrote
+    // at frame start. Running do_copy again here makes our extract the
+    // last write of the frame. For Result-pane focus we skip — imgui's
+    // input_text_multiline owns the clipboard semantics there.
+    if ui.io().key_ctrl && ui.is_key_pressed(imgui::Key::C) {
+        let result_focused = matches!(state.focused, Some((_, FocusedPane::Result)));
+        if !result_focused && copy_enabled(state) {
+            do_copy(ui, state);
+        }
+    }
 }
 
 fn menu_bar(ui: &imgui::Ui, state: &mut AppState) {

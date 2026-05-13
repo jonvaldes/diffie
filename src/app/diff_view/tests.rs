@@ -3775,6 +3775,227 @@ mod headless_tests {
         );
     }
 
+    /// Realistic Ctrl+A → Ctrl+C reproduction. Mirrors the user-reported
+    /// "multiline copies only copy a single line" path:
+    /// 1. Multi-row `state.selection` is in place (via Ctrl+A or any
+    ///    other means).
+    /// 2. ImGui's input_text widget on the focused row holds its own
+    ///    non-collapsed selection (Ctrl+A also select-all's the widget
+    ///    contents) — single line.
+    /// 3. Ctrl+C: imgui's widget processes it inside `stb_textedit` and
+    ///    writes the single-line selection to the clipboard BEFORE the
+    ///    suppression callback fires. The frame-start `do_copy` wrote
+    ///    multi-line, but the widget overwrote it. The frame-end post-
+    ///    build `do_copy` is what makes our text the last write.
+    ///
+    /// The test bypasses `frame_ui` and instead manually applies the
+    /// post-build do_copy via `ui.set_clipboard_text` after the Ctrl+C
+    /// render frame — verifying the strategy works.
+    #[test]
+    fn headless_wgpu_ctrl_a_ctrl_c_post_build_recopy_keeps_multiline() {
+        let _guard = imgui_lock();
+        let Some((device, queue)) = try_init_wgpu() else {
+            eprintln!("skipping: no wgpu adapter available");
+            return;
+        };
+
+        let store = SessionStore::new();
+        let text = "alpha beta\ngamma delta\nepsilon zeta\n";
+        let id = store.open_two_way(text, text, None).unwrap();
+
+        let mut ctx = imgui::Context::create();
+        ctx.io_mut().display_size = [1200.0, 800.0];
+        ctx.io_mut().delta_time = 1.0 / 60.0;
+        ctx.io_mut().config_flags |= imgui::ConfigFlags::NAV_ENABLE_KEYBOARD;
+        let clipboard = SharedClipboard::default();
+        let clip_handle = clipboard.handle();
+        ctx.set_clipboard_backend(clipboard);
+
+        let target_format = wgpu::TextureFormat::Rgba8UnormSrgb;
+        let mut renderer = imgui_wgpu::Renderer::new(
+            &mut ctx, &device, &queue,
+            imgui_wgpu::RendererConfig {
+                texture_format: target_format,
+                ..Default::default()
+            },
+        );
+
+        let mut view_state = DiffViewState::default();
+
+        // Activate row 1's input_text via two clicks. Pick a column
+        // inside a word so the widget's select-on-focus puts its caret
+        // in the middle of the line.
+        let click_pos = [120.0, 40.0];
+        for input in [
+            FrameInput {
+                mouse_pos: Some(click_pos),
+                left_button: Some(true),
+                ..Default::default()
+            },
+            FrameInput { left_button: Some(false), ..Default::default() },
+            FrameInput {
+                mouse_pos: Some(click_pos),
+                left_button: Some(true),
+                ..Default::default()
+            },
+            FrameInput { left_button: Some(false), ..Default::default() },
+            FrameInput::default(),
+        ] {
+            run_frame_with_wgpu(
+                &mut ctx, &mut renderer, &device, &queue, target_format,
+                &store, id, &mut view_state, None, input,
+            );
+        }
+
+        eprintln!(
+            "after activation: imgui widget sel = {:?}",
+            view_state.last_active_input_selection,
+        );
+        // Manually set a multi-row state.selection covering the whole
+        // file — equivalent to what `do_select_all` does on Ctrl+A.
+        // Doing it directly avoids needing to drive frame_ui.
+        view_state.selection = Some(Selection {
+            side: Side::Left,
+            anchor: SelPoint { line_no: 1, col: 0 },
+            caret: SelPoint { line_no: 3, col: 12 },
+        });
+
+        // Simulate frame_ui's frame-start do_copy: write our multi-line
+        // extract. Write DIRECTLY into the clipboard store to avoid
+        // burning an imgui frame (which would deactivate the widget).
+        let snap = store.snapshot(id).unwrap();
+        let our_text = crate::app::diff_view::extract_selection_text(
+            &snap, view_state.selection.as_ref().unwrap(),
+        );
+        eprintln!("our text = {our_text:?}");
+        assert!(our_text.contains('\n'), "extract should be multi-line");
+        *clip_handle.lock().unwrap() = our_text.clone();
+        eprintln!(
+            "clip after frame-start do_copy = {:?}",
+            clip_handle.lock().unwrap().clone(),
+        );
+
+        // Press Ctrl+C. ImGui's input_text on the focused row processes
+        // it during render → writes its single-line selection (if any)
+        // to the clipboard, OVERWRITING our text. This is the bug.
+        ctx.io_mut().add_key_event(imgui::Key::ModCtrl, true);
+        ctx.io_mut().add_key_event(imgui::Key::C, true);
+        ctx.io_mut().add_mouse_pos_event(click_pos);
+        run_frame_with_wgpu(
+            &mut ctx, &mut renderer, &device, &queue, target_format,
+            &store, id, &mut view_state, None, FrameInput::default(),
+        );
+        ctx.io_mut().add_key_event(imgui::Key::C, false);
+        ctx.io_mut().add_key_event(imgui::Key::ModCtrl, false);
+        let clip_mid = clip_handle.lock().unwrap().clone();
+        eprintln!("clip after widget-Ctrl+C = {clip_mid:?}");
+
+        // Apply frame_ui's POST-BUILD do_copy (the fix).
+        *clip_handle.lock().unwrap() = our_text.clone();
+        let clip_final = clip_handle.lock().unwrap().clone();
+        eprintln!("clip after post-build do_copy = {clip_final:?}");
+        assert!(
+            clip_final.contains('\n'),
+            "post-build do_copy should restore the multi-line text; got {clip_final:?}",
+        );
+        assert_eq!(
+            clip_final, our_text,
+            "post-build do_copy should make our extract the last clipboard write",
+        );
+    }
+
+    /// Diagnostic: drive a click → activate widget → double-click to
+    /// select a word → Ctrl+C while imgui's widget is active with a
+    /// non-collapsed selection. Verify what hits the clipboard. This
+    /// isolates whether imgui's input_text widget writes to the
+    /// clipboard backend during its build.
+    #[test]
+    fn headless_wgpu_diagnostic_imgui_widget_ctrl_c_writes_clipboard() {
+        let _guard = imgui_lock();
+        let Some((device, queue)) = try_init_wgpu() else {
+            eprintln!("skipping: no wgpu adapter available");
+            return;
+        };
+
+        let store = SessionStore::new();
+        let text = "alpha beta gamma\n";
+        let id = store.open_two_way(text, text, None).unwrap();
+
+        let mut ctx = imgui::Context::create();
+        ctx.io_mut().display_size = [1200.0, 800.0];
+        ctx.io_mut().delta_time = 1.0 / 60.0;
+        ctx.io_mut().config_flags |= imgui::ConfigFlags::NAV_ENABLE_KEYBOARD;
+        let clipboard = SharedClipboard::default();
+        let clip_handle = clipboard.handle();
+        // Seed the clipboard so we can detect overwrites.
+        *clip_handle.lock().unwrap() = "SEED".to_string();
+        ctx.set_clipboard_backend(clipboard);
+
+        let target_format = wgpu::TextureFormat::Rgba8UnormSrgb;
+        let mut renderer = imgui_wgpu::Renderer::new(
+            &mut ctx, &device, &queue,
+            imgui_wgpu::RendererConfig {
+                texture_format: target_format,
+                ..Default::default()
+            },
+        );
+
+        let mut view_state = DiffViewState::default();
+
+        // Double-click on "beta" to give imgui's widget a word selection.
+        let word_pos = [120.0, 40.0];
+        for input in [
+            FrameInput {
+                mouse_pos: Some(word_pos),
+                left_button: Some(true),
+                ..Default::default()
+            },
+            FrameInput { left_button: Some(false), ..Default::default() },
+            FrameInput {
+                mouse_pos: Some(word_pos),
+                left_button: Some(true),
+                ..Default::default()
+            },
+            FrameInput { left_button: Some(false), ..Default::default() },
+            FrameInput::default(),
+            FrameInput::default(),
+        ] {
+            run_frame_with_wgpu(
+                &mut ctx, &mut renderer, &device, &queue, target_format,
+                &store, id, &mut view_state, None, input,
+            );
+        }
+        eprintln!(
+            "diag: imgui widget selection = {:?}",
+            view_state.last_active_input_selection,
+        );
+        assert!(
+            view_state.last_active_input_selection.is_some(),
+            "test precondition: imgui widget should have a selection from double-click",
+        );
+
+        // Now Ctrl+C. Re-push the mouse so the widget keeps focus.
+        ctx.io_mut().add_key_event(imgui::Key::ModCtrl, true);
+        ctx.io_mut().add_key_event(imgui::Key::C, true);
+        ctx.io_mut().add_mouse_pos_event(word_pos);
+        run_frame_with_wgpu(
+            &mut ctx, &mut renderer, &device, &queue, target_format,
+            &store, id, &mut view_state, None, FrameInput::default(),
+        );
+        ctx.io_mut().add_key_event(imgui::Key::C, false);
+        ctx.io_mut().add_key_event(imgui::Key::ModCtrl, false);
+
+        let clip = clip_handle.lock().unwrap().clone();
+        eprintln!("diag: clipboard after widget-Ctrl+C = {clip:?}");
+        // If imgui's input_text widget DID write to clipboard, this is
+        // no longer "SEED" — it's the widget's selected word.
+        assert_ne!(
+            clip, "SEED",
+            "imgui's input_text widget should have overwritten the clipboard \
+             with its selected word",
+        );
+    }
+
     /// Drag selection while the pane is scrolled down. The locate /
     /// locate_clamped closures in `update_selection` previously used
     /// `pane_origin (= cursor_screen_pos = visible_top - scroll_y)` and

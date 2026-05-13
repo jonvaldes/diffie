@@ -707,12 +707,14 @@ fn draw_row(
         .map(|(s, past)| s == side && past)
         .unwrap_or(false);
     // Also suppress when our cross-row `state.selection` exists on this
-    // side and spans multiple rows. Without this, Ctrl+C would route
-    // through the focused row's `input_text` widget — which only knows
-    // about a single-line slice of our selection — and overwrite the
-    // multi-line text we wrote to the clipboard. Single-row selections
-    // (collapsed click point, same-row drag) leave imgui's selection
-    // alone so double-click word-select still works.
+    // side and spans multiple rows. This keeps the focused row's widget
+    // from painting its own single-line highlight on top of our
+    // cross-row selection rects — purely cosmetic. The Ctrl+C
+    // clipboard race itself is fixed at the frame_ui level via a
+    // post-build do_copy in `src/app/mod.rs` (the ALWAYS callback
+    // fires AFTER stb_textedit processes Ctrl+C, so collapsing the
+    // selection here is too late to prevent the widget's clipboard
+    // write).
     let multi_row_selection_on_this_side = selection.map_or(false, |s| {
         s.side == side && s.anchor.line_no != s.caret.line_no
     });
