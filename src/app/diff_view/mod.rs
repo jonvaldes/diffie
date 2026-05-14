@@ -68,7 +68,7 @@ pub fn render(
         pending_edits, hunks,
     );
 
-    // Connector strip — empty for now, ribbons added back in task 6.
+    // Connector strip — empty for now, ribbons added back in a later task.
     ui.set_cursor_screen_pos(connector_pos);
     ui.invisible_button("connector_strip", [CONNECTOR_W, pane_h]);
 
@@ -101,7 +101,7 @@ fn render_pane(
     side: Side,
     session_id: SessionId,
     pending_edits: &mut Vec<DiffEdit>,
-    _hunks: &[Hunk],
+    hunks: &[Hunk],
 ) -> ([f32; 4], f32) {
     let g_w = gutter_w();
     let widget_pos = [pane_pos[0] + g_w, pane_pos[1]];
@@ -123,33 +123,67 @@ fn render_pane(
     }
 
     ui.set_cursor_screen_pos(widget_pos);
-    let buf = match side {
-        Side::Left => &mut state.a_buf,
-        Side::Right => &mut state.b_buf,
+
+    // Pre-compute line count from the buffer (need it before the closure
+    // takes a mutable borrow). `lines()` doesn't count a trailing empty
+    // line, so add 1 if the buffer ends with '\n' (or is empty).
+    let (buf_line_count, _) = {
+        let buf_ref: &str = match side {
+            Side::Left => &state.a_buf,
+            Side::Right => &state.b_buf,
+        };
+        let n = buf_ref.lines().count().max(1);
+        let trailing = buf_ref.is_empty() || buf_ref.ends_with('\n');
+        (n + if trailing { 1 } else { 0 }, ())
     };
+
+    let lh = crate::app::diff_view::common::line_h();
+    let content_h = (buf_line_count as f32 * lh).max(pane_h);
+
     let widget_id = format!("##diffie_pane_{:?}", side);
-    let changed = ui
-        .input_text_multiline(&widget_id, buf, [widget_w, pane_h])
-        .no_undo_redo(true)
-        .build();
-    let scroll_y = 0.0; // placeholder until task 6 wires the inside-widget scroll read
-    if changed {
-        let side_ref = SideRef::TwoWay(match side {
-            Side::Left => TwoWaySide::A,
-            Side::Right => TwoWaySide::B,
-        });
-        pending_edits.push(DiffEdit::SetSide {
-            session_id,
-            side: side_ref,
-            new_text: buf.clone(),
-            old_text: None,
-        });
-    }
+    let child_id = format!("##diffie_pane_child_{:?}", side);
+
+    let mut scroll_y_out: f32 = 0.0;
+    // Screen-space coordinates valid for the child window's draw list
+    // (imgui draw list positions are always in screen space).
     let widget_rect = [
         widget_pos[0],
         widget_pos[1],
         widget_pos[0] + widget_w,
         widget_pos[1] + pane_h,
     ];
-    (widget_rect, scroll_y)
+
+    ui.child_window(&child_id)
+        .size([widget_w, pane_h])
+        .scroll_bar(true)
+        .build(|| {
+            let buf = match side {
+                Side::Left => &mut state.a_buf,
+                Side::Right => &mut state.b_buf,
+            };
+            let changed = ui
+                .input_text_multiline(&widget_id, buf, [widget_w, content_h])
+                .no_undo_redo(true)
+                .build();
+            // Read scroll AFTER build() so input events (including scroll)
+            // have been processed; reading before would return last frame's value.
+            scroll_y_out = ui.scroll_y();
+            if changed {
+                let side_ref = SideRef::TwoWay(match side {
+                    Side::Left => TwoWaySide::A,
+                    Side::Right => TwoWaySide::B,
+                });
+                pending_edits.push(DiffEdit::SetSide {
+                    session_id,
+                    side: side_ref,
+                    new_text: buf.clone(),
+                    old_text: None,
+                });
+            }
+
+            // Paint overlays on top of the widget.
+            overlay::paint_row_overlays(ui, widget_rect, hunks, side, scroll_y_out);
+        });
+
+    (widget_rect, scroll_y_out)
 }
