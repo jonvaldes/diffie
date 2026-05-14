@@ -91,3 +91,61 @@ impl Side {
 pub fn extract_selection_text(_snap: &crate::session::DiffSession) -> String {
     String::new()
 }
+
+// ---------------------------------------------------------------------------
+// Scroll-sync helpers
+// ---------------------------------------------------------------------------
+
+/// Build per-hunk (id, top_y, bot_y) ranges in content space for one pane.
+pub(super) fn build_pane_ranges(
+    hunks: &[crate::diff::Hunk],
+    side: Side,
+    lh: f32,
+) -> Vec<(u32, f32, f32)> {
+    hunks
+        .iter()
+        .filter_map(|h| {
+            let (lo, hi) = match side {
+                Side::Left => h.a_range,
+                Side::Right => h.b_range,
+            };
+            if lo == 0 || hi == 0 {
+                return None;
+            }
+            Some((h.id, (lo as f32 - 1.0) * lh, hi as f32 * lh))
+        })
+        .collect()
+}
+
+/// Given the source pane's current scroll, compute the scroll value the
+/// destination pane should be set to so that the same hunk is centred.
+pub(super) fn target_scroll(
+    src_scroll: f32,
+    src_view_h: f32,
+    dst_view_h: f32,
+    src_ranges: &[(u32, f32, f32)],
+    dst_ranges: &[(u32, f32, f32)],
+) -> Option<f32> {
+    let center = src_scroll + src_view_h * 0.5;
+    let (hunk_id, fraction) = locate_hunk(src_ranges, center)?;
+    let (_id, top, bot) = dst_ranges.iter().find(|r| r.0 == hunk_id)?;
+    let dst_center = top + fraction * (bot - top);
+    Some((dst_center - dst_view_h * 0.5).max(0.0))
+}
+
+fn locate_hunk(ranges: &[(u32, f32, f32)], y: f32) -> Option<(u32, f32)> {
+    let mut best: Option<(u32, f32, f32)> = None;
+    for r in ranges {
+        if r.1 <= y && y < r.2 {
+            let span = (r.2 - r.1).max(1.0);
+            return Some((r.0, ((y - r.1) / span).clamp(0.0, 1.0)));
+        }
+        if r.1 <= y && best.map_or(true, |b| r.2 > b.2) {
+            best = Some(*r);
+        }
+    }
+    best.map(|b| {
+        let span = (b.2 - b.1).max(1.0);
+        (b.0, ((y - b.1) / span).clamp(0.0, 1.0))
+    })
+}

@@ -19,7 +19,11 @@ mod overlay;
 mod tests;
 
 pub use common::{extract_selection_text, DiffViewState, Side};
-use common::{gutter_w, line_h, PendingJump, CONNECTOR_W};
+use common::{build_pane_ranges, gutter_w, line_h, target_scroll, PendingJump, CONNECTOR_W};
+
+/// Minimum scroll change (px) to treat as intentional user input.
+/// Dampens single-pixel echo oscillation when we push a new scroll value.
+const ECHO_TOLERANCE: f32 = 1.0;
 
 use super::undo_stack::DiffEdit;
 
@@ -83,10 +87,33 @@ pub fn render(
         pending_edits, hunks, anchors, &hover_right, status, store,
     );
 
+    let prev_left = state.last_left_scroll_y;
+    let prev_right = state.last_right_scroll_y;
     state.last_left_scroll_y = left_scroll_y;
     state.last_right_scroll_y = right_scroll_y;
     let _ = left_widget_rect;
     let _ = right_widget_rect;
+
+    // Scroll sync: whichever pane moved this frame drives the other.
+    let lh = line_h();
+    let left_changed = (left_scroll_y - prev_left).abs() > ECHO_TOLERANCE;
+    let right_changed = (right_scroll_y - prev_right).abs() > ECHO_TOLERANCE;
+    let left_ranges = build_pane_ranges(hunks, Side::Left, lh);
+    let right_ranges = build_pane_ranges(hunks, Side::Right, lh);
+
+    if left_changed && !right_changed {
+        if let Some(target) = target_scroll(
+            left_scroll_y, pane_h, pane_h, &left_ranges, &right_ranges,
+        ) {
+            state.pending_right_scroll = Some(target);
+        }
+    } else if right_changed && !left_changed {
+        if let Some(target) = target_scroll(
+            right_scroll_y, pane_h, pane_h, &right_ranges, &left_ranges,
+        ) {
+            state.pending_left_scroll = Some(target);
+        }
+    }
 
     // Draw the hover panel(s) on top, after both panes have rendered.
     if let Some((hid, pos)) = hover_left.get() {
