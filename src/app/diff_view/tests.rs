@@ -318,6 +318,9 @@ mod headless_tests {
             } => {
                 let _ = store.replace_hunk_side(session_id, hunk_id, target);
             }
+            DiffEdit::SetSide { session_id, side, new_text, .. } => {
+                let _ = store.set_side_text(session_id, side, new_text);
+            }
         }
     }
 
