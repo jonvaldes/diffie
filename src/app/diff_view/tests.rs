@@ -12,7 +12,7 @@ pub(super) use super::render;
 pub(super) use super::super::undo_stack::DiffEdit;
 
 use crate::diff::{DiffOp, DiffOptions};
-use crate::session::{SessionId, SessionMode, SessionStore, TwoWaySide};
+use crate::session::{SessionId, SessionMode, SessionStore, SideRef, TwoWaySide};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 /// `imgui::Context` is a process-global singleton. `cargo test` runs
@@ -517,5 +517,64 @@ fn scrolling_one_pane_targets_the_other() {
         view.last_right_scroll_y > 100.0,
         "right pane should follow left's scroll; got right_y={}",
         view.last_right_scroll_y,
+    );
+}
+
+#[test]
+fn undo_after_typing_reverts_session_text() {
+    let _guard = imgui_lock();
+    let Some((device, queue)) = try_init_wgpu() else {
+        eprintln!("skipping: no wgpu adapter available");
+        return;
+    };
+
+    let store = SessionStore::new();
+    let text = "alpha\nbeta\n";
+    let id = store.open_two_way(text, text, None).unwrap();
+
+    let mut ctx = imgui::Context::create();
+    ctx.io_mut().display_size = [1200.0, 800.0];
+    ctx.io_mut().config_flags |= imgui::ConfigFlags::NAV_ENABLE_KEYBOARD;
+    let target_format = wgpu::TextureFormat::Rgba8UnormSrgb;
+    let mut renderer = imgui_wgpu::Renderer::new(
+        &mut ctx, &device, &queue,
+        imgui_wgpu::RendererConfig { texture_format: target_format, ..Default::default() },
+    );
+    let mut view = DiffViewState::default();
+
+    // Warm-up + click into pane A.
+    run_frame_with_wgpu(&mut ctx, &mut renderer, &device, &queue, target_format, &store, id, &mut view, None, FrameInput::default());
+    for input in [
+        FrameInput { mouse_pos: Some([100.0, 60.0]), left_button: Some(true), ..Default::default() },
+        FrameInput { left_button: Some(false), ..Default::default() },
+        FrameInput::default(),
+    ] {
+        run_frame_with_wgpu(&mut ctx, &mut renderer, &device, &queue, target_format, &store, id, &mut view, None, input);
+    }
+    // Type 'X'.
+    ctx.io_mut().add_input_character('X');
+    run_frame_with_wgpu(&mut ctx, &mut renderer, &device, &queue, target_format, &store, id, &mut view, None, FrameInput::default());
+
+    // The typed character should have landed in session text.
+    let snap = store.snapshot(id).unwrap();
+    let SessionMode::TwoWay { a_text: text_after, .. } = &snap.mode else { panic!() };
+    assert!(text_after.contains('X'), "type should land before undo test runs; got {text_after:?}");
+
+    // Simulate undo: external mutation of the session + epoch bump.
+    // (Tests can't drive do_undo directly since it needs AppState; we
+    // exercise the contract — external mutation + epoch bump means the
+    // widget must re-init from `buf` on the next frame, NOT write its
+    // stale internal stb_textedit state back.)
+    store.set_side_text(id, SideRef::TwoWay(TwoWaySide::A), "alpha\nbeta".into()).unwrap();
+    view.input_epoch = view.input_epoch.wrapping_add(1);
+    // Run two frames so imgui has a chance to re-initialise from the new buf.
+    for _ in 0..2 {
+        run_frame_with_wgpu(&mut ctx, &mut renderer, &device, &queue, target_format, &store, id, &mut view, None, FrameInput::default());
+    }
+    let snap = store.snapshot(id).unwrap();
+    let SessionMode::TwoWay { a_text: text_final, .. } = &snap.mode else { panic!() };
+    assert!(
+        !text_final.contains('X'),
+        "after external set_side_text + input_epoch bump the widget should reflect the new text, not write its old internal state back; got {text_final:?}",
     );
 }

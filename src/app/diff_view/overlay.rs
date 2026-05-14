@@ -11,6 +11,7 @@ use crate::diff::{Anchor, DiffOp, Hunk, SubSpan, SubSpanKind};
 use crate::session::{SessionId, TwoWaySide};
 
 use super::common::{line_h, PendingJump, Side};
+use crate::app::syntax::LineSpans;
 
 /// Pure: 1-based row from a mouse y, the widget's top in screen space,
 /// the widget's scroll, and the line height.
@@ -65,6 +66,293 @@ fn is_change_hunk(hunk: &Hunk) -> bool {
 /// widget's top-left content y, the widget's scroll_y, and line height.
 pub(super) fn line_screen_y(widget_top: f32, line: u32, scroll_y: f32, lh: f32) -> f32 {
     widget_top + (line as f32 - 1.0) * lh - scroll_y
+}
+
+/// Paint syntax-highlighted text on top of the input_text_multiline widget.
+/// imgui's widget paints monochrome text underneath; we overpaint the
+/// colored spans on top so the colored characters cover the monochrome
+/// ones. Plain (uncolored) text is left as-is so the caret stays visible.
+///
+/// `IMGUI_TEXT_PADDING_X` is imgui's frame-padding; ~4px empirically.
+const IMGUI_TEXT_PADDING_X: f32 = 4.0;
+
+pub(super) fn paint_syntax_text(
+    ui: &Ui,
+    widget_rect: [f32; 4],
+    buf: &str,
+    highlights: &[LineSpans],
+    scroll_y: f32,
+) {
+    if highlights.is_empty() {
+        return;
+    }
+    let dl = ui.get_window_draw_list();
+    let lh = line_h();
+    let widget_top = widget_rect[1];
+    let widget_bottom = widget_rect[3];
+    let widget_h = widget_bottom - widget_top;
+    if widget_h <= 0.0 || lh <= 0.0 {
+        return;
+    }
+    let char_w = ui.calc_text_size("m")[0].max(1.0);
+    let text_x0 = widget_rect[0] + IMGUI_TEXT_PADDING_X;
+
+    let first_line = (scroll_y / lh).floor() as u32 + 1;
+    let last_line = ((scroll_y + widget_h) / lh).ceil() as u32 + 1;
+
+    for (line_idx, line_text) in buf.lines().enumerate() {
+        let ln = line_idx as u32 + 1;
+        if ln < first_line || ln > last_line {
+            continue;
+        }
+        let Some(line_spans) = highlights.get(line_idx) else {
+            continue;
+        };
+        if line_spans.is_empty() {
+            continue;
+        }
+        let y = line_screen_y(widget_top, ln, scroll_y, lh);
+        if y + lh < widget_top || y > widget_bottom {
+            continue;
+        }
+        // Walk chars and pick each span's slice. start_col/end_col are
+        // CHAR indices; convert to byte ranges by walking char indices.
+        let chars: Vec<(usize, char)> = line_text.char_indices().collect();
+        for span in line_spans {
+            if span.end_col <= span.start_col {
+                continue;
+            }
+            if span.start_col >= chars.len() {
+                continue;
+            }
+            let start_byte = chars[span.start_col].0;
+            let end_byte = if span.end_col >= chars.len() {
+                line_text.len()
+            } else {
+                chars[span.end_col].0
+            };
+            if end_byte <= start_byte {
+                continue;
+            }
+            let slice = &line_text[start_byte..end_byte];
+            let x = text_x0 + (span.start_col as f32) * char_w;
+            dl.add_text([x, y + 2.0], span.kind.color(), slice);
+        }
+    }
+}
+
+// ---------------------------- bezier connector ------------------------------
+
+fn pack_color(c: [f32; 4]) -> u32 {
+    let to8 = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u32;
+    to8(c[0]) | (to8(c[1]) << 8) | (to8(c[2]) << 16) | (to8(c[3]) << 24)
+}
+
+fn v2(x: f32, y: f32) -> imgui::sys::ImVec2 {
+    imgui::sys::ImVec2 { x, y }
+}
+
+const BEZIER_SEGMENTS: usize = 24;
+
+fn cubic_bezier(p0: [f32; 2], p1: [f32; 2], p2: [f32; 2], p3: [f32; 2], t: f32) -> [f32; 2] {
+    let u = 1.0 - t;
+    let uu = u * u;
+    let uuu = uu * u;
+    let tt = t * t;
+    let ttt = tt * t;
+    [
+        uuu * p0[0] + 3.0 * uu * t * p1[0] + 3.0 * u * tt * p2[0] + ttt * p3[0],
+        uuu * p0[1] + 3.0 * uu * t * p1[1] + 3.0 * u * tt * p2[1] + ttt * p3[1],
+    ]
+}
+
+fn sample_curve(p0: [f32; 2], p1: [f32; 2], p2: [f32; 2], p3: [f32; 2]) -> Vec<[f32; 2]> {
+    (0..=BEZIER_SEGMENTS)
+        .map(|i| cubic_bezier(p0, p1, p2, p3, i as f32 / BEZIER_SEGMENTS as f32))
+        .collect()
+}
+
+fn fill_polygon(pts: &[[f32; 2]], color: [f32; 4]) {
+    if pts.len() < 3 {
+        return;
+    }
+    let mut flat: Vec<f32> = Vec::with_capacity(pts.len() * 2);
+    for p in pts {
+        flat.push(p[0]);
+        flat.push(p[1]);
+    }
+    let tris = match earcutr::earcut(&flat, &[], 2) {
+        Ok(t) => t,
+        Err(_) => return,
+    };
+    if tris.is_empty() {
+        return;
+    }
+    let col = pack_color(color);
+    unsafe {
+        let dl = imgui::sys::igGetWindowDrawList();
+        let mut uv = imgui::sys::ImVec2 { x: 0.0, y: 0.0 };
+        imgui::sys::igGetFontTexUvWhitePixel(&mut uv);
+        let vtx_count = pts.len() as i32;
+        let idx_count = tris.len() as i32;
+        imgui::sys::ImDrawList_PrimReserve(dl, idx_count, vtx_count);
+        let base = (*dl)._VtxCurrentIdx;
+        for p in pts {
+            imgui::sys::ImDrawList_PrimWriteVtx(dl, v2(p[0], p[1]), uv, col);
+        }
+        for &idx in &tris {
+            imgui::sys::ImDrawList_PrimWriteIdx(
+                dl,
+                (base + idx as u32) as imgui::sys::ImDrawIdx,
+            );
+        }
+    }
+}
+
+fn fill_bezier_ribbon(x_l: f32, x_r: f32, a1: f32, a2: f32, b1: f32, b2: f32, color: [f32; 4]) {
+    let cx = (x_l + x_r) * 0.5;
+    let top = sample_curve([x_l, a1], [cx, a1], [cx, b1], [x_r, b1]);
+    let bot = sample_curve([x_l, a2], [cx, a2], [cx, b2], [x_r, b2]);
+    let mut outline: Vec<[f32; 2]> = top;
+    outline.extend(bot.into_iter().rev());
+    fill_polygon(&outline, color);
+    let col = pack_color(color);
+    unsafe {
+        let dl = imgui::sys::igGetWindowDrawList();
+        imgui::sys::ImDrawList_PathClear(dl);
+        for p in &outline {
+            imgui::sys::ImDrawList_PathLineTo(dl, v2(p[0], p[1]));
+        }
+        imgui::sys::ImDrawList_PathStroke(
+            dl,
+            col,
+            imgui::sys::ImDrawFlags_Closed as i32,
+            1.0,
+        );
+    }
+}
+
+fn stroke_bezier_curve(
+    x_l: f32,
+    x_r: f32,
+    y1: f32,
+    y2: f32,
+    color: [f32; 4],
+    thickness: f32,
+) {
+    let cx = (x_l + x_r) * 0.5;
+    let col = pack_color(color);
+    unsafe {
+        let dl = imgui::sys::igGetWindowDrawList();
+        imgui::sys::ImDrawList_PathClear(dl);
+        imgui::sys::ImDrawList_PathLineTo(dl, v2(x_l, y1));
+        imgui::sys::ImDrawList_PathBezierCubicCurveTo(
+            dl,
+            v2(cx, y1),
+            v2(cx, y2),
+            v2(x_r, y2),
+            0,
+        );
+        imgui::sys::ImDrawList_PathStroke(dl, col, imgui::sys::ImDrawFlags_None as i32, thickness);
+    }
+}
+
+fn ribbon_color(is_change: bool) -> [f32; 4] {
+    if is_change {
+        theme::with_alpha(theme::BLUE, 0.28)
+    } else {
+        theme::with_alpha(theme::OVERLAY1, 0.10)
+    }
+}
+
+fn move_ribbon_alpha(dy_px: f32) -> f32 {
+    const RIBBON_ALPHA_NEAR: f32 = 0.30;
+    const RIBBON_ALPHA_FAR: f32 = 0.08;
+    const RIBBON_FADE_RANGE_PX: f32 = 800.0;
+    let t = (dy_px.abs() / RIBBON_FADE_RANGE_PX).clamp(0.0, 1.0);
+    RIBBON_ALPHA_NEAR + (RIBBON_ALPHA_FAR - RIBBON_ALPHA_NEAR) * t
+}
+
+/// Paint bezier ribbons + anchor curves in the 60px strip between the two
+/// panes. `left_origin_y` / `right_origin_y` are the screen-y of content-y=0
+/// for each pane (i.e. `widget_top - scroll_y`). `left_ranges` / `right_ranges`
+/// are content-space hunk extents per pane.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn draw_connector(
+    ui: &Ui,
+    origin: [f32; 2],
+    w: f32,
+    h: f32,
+    left_origin_y: f32,
+    right_origin_y: f32,
+    left_ranges: &[(u32, f32, f32)],
+    right_ranges: &[(u32, f32, f32)],
+    anchors: &[Anchor],
+    hunks: &[Hunk],
+) {
+    let dl = ui.get_window_draw_list();
+    dl.with_clip_rect_intersect(origin, [origin[0] + w, origin[1] + h], || {
+        let x_l = origin[0];
+        let x_r = origin[0] + w;
+        let band_top = origin[1];
+        let band_bot = origin[1] + h;
+
+        // Per-hunk change ribbons (and faint equal-hunk shading).
+        for h_obj in hunks {
+            let Some(lr) = left_ranges.iter().find(|r| r.0 == h_obj.id) else {
+                continue;
+            };
+            let Some(rr) = right_ranges.iter().find(|r| r.0 == h_obj.id) else {
+                continue;
+            };
+            let a1 = left_origin_y + lr.1;
+            let a2 = left_origin_y + lr.2;
+            let b1 = right_origin_y + rr.1;
+            let b2 = right_origin_y + rr.2;
+            if (a2 < band_top && b2 < band_top) || (a1 > band_bot && b1 > band_bot) {
+                continue;
+            }
+            fill_bezier_ribbon(x_l, x_r, a1, a2, b1, b2, ribbon_color(is_change_hunk(h_obj)));
+        }
+
+        // Moved-hunk ribbons (peach, distance-faded). Iterate only Delete-only
+        // halves to avoid double-paint.
+        for h_obj in hunks {
+            let Some(move_id) = hunk_move_id(h_obj) else { continue };
+            if h_obj.b_range != (0, 0) {
+                continue;
+            }
+            let Some(paired) = find_paired_hunk(hunks, move_id, Side::Left) else {
+                continue;
+            };
+            let Some(lr) = left_ranges.iter().find(|r| r.0 == h_obj.id) else { continue };
+            let Some(rr) = right_ranges.iter().find(|r| r.0 == paired.id) else { continue };
+            let a1 = left_origin_y + lr.1;
+            let a2 = left_origin_y + lr.2;
+            let b1 = right_origin_y + rr.1;
+            let b2 = right_origin_y + rr.2;
+            if (a2 < band_top && b2 < band_top) || (a1 > band_bot && b1 > band_bot) {
+                continue;
+            }
+            let mid_a = (a1 + a2) * 0.5;
+            let mid_b = (b1 + b2) * 0.5;
+            let alpha = move_ribbon_alpha(mid_a - mid_b);
+            fill_bezier_ribbon(x_l, x_r, a1, a2, b1, b2, theme::with_alpha(theme::PEACH, alpha));
+        }
+
+        // Anchor curves: thin line from anchor.a row centre on left to
+        // anchor.b row centre on right.
+        let lh = line_h();
+        for anc in anchors {
+            let ly = left_origin_y + (anc.a as f32 - 1.0) * lh + lh * 0.5;
+            let ry = right_origin_y + (anc.b as f32 - 1.0) * lh + lh * 0.5;
+            if (ly < band_top && ry < band_top) || (ly > band_bot && ry > band_bot) {
+                continue;
+            }
+            stroke_bezier_curve(x_l, x_r, ly, ry, theme::CRUST, 3.0);
+        }
+    });
+    let _ = dl;
 }
 
 #[derive(Copy, Clone)]

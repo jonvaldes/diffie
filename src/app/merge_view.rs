@@ -48,6 +48,9 @@ pub struct MergeViewState {
     last: [f32; 3],
     /// Pending scroll value to apply next frame on a given pane.
     pending: [Option<f32>; 3],
+    /// Bumped on external buffer mutations (undo/redo, Apply Local/Base/Remote);
+    /// mixed into the widget ID so imgui re-initialises stb_textedit from `buf`.
+    pub input_epoch: u32,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -315,8 +318,8 @@ fn render_pane(
     let lh = row_h();
     let content_h = (buf_line_count as f32 * lh).max(pane_h);
 
-    let widget_id = format!("##merge_pane_{:?}", pane);
-    let child_id = format!("##merge_pane_child_{:?}", pane);
+    let widget_id = format!("##merge_pane_{:?}_e{}", pane, state.input_epoch);
+    let child_id = format!("##merge_pane_child_{:?}_e{}", pane, state.input_epoch);
 
     let widget_rect = [
         widget_pos[0],

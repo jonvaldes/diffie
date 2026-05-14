@@ -67,6 +67,11 @@ pub struct DiffViewState {
     /// Jump-to-pair and arrival flash (unchanged).
     pub(super) pending_jump: Option<PendingJump>,
     pub(super) flash: Option<MoveFlash>,
+    /// Bumped on external buffer mutations (undo/redo, Apply A->B/B->A)
+    /// and mixed into the widget ID so imgui re-initialises its
+    /// stb_textedit state from `buf` instead of writing stale internal
+    /// bytes back.
+    pub input_epoch: u32,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]

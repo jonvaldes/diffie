@@ -776,8 +776,15 @@ fn do_undo(state: &mut AppState) {
     };
     if record.can_undo() {
         record.undo(store);
-        // The diff/merge views sync their buffers from session text at the
-        // top of every render, so no per-view epoch bump is required.
+        // imgui's input_text_multiline keeps stale stb_textedit state across
+        // frames; bumping input_epoch changes the widget ID so it
+        // re-initialises from the post-undo buffer.
+        if let Some(v) = state.diff_views.get_mut(&id) {
+            v.input_epoch = v.input_epoch.wrapping_add(1);
+        }
+        if let Some(v) = state.merge_views.get_mut(&id) {
+            v.input_epoch = v.input_epoch.wrapping_add(1);
+        }
         state.status = "undone".to_string();
     } else {
         state.status = "nothing to undo".to_string();
@@ -794,6 +801,12 @@ fn do_redo(state: &mut AppState) {
     };
     if record.can_redo() {
         record.redo(store);
+        if let Some(v) = state.diff_views.get_mut(&id) {
+            v.input_epoch = v.input_epoch.wrapping_add(1);
+        }
+        if let Some(v) = state.merge_views.get_mut(&id) {
+            v.input_epoch = v.input_epoch.wrapping_add(1);
+        }
         state.status = "redone".to_string();
     } else {
         state.status = "nothing to redo".to_string();
@@ -1162,11 +1175,20 @@ fn current_session_summary(ui: &imgui::Ui, state: &mut AppState) {
             // operation is reversible via Edit > Undo / Redo.
             if !pending_edits.is_empty() {
                 let record = state.undo_stacks.entry(id).or_default();
-                // The new multiline pane syncs its buffer from session
-                // text at the top of every `diff_view::render`, so we no
-                // longer need the per-view input-epoch trick.
+                let mut needs_epoch_bump = false;
                 for edit in pending_edits {
+                    if !matches!(edit, undo_stack::DiffEdit::SetSide { .. }) {
+                        // ReplaceHunkSide (Apply A->B / B->A) is an external
+                        // mutation from the widget's POV — bump the epoch so
+                        // imgui re-initialises stb_textedit from the new buf.
+                        needs_epoch_bump = true;
+                    }
                     record.edit(&mut state.sessions, edit);
+                }
+                if needs_epoch_bump {
+                    if let Some(v) = state.diff_views.get_mut(&id) {
+                        v.input_epoch = v.input_epoch.wrapping_add(1);
+                    }
                 }
                 state.status = "edited (Ctrl+Z to undo)".to_string();
             }

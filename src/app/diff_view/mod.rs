@@ -93,15 +93,18 @@ pub fn render(
     let (left_widget_rect, left_scroll_y) = render_pane(
         ui, state, left_pos, pane_w, pane_h, Side::Left, session_id,
         pending_edits, hunks, anchors, &hover_left, status, store,
+        a_highlights,
     );
 
-    // Connector strip — empty for now, ribbons added back in a later task.
+    // Connector strip: reserve the area; ribbons painted after both panes
+    // have rendered so we have their final widget rects + scroll_ys.
     ui.set_cursor_screen_pos(connector_pos);
     ui.invisible_button("connector_strip", [CONNECTOR_W, pane_h]);
 
     let (right_widget_rect, right_scroll_y) = render_pane(
         ui, state, right_pos, pane_w, pane_h, Side::Right, session_id,
         pending_edits, hunks, anchors, &hover_right, status, store,
+        b_highlights,
     );
 
     let prev_left = state.last_left_scroll_y;
@@ -132,6 +135,21 @@ pub fn render(
         }
     }
 
+    // Bezier connector ribbons between the two panes, drawn after both
+    // panes render so we have their final widget rects + scroll values.
+    overlay::draw_connector(
+        ui,
+        connector_pos,
+        CONNECTOR_W,
+        pane_h,
+        left_widget_rect[1] - left_scroll_y,
+        right_widget_rect[1] - right_scroll_y,
+        &left_ranges,
+        &right_ranges,
+        anchors,
+        hunks,
+    );
+
     // Draw the hover panel(s) on top, after both panes have rendered.
     if let Some((hid, pos)) = hover_left.get() {
         overlay::draw_control_overlay(
@@ -153,8 +171,6 @@ pub fn render(
     ui.set_cursor_screen_pos([panes_top_left[0], panes_top_left[1] + pane_h]);
 
     let _ = focus_request;
-    let _ = a_highlights;
-    let _ = b_highlights;
 }
 
 fn handle_anchor_click(
@@ -194,6 +210,7 @@ fn render_pane(
     hover_out: &Cell<Option<(u32, [f32; 2])>>,
     status: &mut String,
     store: &SessionStore,
+    highlights: &[crate::app::syntax::LineSpans],
 ) -> ([f32; 4], f32) {
     let g_w = gutter_w();
     let widget_pos = [pane_pos[0] + g_w, pane_pos[1]];
@@ -257,8 +274,8 @@ fn render_pane(
     let lh = crate::app::diff_view::common::line_h();
     let content_h = (buf_line_count as f32 * lh).max(pane_h);
 
-    let widget_id = format!("##diffie_pane_{:?}", side);
-    let child_id = format!("##diffie_pane_child_{:?}", side);
+    let widget_id = format!("##diffie_pane_{:?}_e{}", side, state.input_epoch);
+    let child_id = format!("##diffie_pane_child_{:?}_e{}", side, state.input_epoch);
 
     let mut scroll_y_out: f32 = 0.0;
     // Screen-space coordinates valid for the child window's draw list
@@ -274,18 +291,22 @@ fn render_pane(
         .size([widget_w, pane_h])
         .scroll_bar(true)
         .build(|| {
-            let buf = match side {
-                Side::Left => &mut state.a_buf,
-                Side::Right => &mut state.b_buf,
+            let (changed, buf_clone) = {
+                let buf = match side {
+                    Side::Left => &mut state.a_buf,
+                    Side::Right => &mut state.b_buf,
+                };
+                let changed = ui
+                    .input_text_multiline(&widget_id, buf, [widget_w, content_h])
+                    .no_undo_redo(true)
+                    .build();
+                // Read scroll AFTER build() so input events (including scroll)
+                // have been processed.
+                scroll_y_out = ui.scroll_y();
+                let clone = if changed { Some(buf.clone()) } else { None };
+                (changed, clone)
             };
-            let changed = ui
-                .input_text_multiline(&widget_id, buf, [widget_w, content_h])
-                .no_undo_redo(true)
-                .build();
-            // Read scroll AFTER build() so input events (including scroll)
-            // have been processed; reading before would return last frame's value.
-            scroll_y_out = ui.scroll_y();
-            if changed {
+            if let Some(new_text) = buf_clone {
                 let side_ref = SideRef::TwoWay(match side {
                     Side::Left => TwoWaySide::A,
                     Side::Right => TwoWaySide::B,
@@ -293,13 +314,21 @@ fn render_pane(
                 pending_edits.push(DiffEdit::SetSide {
                     session_id,
                     side: side_ref,
-                    new_text: buf.clone(),
+                    new_text,
                     old_text: None,
                 });
             }
+            let _ = changed;
 
             // Paint overlays on top of the widget.
             overlay::paint_row_overlays(ui, widget_rect, hunks, side, scroll_y_out, hover_out);
+
+            // Paint syntax-highlighted text over imgui's monochrome text.
+            let buf_for_paint: &str = match side {
+                Side::Left => &state.a_buf,
+                Side::Right => &state.b_buf,
+            };
+            overlay::paint_syntax_text(ui, widget_rect, buf_for_paint, highlights, scroll_y_out);
         });
 
     (widget_rect, scroll_y_out)
