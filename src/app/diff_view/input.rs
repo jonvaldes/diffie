@@ -64,6 +64,64 @@ pub(super) fn build_selection_splice(
     })
 }
 
+/// Like `build_selection_splice` but inserts `insert_text` in place of
+/// the selection instead of merely deleting it. The replacement
+/// preserves the prefix of `sel.lo.line_no` (up to `sel.lo.col`) and
+/// the suffix of `sel.hi.line_no` (from `sel.hi.col`), splicing
+/// `insert_text` between them. Newlines inside `insert_text` create
+/// additional replacement rows. Returns `None` when the selection
+/// refers to lines that no longer exist.
+pub(super) fn build_selection_replace_splice(
+    snap: &crate::session::DiffSession,
+    sel: &Selection,
+    insert_text: &str,
+    session_id: SessionId,
+) -> Option<DiffEdit> {
+    let crate::session::SessionMode::TwoWay { a_lines, b_lines, .. } = &snap.mode else {
+        return None;
+    };
+    let (lo, hi) = ordered_endpoints(sel);
+    let source = match sel.side {
+        Side::Left => a_lines,
+        Side::Right => b_lines,
+    };
+    let s_idx = lo.line_no.checked_sub(1)? as usize;
+    let e_idx = hi.line_no.checked_sub(1)? as usize;
+    if s_idx >= source.len() || e_idx >= source.len() {
+        return None;
+    }
+    let first_chars: Vec<char> = source[s_idx].chars().collect();
+    let last_chars: Vec<char> = source[e_idx].chars().collect();
+    let s_col = lo.col.min(first_chars.len());
+    let e_col = hi.col.min(last_chars.len());
+    let prefix: String = first_chars[..s_col].iter().collect();
+    let suffix: String = last_chars[e_col..].iter().collect();
+    let insert_lines: Vec<&str> = insert_text.split('\n').collect();
+    let replacement: Vec<String> = if insert_lines.len() == 1 {
+        vec![format!("{prefix}{}{suffix}", insert_lines[0])]
+    } else {
+        let mut out = Vec::with_capacity(insert_lines.len());
+        out.push(format!("{prefix}{}", insert_lines[0]));
+        for line in &insert_lines[1..insert_lines.len() - 1] {
+            out.push((*line).to_string());
+        }
+        out.push(format!("{}{suffix}", insert_lines[insert_lines.len() - 1]));
+        out
+    };
+    let two_way = match sel.side {
+        Side::Left => TwoWaySide::A,
+        Side::Right => TwoWaySide::B,
+    };
+    Some(DiffEdit::SpliceTwoWayLines {
+        session_id,
+        side: two_way,
+        start: s_idx,
+        end: e_idx + 1,
+        replacement,
+        old_target_lines: None,
+    })
+}
+
 /// Build the replacement vec for splitting `buf` at a character position.
 /// Returns `[prefix, suffix]` where `prefix` is `buf` up to (exclusive)
 /// `caret_char` and `suffix` is the rest. `caret_char` is a 0-based

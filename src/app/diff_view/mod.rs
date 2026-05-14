@@ -126,6 +126,13 @@ pub fn render(
     // where caret_offset is the caret's x offset from the text-start
     // column, in pixels. Read by tests to verify caret–text alignment.
     let caret_offset_cell: Cell<Option<(Side, f32)>> = Cell::new(None);
+    // Filled by `draw_row` when the user typed or pasted text into a
+    // row WHILE a multi-row cross-row `state.selection` was active.
+    // The value is the inserted text (possibly multi-line, recovered
+    // from the original clipboard if the input was a multi-line paste
+    // that imgui stripped). The post-draw handler replaces the cross-
+    // row selection range with `[prefix + inserted + suffix]`.
+    let replace_selection_with: Cell<Option<String>> = Cell::new(None);
     // Jump-to-pair request: a request set by the `↕` button last frame is
     // consumed now (the target pane scrolls to center `target_line` and a
     // `MoveFlash` is started on the arrival hunk). The cell collects any
@@ -298,6 +305,7 @@ pub fn render(
                     &clear_state_selection,
                     &pin_scroll_x_request,
                     &caret_offset_cell,
+                    &replace_selection_with,
                     hunks,
                     &pending_jump_cell,
                     state.flash,
@@ -380,6 +388,7 @@ pub fn render(
                     &clear_state_selection,
                     &pin_scroll_x_request,
                     &caret_offset_cell,
+                    &replace_selection_with,
                     hunks,
                     &pending_jump_cell,
                     state.flash,
@@ -449,6 +458,7 @@ pub fn render(
                     &clear_state_selection,
                     &pin_scroll_x_request,
                     &caret_offset_cell,
+                    &replace_selection_with,
                     hunks,
                     &pending_jump_cell,
                     state.flash,
@@ -527,6 +537,7 @@ pub fn render(
                     &clear_state_selection,
                     &pin_scroll_x_request,
                     &caret_offset_cell,
+                    &replace_selection_with,
                     hunks,
                     &pending_jump_cell,
                     state.flash,
@@ -609,6 +620,49 @@ pub fn render(
         char_w_cell.get(),
         focus_request,
     );
+
+    // Typing or pasting WHILE a multi-row `state.selection` is active:
+    // the focused row's input_text widget already inserted the typed
+    // char(s) into its single-row buf and queued a `SetTwoWayLine`
+    // (visible in `pending_edits`). Replace that with a
+    // `SpliceTwoWayLines` covering the entire cross-row range, with the
+    // inserted text in the middle. This is the cross-row analogue of
+    // imgui's "typing replaces the selection" behavior.
+    if let Some(inserted) = replace_selection_with.take() {
+        if let Some(sel) = state.selection.as_ref().cloned() {
+            if let Ok(snap) = store.snapshot(session_id) {
+                if let Some(edit) = input::build_selection_replace_splice(
+                    &snap, &sel, &inserted, session_id,
+                ) {
+                    let (lo, hi) = ordered_endpoints(&sel);
+                    let sel_side: TwoWaySide = match sel.side {
+                        Side::Left => TwoWaySide::A,
+                        Side::Right => TwoWaySide::B,
+                    };
+                    pending_edits.retain(|e| match e {
+                        DiffEdit::SetTwoWayLine {
+                            session_id: e_sid,
+                            side: e_side,
+                            line_no,
+                            ..
+                        } => !(*e_sid == session_id
+                            && *e_side == sel_side
+                            && *line_no >= lo.line_no
+                            && *line_no <= hi.line_no),
+                        _ => true,
+                    });
+                    pending_edits.push(edit);
+                    state.arrow_focus = Some((sel.side, lo.line_no, lo.col));
+                    let cur_scroll_x = match sel.side {
+                        Side::Left => left_scroll_x.get(),
+                        Side::Right => right_scroll_x.get(),
+                    };
+                    state.pin_scroll_x_after_splice = Some((sel.side, cur_scroll_x, 4));
+                    state.selection = None;
+                }
+            }
+        }
+    }
 
     // Selection + Delete/Backspace/Ctrl+X ⇒ splice the selected range out
     // of the source side. We bypass `want_capture_keyboard` so a focused

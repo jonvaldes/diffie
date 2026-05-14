@@ -3775,6 +3775,196 @@ mod headless_tests {
         );
     }
 
+    /// Typing a character while a multi-row `state.selection` is active
+    /// must replace the cross-row range with the typed text. Standard
+    /// editor behavior — typing on a selection deletes the selection
+    /// and inserts the new text. Imgui's single-line input_text only
+    /// knows about its own (collapsed-by-our-suppression) selection,
+    /// so without the cross-row replace path the typed char would only
+    /// land in the focused row.
+    #[test]
+    fn headless_wgpu_typing_with_selection_replaces_selection() {
+        let _guard = imgui_lock();
+        let Some((device, queue)) = try_init_wgpu() else {
+            eprintln!("skipping: no wgpu adapter available");
+            return;
+        };
+
+        let store = SessionStore::new();
+        let text = "alpha\nbeta\ngamma\n";
+        let id = store.open_two_way(text, text, None).unwrap();
+
+        let mut ctx = imgui::Context::create();
+        ctx.io_mut().display_size = [1200.0, 800.0];
+        ctx.io_mut().delta_time = 1.0 / 60.0;
+        ctx.io_mut().config_flags |= imgui::ConfigFlags::NAV_ENABLE_KEYBOARD;
+
+        let target_format = wgpu::TextureFormat::Rgba8UnormSrgb;
+        let mut renderer = imgui_wgpu::Renderer::new(
+            &mut ctx, &device, &queue,
+            imgui_wgpu::RendererConfig {
+                texture_format: target_format,
+                ..Default::default()
+            },
+        );
+
+        let mut view_state = DiffViewState::default();
+
+        // Activate row 1's input_text with two clicks.
+        let click_pos = [80.0, 40.0];
+        for input in [
+            FrameInput {
+                mouse_pos: Some(click_pos),
+                left_button: Some(true),
+                ..Default::default()
+            },
+            FrameInput { left_button: Some(false), ..Default::default() },
+            FrameInput {
+                mouse_pos: Some(click_pos),
+                left_button: Some(true),
+                ..Default::default()
+            },
+            FrameInput { left_button: Some(false), ..Default::default() },
+            FrameInput::default(),
+        ] {
+            run_frame_with_wgpu(
+                &mut ctx, &mut renderer, &device, &queue, target_format,
+                &store, id, &mut view_state, None, input,
+            );
+        }
+
+        // Multi-row selection: line 1 col 2 → line 2 col 3.
+        // Original lines: "alpha" (line 1), "beta" (line 2), "gamma" (line 3).
+        // Expected after typing 'X': prefix="al" + "X" + suffix="a"
+        // (suffix of "beta" from col 3 is "a") → "alXa". Line 3 untouched.
+        view_state.selection = Some(Selection {
+            side: Side::Left,
+            anchor: SelPoint { line_no: 1, col: 2 },
+            caret: SelPoint { line_no: 2, col: 3 },
+        });
+
+        // Type 'X'. add_input_character routes a printable char into
+        // the active input_text widget's stb_textedit input queue.
+        ctx.io_mut().add_input_character('X');
+        ctx.io_mut().add_mouse_pos_event(click_pos);
+        run_frame_with_wgpu(
+            &mut ctx, &mut renderer, &device, &queue, target_format,
+            &store, id, &mut view_state, None, FrameInput::default(),
+        );
+
+        let snap = store.snapshot(id).unwrap();
+        let a_lines = match snap.mode {
+            SessionMode::TwoWay { a_lines, .. } => a_lines,
+            _ => panic!("expected two-way"),
+        };
+        eprintln!("a_lines after typing 'X' with selection = {a_lines:?}");
+        assert_eq!(
+            a_lines, vec!["alXa".to_string(), "gamma".to_string()],
+            "typing 'X' should replace the cross-row selection with 'X' between \
+             prefix 'al' and suffix 'a'; got {a_lines:?}",
+        );
+        assert!(
+            view_state.selection.is_none(),
+            "selection should be cleared after the replace splice",
+        );
+    }
+
+    /// Pasting multi-line text while a multi-row `state.selection` is
+    /// active must replace the cross-row range with the pasted text.
+    /// Same path as the typing case but the inserted text comes from
+    /// the clipboard (including newlines that imgui's single-line
+    /// widget would have stripped).
+    #[test]
+    fn headless_wgpu_paste_multiline_with_selection_replaces_selection() {
+        let _guard = imgui_lock();
+        let Some((device, queue)) = try_init_wgpu() else {
+            eprintln!("skipping: no wgpu adapter available");
+            return;
+        };
+
+        let store = SessionStore::new();
+        let text = "alpha\nbeta\ngamma\n";
+        let id = store.open_two_way(text, text, None).unwrap();
+
+        let mut ctx = imgui::Context::create();
+        ctx.io_mut().display_size = [1200.0, 800.0];
+        ctx.io_mut().delta_time = 1.0 / 60.0;
+        ctx.io_mut().config_flags |= imgui::ConfigFlags::NAV_ENABLE_KEYBOARD;
+        // Pre-seed the clipboard with "X\nY".
+        ctx.set_clipboard_backend(TestClipboard { text: "X\nY".into() });
+
+        let target_format = wgpu::TextureFormat::Rgba8UnormSrgb;
+        let mut renderer = imgui_wgpu::Renderer::new(
+            &mut ctx, &device, &queue,
+            imgui_wgpu::RendererConfig {
+                texture_format: target_format,
+                ..Default::default()
+            },
+        );
+
+        let mut view_state = DiffViewState::default();
+
+        // Activate row 1's input_text.
+        let click_pos = [80.0, 40.0];
+        for input in [
+            FrameInput {
+                mouse_pos: Some(click_pos),
+                left_button: Some(true),
+                ..Default::default()
+            },
+            FrameInput { left_button: Some(false), ..Default::default() },
+            FrameInput {
+                mouse_pos: Some(click_pos),
+                left_button: Some(true),
+                ..Default::default()
+            },
+            FrameInput { left_button: Some(false), ..Default::default() },
+            FrameInput::default(),
+        ] {
+            run_frame_with_wgpu(
+                &mut ctx, &mut renderer, &device, &queue, target_format,
+                &store, id, &mut view_state, None, input,
+            );
+        }
+
+        // Multi-row selection from line 1 col 2 to line 2 col 3.
+        view_state.selection = Some(Selection {
+            side: Side::Left,
+            anchor: SelPoint { line_no: 1, col: 2 },
+            caret: SelPoint { line_no: 2, col: 3 },
+        });
+
+        // Ctrl+V.
+        ctx.io_mut().add_key_event(imgui::Key::ModCtrl, true);
+        ctx.io_mut().add_key_event(imgui::Key::V, true);
+        ctx.io_mut().add_mouse_pos_event(click_pos);
+        run_frame_with_wgpu(
+            &mut ctx, &mut renderer, &device, &queue, target_format,
+            &store, id, &mut view_state, None, FrameInput::default(),
+        );
+        ctx.io_mut().add_key_event(imgui::Key::V, false);
+        ctx.io_mut().add_key_event(imgui::Key::ModCtrl, false);
+
+        let snap = store.snapshot(id).unwrap();
+        let a_lines = match snap.mode {
+            SessionMode::TwoWay { a_lines, .. } => a_lines,
+            _ => panic!("expected two-way"),
+        };
+        eprintln!("a_lines after multi-line paste with selection = {a_lines:?}");
+        // Expected: prefix "al" + "X\nY" + suffix "a" → ["alX", "Ya"].
+        // Line 3 ("gamma") untouched.
+        assert_eq!(
+            a_lines,
+            vec!["alX".to_string(), "Ya".to_string(), "gamma".to_string()],
+            "multi-line paste should replace the selection with the paste lines \
+             attached to prefix/suffix; got {a_lines:?}",
+        );
+        assert!(
+            view_state.selection.is_none(),
+            "selection should be cleared after the replace splice",
+        );
+    }
+
     /// Ctrl+X with a multi-row `state.selection` must:
     /// 1. Splice the entire cross-row range out of the source (not just
     ///    cut the contents of the focused row).

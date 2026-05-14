@@ -135,6 +135,7 @@ pub(super) fn draw_pane(
     clear_state_selection_out: &Cell<bool>,
     pin_scroll_x_request_out: &Cell<Option<(Side, f32)>>,
     caret_offset_out: &Cell<Option<(Side, f32)>>,
+    replace_selection_with_out: &Cell<Option<String>>,
     hunks: &[Hunk],
     pending_jump_out: &Cell<Option<PendingJump>>,
     flash: Option<MoveFlash>,
@@ -186,6 +187,7 @@ pub(super) fn draw_pane(
                 clear_state_selection_out,
                 pin_scroll_x_request_out,
                 caret_offset_out,
+                replace_selection_with_out,
                 flash,
             ) {
                 click_out.set(Some(clicked_line));
@@ -446,6 +448,7 @@ fn draw_row(
     clear_state_selection_out: &Cell<bool>,
     pin_scroll_x_request_out: &Cell<Option<(Side, f32)>>,
     caret_offset_out: &Cell<Option<(Side, f32)>>,
+    replace_selection_with_out: &Cell<Option<String>>,
     flash: Option<MoveFlash>,
 ) -> Option<u32> {
     let p0 = ui.cursor_screen_pos();
@@ -723,6 +726,12 @@ fn draw_row(
     // (start_byte, end_byte). Read after `build()` so we know whether
     // imgui's input_text ended up with a selection this frame.
     let caret_selection: Cell<Option<(usize, usize)>> = Cell::new(None);
+    // Filled by the CHAR_FILTER callback with chars the user typed this
+    // frame. Used to compute the "inserted text" for the typing-with-
+    // cross-row-selection replace path. (Paste/Ctrl+V goes through a
+    // different stb_textedit path that doesn't fire CHAR_FILTER, so
+    // multi-line paste uses `pending_paste` instead.)
+    let chars_typed: std::cell::RefCell<String> = std::cell::RefCell::new(String::new());
     struct CaretCapture<'a> {
         out: &'a Cell<i32>,
         selection_out: &'a Cell<Option<(usize, usize)>>,
@@ -730,8 +739,13 @@ fn draw_row(
         seed_byte: i32,
         suppress_imgui_selection: bool,
         dbl_click_override: Option<(usize, usize)>,
+        chars_typed: &'a std::cell::RefCell<String>,
     }
     impl<'a> imgui::InputTextCallbackHandler for CaretCapture<'a> {
+        fn char_filter(&mut self, c: char) -> Option<char> {
+            self.chars_typed.borrow_mut().push(c);
+            Some(c)
+        }
         fn on_always(&mut self, mut data: imgui::TextCallbackData) {
             if self.clear_selection {
                 if self.seed_byte >= 0 {
@@ -779,7 +793,7 @@ fn draw_row(
         // level, so disable imgui's.
         .no_undo_redo(true)
         .callback(
-            imgui::InputTextCallback::ALWAYS,
+            imgui::InputTextCallback::ALWAYS | imgui::InputTextCallback::CHAR_FILTER,
             CaretCapture {
                 out: &caret_pos,
                 selection_out: &caret_selection,
@@ -788,6 +802,7 @@ fn draw_row(
                 suppress_imgui_selection: drag_on_this_side_past_threshold
                     || multi_row_selection_on_this_side,
                 dbl_click_override,
+                chars_typed: &chars_typed,
             },
         )
         .build();
@@ -937,6 +952,38 @@ fn draw_row(
         caret_offset_out.set(Some((side, caret_offset)));
     }
 
+    // Typing or pasting INTO a row while a multi-row cross-row
+    // `state.selection` exists on this side: signal that the
+    // post-draw_pane handler should replace the cross-row range with
+    // the inserted text rather than letting the focused row's
+    // SetTwoWayLine win. The signal carries the inserted text; for
+    // multi-line paste it's the original clipboard contents (since
+    // imgui's single-line widget strips newlines from the buf),
+    // otherwise it's recovered by diffing the row's pre-edit text
+    // against the post-build buf.
+    let multi_row_sel_here = input_active
+        && selection.map_or(false, |s| {
+            s.side == side && s.anchor.line_no != s.caret.line_no
+        });
+    if multi_row_sel_here && row.line_no.is_some() {
+        // Inserted text comes from either the recorded chars (typing)
+        // or from the clipboard (multi-line paste, which doesn't fire
+        // CHAR_FILTER because stb_textedit_paste uses a bulk-replace
+        // path). For single-line Ctrl+V each char fires CHAR_FILTER so
+        // `chars_typed` captures it; for multi-line Ctrl+V we rely on
+        // `pending_paste`. If both are populated we prefer the
+        // clipboard (it carries the newlines).
+        let inserted: Option<String> = if let Some(paste) = pending_paste.clone() {
+            Some(paste)
+        } else {
+            let typed = chars_typed.borrow().clone();
+            if typed.is_empty() { None } else { Some(typed) }
+        };
+        if let Some(text) = inserted {
+            replace_selection_with_out.set(Some(text));
+        }
+    }
+
     // Enter / multi-line paste: imgui's input_text is single-line, so
     // Enter is a no-op and Ctrl+V strips newlines. Detect both and
     // emit a `SpliceTwoWayLines` that produces the correct multi-line
@@ -951,7 +998,14 @@ fn draw_row(
     // Only the row whose input_text actually received the key event
     // emits a splice; otherwise BOTH panes' rows for this line would
     // compete for `line_remove` and the wrong-side splice could win.
-    let paste_target = input_active.then_some(pending_paste).flatten();
+    // When we're in replace-selection mode the post-draw handler owns
+    // the splice for this frame, so suppress the single-row paste path
+    // here.
+    let paste_target = if multi_row_sel_here {
+        None
+    } else {
+        input_active.then_some(pending_paste).flatten()
+    };
     let mut emit_splice: Option<Vec<String>> = None;
     if enter_pressed {
         // Imgui ignored Enter — `buf` and `caret_pos` are unchanged.
