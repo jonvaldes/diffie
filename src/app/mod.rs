@@ -27,9 +27,6 @@ use crate::session::{SessionId, SessionMode, SessionStore};
 mod char_diff;
 mod diff_view;
 mod engine_bar;
-pub mod input;
-#[cfg(feature = "gui")]
-mod input_imgui;
 mod merge_view;
 mod preferences;
 mod recents;
@@ -816,11 +813,15 @@ fn copy_enabled(state: &AppState) -> bool {
         return false;
     };
     match focused {
-        FocusedPane::TwoWayA | FocusedPane::TwoWayB => state
-            .diff_views
-            .get(&sid)
-            .and_then(|v| v.selection.as_ref())
-            .is_some(),
+        // TODO(task 11): re-enable once selection state is reintroduced on
+        // the multiline widget. The new `input_text_multiline` owns its own
+        // selection internally, so Copy is handled by imgui directly when
+        // the pane has focus; this path is a no-op for now.
+        FocusedPane::TwoWayA | FocusedPane::TwoWayB => {
+            let _ = &state.diff_views;
+            let _ = sid;
+            false
+        }
         FocusedPane::ThreeWayBase | FocusedPane::ThreeWayLocal | FocusedPane::ThreeWayRemote => {
             state
                 .merge_views
@@ -840,11 +841,13 @@ fn do_copy(ui: &imgui::Ui, state: &AppState) {
         return;
     };
     let text = match focused {
-        FocusedPane::TwoWayA | FocusedPane::TwoWayB => state
-            .diff_views
-            .get(&sid)
-            .and_then(|v| v.selection.as_ref())
-            .map(|sel| diff_view::extract_selection_text(&snap, sel)),
+        // TODO(task 11): wire 2-way Copy back up when selection state is
+        // reintroduced on the multiline widget. For now the multiline
+        // widget handles Ctrl+C natively, so this path is a no-op.
+        FocusedPane::TwoWayA | FocusedPane::TwoWayB => {
+            let _ = (&state.diff_views, &snap, &diff_view::extract_selection_text);
+            None
+        }
         FocusedPane::ThreeWayBase | FocusedPane::ThreeWayLocal | FocusedPane::ThreeWayRemote => {
             state
                 .merge_views
@@ -931,9 +934,12 @@ fn do_undo(state: &mut AppState) {
     };
     if record.can_undo() {
         record.undo(store);
-        if let Some(v) = state.diff_views.get_mut(&id) {
-            v.input_epoch = v.input_epoch.wrapping_add(1);
-        }
+        // TODO(task 11): bump per-view epoch so the multiline widget
+        // re-syncs from session text after an undo. The new state has
+        // no `input_epoch` yet — buffers are synced unconditionally at
+        // the top of `diff_view::render` for now.
+        let _ = &state.diff_views;
+        let _ = id;
         state.status = "undone".to_string();
     } else {
         state.status = "nothing to undo".to_string();
@@ -950,9 +956,9 @@ fn do_redo(state: &mut AppState) {
     };
     if record.can_redo() {
         record.redo(store);
-        if let Some(v) = state.diff_views.get_mut(&id) {
-            v.input_epoch = v.input_epoch.wrapping_add(1);
-        }
+        // TODO(task 11): see do_undo.
+        let _ = &state.diff_views;
+        let _ = id;
         state.status = "redone".to_string();
     } else {
         state.status = "nothing to redo".to_string();
@@ -968,13 +974,10 @@ fn do_select_all(state: &mut AppState) {
     };
     match focused {
         FocusedPane::TwoWayA | FocusedPane::TwoWayB => {
-            let side = match focused {
-                FocusedPane::TwoWayA => diff_view::Side::Left,
-                _ => diff_view::Side::Right,
-            };
-            if let Some(sel) = diff_view::select_all(&snap, side) {
-                state.diff_views.entry(sid).or_default().selection = Some(sel);
-            }
+            // TODO(task 11): re-implement Select All for the multiline
+            // widget. For now imgui handles Ctrl+A inside the focused
+            // pane natively.
+            let _ = (&state.diff_views, &snap, sid);
         }
         FocusedPane::ThreeWayBase | FocusedPane::ThreeWayLocal | FocusedPane::ThreeWayRemote => {
             let pane = match focused {
@@ -1354,23 +1357,11 @@ fn current_session_summary(ui: &imgui::Ui, state: &mut AppState) {
             // operation is reversible via Edit > Undo / Redo.
             if !pending_edits.is_empty() {
                 let record = state.undo_stacks.entry(id).or_default();
-                // A non-SetTwoWayLine edit (splice, hunk-apply) mutates
-                // lines from outside any focused row, so the focused
-                // input_text's internal stb buffer goes stale and would
-                // overwrite our session with its old contents next frame.
-                // Bump the per-view input epoch so each row's widget id
-                // changes and imgui re-inits from `buf`.
-                let mut needs_epoch_bump = false;
+                // The new multiline pane syncs its buffer from session
+                // text at the top of every `diff_view::render`, so we no
+                // longer need the per-view input-epoch trick.
                 for edit in pending_edits {
-                    if !matches!(edit, undo_stack::DiffEdit::SetTwoWayLine { .. }) {
-                        needs_epoch_bump = true;
-                    }
                     record.edit(&mut state.sessions, edit);
-                }
-                if needs_epoch_bump {
-                    if let Some(v) = state.diff_views.get_mut(&id) {
-                        v.input_epoch = v.input_epoch.wrapping_add(1);
-                    }
                 }
                 state.status = "edited (Ctrl+Z to undo)".to_string();
             }
