@@ -622,16 +622,28 @@ pub fn render(
     // — this collapses the deletion into a single undo entry whose
     // snapshot reflects the true pre-keystroke state.
     //
-    // For Ctrl+X (cut), the clipboard write itself is handled by
-    // `frame_ui`'s post-build hook in `src/app/mod.rs`; here we only
-    // own the structural deletion.
+    // For Ctrl+X (cut), the clipboard write happens INSIDE this block
+    // too — see the `ctrl_x_pressed` branch below. We must write before
+    // clearing `state.selection`, and we must run AFTER the focused
+    // row's input_text widget has already done its single-line cut
+    // (which happens during draw_row, above) so our multi-line write
+    // wins the clipboard race. `frame_ui`'s post-build hook in
+    // `src/app/mod.rs` can't help here because the splice clears
+    // `state.selection` before that hook runs.
+    let ctrl_x_pressed = ui.io().key_ctrl && ui.is_key_pressed(imgui::Key::X);
     let key_pressed = ui.is_key_pressed(imgui::Key::Delete)
         || ui.is_key_pressed(imgui::Key::Backspace)
-        || (ui.io().key_ctrl && ui.is_key_pressed(imgui::Key::X));
+        || ctrl_x_pressed;
     if key_pressed {
         if let Some(sel) = state.selection.as_ref().cloned() {
             if let Ok(snap) = store.snapshot(session_id) {
                 if let Some(edit) = build_selection_splice(&snap, &sel, session_id) {
+                    if ctrl_x_pressed {
+                        let text = extract_selection_text(&snap, &sel);
+                        if !text.is_empty() {
+                            ui.set_clipboard_text(text);
+                        }
+                    }
                     let (lo, hi) = ordered_endpoints(&sel);
                     let sel_side: TwoWaySide = match sel.side {
                         Side::Left => TwoWaySide::A,

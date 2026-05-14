@@ -3851,19 +3851,22 @@ mod headless_tests {
             caret: SelPoint { line_no: 2, col: 11 },
         });
 
-        // Frame-start do_copy mirror: write the extract.
+        // Compute the expected clipboard contents.
         let snap = store.snapshot(id).unwrap();
         let our_text = crate::app::diff_view::extract_selection_text(
             &snap, view_state.selection.as_ref().unwrap(),
         );
         eprintln!("our text = {our_text:?}");
         assert!(our_text.contains('\n'), "extract should be multi-line");
-        *clip_handle.lock().unwrap() = our_text.clone();
+        // Seed the clipboard with a sentinel so we can detect that
+        // diff_view::render did write to it during the Ctrl+X frame.
+        *clip_handle.lock().unwrap() = "SENTINEL".into();
 
         // Press Ctrl+X. ImGui's widget cuts its single-line slice
         // (writing to clipboard and deleting in-buf); diff_view::render
-        // detects the same Ctrl+X and queues a SpliceTwoWayLines that
-        // replaces the cross-row range with a merged-suffix line.
+        // detects the same Ctrl+X and (a) writes the multi-line extract
+        // to the clipboard BEFORE clearing state.selection, then (b)
+        // queues a SpliceTwoWayLines that replaces the cross-row range.
         ctx.io_mut().add_key_event(imgui::Key::ModCtrl, true);
         ctx.io_mut().add_key_event(imgui::Key::X, true);
         ctx.io_mut().add_mouse_pos_event(click_pos);
@@ -3873,9 +3876,6 @@ mod headless_tests {
         );
         ctx.io_mut().add_key_event(imgui::Key::X, false);
         ctx.io_mut().add_key_event(imgui::Key::ModCtrl, false);
-
-        // Mirror frame_ui's POST-BUILD do_copy (the fix).
-        *clip_handle.lock().unwrap() = our_text.clone();
 
         // Assertion 1: the source has been spliced (rows 1..=2 collapsed).
         // Original a_lines had 3 entries. After splicing rows 1..=2 with
