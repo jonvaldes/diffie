@@ -64,3 +64,6 @@ tree-sitter-cpp = { version = "0.23", optional = true }
 tree-sitter-c-sharp = { version = "0.23", optional = true }
 tree-sitter-hlsl = { version = "0.2", optional = true }
 tree-sitter-rust = { version = "0.24", optional = true }
+
+[dev-dependencies]
+tempfile = "3.27.0"

@@ -1238,7 +1238,7 @@ fn save_two_way_side(state: &mut AppState, side: crate::session::TwoWaySide) {
     if !text.is_empty() {
         text.push('\n');
     }
-    match fileio::write_text(&path, &text) {
+    match fileio::write_text(&path, &text, false) {
         Ok(()) => {
             state.status = format!(
                 "saved {}: {}",
@@ -1270,7 +1270,7 @@ fn save_as(state: &mut AppState) {
             return;
         }
     };
-    match fileio::write_text(&path, &text) {
+    match fileio::write_text(&path, &text, false) {
         Ok(()) => state.status = format!("saved: {}", path.display()),
         Err(e) => state.status = format!("save error: {e}"),
     }
@@ -1481,14 +1481,14 @@ fn open_two_way(state: &mut AppState) {
 
 fn open_two_way_paths(state: &mut AppState, a: PathBuf, b: PathBuf) {
     let a_text = match fileio::read_text(&a) {
-        Ok(t) => t,
+        Ok(t) => t.text,
         Err(e) => {
             state.status = format!("Read error (A): {e}");
             return;
         }
     };
     let b_text = match fileio::read_text(&b) {
-        Ok(t) => t,
+        Ok(t) => t.text,
         Err(e) => {
             state.status = format!("Read error (B): {e}");
             return;
@@ -1537,21 +1537,21 @@ fn open_three_way_paths(
     remote: PathBuf,
 ) {
     let base_text = match fileio::read_text(&base) {
-        Ok(t) => t,
+        Ok(t) => t.text,
         Err(e) => {
             state.status = format!("Read error (BASE): {e}");
             return;
         }
     };
     let local_text = match fileio::read_text(&local) {
-        Ok(t) => t,
+        Ok(t) => t.text,
         Err(e) => {
             state.status = format!("Read error (LOCAL): {e}");
             return;
         }
     };
     let remote_text = match fileio::read_text(&remote) {
-        Ok(t) => t,
+        Ok(t) => t.text,
         Err(e) => {
             state.status = format!("Read error (REMOTE): {e}");
             return;
