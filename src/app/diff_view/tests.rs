@@ -3775,6 +3775,142 @@ mod headless_tests {
         );
     }
 
+    /// Ctrl+X with a multi-row `state.selection` must:
+    /// 1. Splice the entire cross-row range out of the source (not just
+    ///    cut the contents of the focused row).
+    /// 2. Write the multi-line extract to the clipboard (same race as
+    ///    Ctrl+C — imgui's input_text writes its single-line slice
+    ///    mid-frame; our post-build do_copy overrides).
+    ///
+    /// The bug being fixed: Ctrl+X without our intervention only cut the
+    /// focused row's selected text (imgui's widget did that inside
+    /// `stb_textedit`); the other rows in our cross-row selection were
+    /// untouched and the clipboard only had one line.
+    #[test]
+    fn headless_wgpu_ctrl_x_splices_full_selection_and_writes_multiline() {
+        let _guard = imgui_lock();
+        let Some((device, queue)) = try_init_wgpu() else {
+            eprintln!("skipping: no wgpu adapter available");
+            return;
+        };
+
+        let store = SessionStore::new();
+        let text = "alpha beta\ngamma delta\nepsilon zeta\n";
+        let id = store.open_two_way(text, text, None).unwrap();
+
+        let mut ctx = imgui::Context::create();
+        ctx.io_mut().display_size = [1200.0, 800.0];
+        ctx.io_mut().delta_time = 1.0 / 60.0;
+        ctx.io_mut().config_flags |= imgui::ConfigFlags::NAV_ENABLE_KEYBOARD;
+        let clipboard = SharedClipboard::default();
+        let clip_handle = clipboard.handle();
+        ctx.set_clipboard_backend(clipboard);
+
+        let target_format = wgpu::TextureFormat::Rgba8UnormSrgb;
+        let mut renderer = imgui_wgpu::Renderer::new(
+            &mut ctx, &device, &queue,
+            imgui_wgpu::RendererConfig {
+                texture_format: target_format,
+                ..Default::default()
+            },
+        );
+
+        let mut view_state = DiffViewState::default();
+
+        // Activate row 1's input_text with two clicks (double-click).
+        let click_pos = [120.0, 40.0];
+        for input in [
+            FrameInput {
+                mouse_pos: Some(click_pos),
+                left_button: Some(true),
+                ..Default::default()
+            },
+            FrameInput { left_button: Some(false), ..Default::default() },
+            FrameInput {
+                mouse_pos: Some(click_pos),
+                left_button: Some(true),
+                ..Default::default()
+            },
+            FrameInput { left_button: Some(false), ..Default::default() },
+            FrameInput::default(),
+        ] {
+            run_frame_with_wgpu(
+                &mut ctx, &mut renderer, &device, &queue, target_format,
+                &store, id, &mut view_state, None, input,
+            );
+        }
+        assert!(
+            view_state.last_active_input_selection.is_some(),
+            "test precondition: imgui widget must have a selection from double-click",
+        );
+
+        // Set a multi-row state.selection covering rows 1..=2.
+        view_state.selection = Some(Selection {
+            side: Side::Left,
+            anchor: SelPoint { line_no: 1, col: 0 },
+            caret: SelPoint { line_no: 2, col: 11 },
+        });
+
+        // Frame-start do_copy mirror: write the extract.
+        let snap = store.snapshot(id).unwrap();
+        let our_text = crate::app::diff_view::extract_selection_text(
+            &snap, view_state.selection.as_ref().unwrap(),
+        );
+        eprintln!("our text = {our_text:?}");
+        assert!(our_text.contains('\n'), "extract should be multi-line");
+        *clip_handle.lock().unwrap() = our_text.clone();
+
+        // Press Ctrl+X. ImGui's widget cuts its single-line slice
+        // (writing to clipboard and deleting in-buf); diff_view::render
+        // detects the same Ctrl+X and queues a SpliceTwoWayLines that
+        // replaces the cross-row range with a merged-suffix line.
+        ctx.io_mut().add_key_event(imgui::Key::ModCtrl, true);
+        ctx.io_mut().add_key_event(imgui::Key::X, true);
+        ctx.io_mut().add_mouse_pos_event(click_pos);
+        run_frame_with_wgpu(
+            &mut ctx, &mut renderer, &device, &queue, target_format,
+            &store, id, &mut view_state, None, FrameInput::default(),
+        );
+        ctx.io_mut().add_key_event(imgui::Key::X, false);
+        ctx.io_mut().add_key_event(imgui::Key::ModCtrl, false);
+
+        // Mirror frame_ui's POST-BUILD do_copy (the fix).
+        *clip_handle.lock().unwrap() = our_text.clone();
+
+        // Assertion 1: the source has been spliced (rows 1..=2 collapsed).
+        // Original a_lines had 3 entries. After splicing rows 1..=2 with
+        // anchor at (1,0) and caret at (2,11) — the merge keeps prefix
+        // of row 1 (empty) and suffix of row 2 (after col 11, also
+        // empty), producing one line where rows 1-2 used to be. Plus
+        // row 3 untouched.
+        let snap_after = store.snapshot(id).unwrap();
+        let a_lines = match snap_after.mode {
+            SessionMode::TwoWay { a_lines, .. } => a_lines,
+            _ => panic!("expected two-way"),
+        };
+        eprintln!("a_lines after cut = {a_lines:?}");
+        assert_eq!(
+            a_lines.len(), 2,
+            "Cut of rows 1..=2 should collapse them into one line, leaving 2 total; got {a_lines:?}",
+        );
+        assert_eq!(
+            a_lines[1], "epsilon zeta",
+            "row 2 (was row 3) should be untouched by the splice",
+        );
+
+        // Assertion 2: clipboard has the multi-line extract.
+        let clip_final = clip_handle.lock().unwrap().clone();
+        eprintln!("clip after cut + post-build = {clip_final:?}");
+        assert!(
+            clip_final.contains('\n'),
+            "cut should put multi-line text on clipboard; got {clip_final:?}",
+        );
+        assert_eq!(
+            clip_final, our_text,
+            "post-build do_copy should make our extract the last clipboard write",
+        );
+    }
+
     /// Realistic Ctrl+A → Ctrl+C reproduction. Mirrors the user-reported
     /// "multiline copies only copy a single line" path:
     /// 1. Multi-row `state.selection` is in place (via Ctrl+A or any

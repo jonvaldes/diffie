@@ -610,18 +610,24 @@ pub fn render(
         focus_request,
     );
 
-    // Selection + Delete/Backspace ⇒ splice the selected range out of the
-    // source side. We bypass `want_capture_keyboard` so a focused row's
-    // input_text doesn't swallow Delete when a multi-line selection exists.
+    // Selection + Delete/Backspace/Ctrl+X ⇒ splice the selected range out
+    // of the source side. We bypass `want_capture_keyboard` so a focused
+    // row's input_text doesn't swallow Delete when a multi-line selection
+    // exists.
     //
     // The focused row's input_text will have *already* processed the same
-    // Backspace this frame, queuing its own `SetTwoWayLine` for line 1 (the
-    // active row) into `pending_edits`. That edit refers to a line we're
-    // about to splice out, so we drop it before pushing the Splice — this
-    // collapses the deletion into a single undo entry whose snapshot
-    // reflects the true pre-keystroke state.
+    // Backspace/Cut this frame, queuing its own `SetTwoWayLine` for line 1
+    // (the active row) into `pending_edits`. That edit refers to a line
+    // we're about to splice out, so we drop it before pushing the Splice
+    // — this collapses the deletion into a single undo entry whose
+    // snapshot reflects the true pre-keystroke state.
+    //
+    // For Ctrl+X (cut), the clipboard write itself is handled by
+    // `frame_ui`'s post-build hook in `src/app/mod.rs`; here we only
+    // own the structural deletion.
     let key_pressed = ui.is_key_pressed(imgui::Key::Delete)
-        || ui.is_key_pressed(imgui::Key::Backspace);
+        || ui.is_key_pressed(imgui::Key::Backspace)
+        || (ui.io().key_ctrl && ui.is_key_pressed(imgui::Key::X));
     if key_pressed {
         if let Some(sel) = state.selection.as_ref().cloned() {
             if let Ok(snap) = store.snapshot(session_id) {
