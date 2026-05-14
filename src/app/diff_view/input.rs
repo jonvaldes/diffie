@@ -27,13 +27,15 @@ pub(super) fn build_selection_splice(
     sel: &Selection,
     session_id: SessionId,
 ) -> Option<DiffEdit> {
-    let crate::session::SessionMode::TwoWay { a_lines, b_lines, .. } = &snap.mode else {
+    let crate::session::SessionMode::TwoWay { a_text, b_text, .. } = &snap.mode else {
         return None;
     };
     let (lo, hi) = ordered_endpoints(sel);
-    let source = match sel.side {
-        Side::Left => a_lines,
-        Side::Right => b_lines,
+    let a_lines_vec: Vec<String> = crate::session::lines_of(a_text).into_iter().map(|s| s.to_string()).collect();
+    let b_lines_vec: Vec<String> = crate::session::lines_of(b_text).into_iter().map(|s| s.to_string()).collect();
+    let source: &[String] = match sel.side {
+        Side::Left => &a_lines_vec,
+        Side::Right => &b_lines_vec,
     };
     let s_idx = lo.line_no.checked_sub(1)? as usize;
     let e_idx = hi.line_no.checked_sub(1)? as usize;
@@ -60,7 +62,7 @@ pub(super) fn build_selection_splice(
         start: s_idx,
         end: e_idx + 1,
         replacement: vec![merged],
-        old_target_lines: None,
+        old_target_text: None,
     })
 }
 
@@ -77,13 +79,15 @@ pub(super) fn build_selection_replace_splice(
     insert_text: &str,
     session_id: SessionId,
 ) -> Option<DiffEdit> {
-    let crate::session::SessionMode::TwoWay { a_lines, b_lines, .. } = &snap.mode else {
+    let crate::session::SessionMode::TwoWay { a_text, b_text, .. } = &snap.mode else {
         return None;
     };
     let (lo, hi) = ordered_endpoints(sel);
-    let source = match sel.side {
-        Side::Left => a_lines,
-        Side::Right => b_lines,
+    let a_lines_vec: Vec<String> = crate::session::lines_of(a_text).into_iter().map(|s| s.to_string()).collect();
+    let b_lines_vec: Vec<String> = crate::session::lines_of(b_text).into_iter().map(|s| s.to_string()).collect();
+    let source: &[String] = match sel.side {
+        Side::Left => &a_lines_vec,
+        Side::Right => &b_lines_vec,
     };
     let s_idx = lo.line_no.checked_sub(1)? as usize;
     let e_idx = hi.line_no.checked_sub(1)? as usize;
@@ -118,7 +122,7 @@ pub(super) fn build_selection_replace_splice(
         start: s_idx,
         end: e_idx + 1,
         replacement,
-        old_target_lines: None,
+        old_target_text: None,
     })
 }
 

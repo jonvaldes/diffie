@@ -1226,19 +1226,15 @@ fn save_two_way_side(state: &mut AppState, side: crate::session::TwoWaySide) {
             return;
         }
     };
-    let crate::session::SessionMode::TwoWay { a_lines, b_lines, .. } = &snap.mode else {
+    let crate::session::SessionMode::TwoWay { a_text, b_text, a_trailing_newline, b_trailing_newline, .. } = &snap.mode else {
         state.status = "active session is not 2-way".into();
         return;
     };
-    let lines = match side {
-        crate::session::TwoWaySide::A => a_lines,
-        crate::session::TwoWaySide::B => b_lines,
+    let (text, trailing) = match side {
+        crate::session::TwoWaySide::A => (a_text, *a_trailing_newline),
+        crate::session::TwoWaySide::B => (b_text, *b_trailing_newline),
     };
-    let mut text = lines.join("\n");
-    if !text.is_empty() {
-        text.push('\n');
-    }
-    match fileio::write_text(&path, &text, false) {
+    match fileio::write_text(&path, text, trailing) {
         Ok(()) => {
             state.status = format!(
                 "saved {}: {}",
@@ -1302,7 +1298,7 @@ fn current_session_summary(ui: &imgui::Ui, state: &mut AppState) {
     );
     ui.separator();
     match &snap.mode {
-        SessionMode::TwoWay { hunks, anchors, a_lines, b_lines, .. } => {
+        SessionMode::TwoWay { hunks, anchors, a_text, b_text, .. } => {
             anchor_bar_two_way(ui, &state.sessions, id, anchors, &mut state.status);
             ui.separator();
             // 2-way edits the source files directly — there is no separate
@@ -1322,13 +1318,17 @@ fn current_session_summary(ui: &imgui::Ui, state: &mut AppState) {
             };
             let a_key = id << 1;
             let b_key = (id << 1) | 1;
+            let a_lines_vec: Vec<String> = crate::session::lines_of(a_text)
+                .into_iter().map(|s| s.to_string()).collect();
+            let b_lines_vec: Vec<String> = crate::session::lines_of(b_text)
+                .into_iter().map(|s| s.to_string()).collect();
             let a_highlights = state
                 .syntax
-                .highlights(a_key, a_lang, a_lines)
+                .highlights(a_key, a_lang, &a_lines_vec)
                 .to_vec();
             let b_highlights = state
                 .syntax
-                .highlights(b_key, b_lang, b_lines)
+                .highlights(b_key, b_lang, &b_lines_vec)
                 .to_vec();
             let view_state = state.diff_views.entry(id).or_default();
             let mut focus_request: Option<FocusedPane> = None;
@@ -1480,15 +1480,15 @@ fn open_two_way(state: &mut AppState) {
 }
 
 fn open_two_way_paths(state: &mut AppState, a: PathBuf, b: PathBuf) {
-    let a_text = match fileio::read_text(&a) {
-        Ok(t) => t.text,
+    let a_read = match fileio::read_text(&a) {
+        Ok(t) => t,
         Err(e) => {
             state.status = format!("Read error (A): {e}");
             return;
         }
     };
-    let b_text = match fileio::read_text(&b) {
-        Ok(t) => t.text,
+    let b_read = match fileio::read_text(&b) {
+        Ok(t) => t,
         Err(e) => {
             state.status = format!("Read error (B): {e}");
             return;
@@ -1496,7 +1496,14 @@ fn open_two_way_paths(state: &mut AppState, a: PathBuf, b: PathBuf) {
     };
     let engine = Some(state.preferences.default_engine.clone());
     let opts = state.preferences.default_options;
-    match state.sessions.open_two_way_with(&a_text, &b_text, engine, opts) {
+    match state.sessions.open_two_way_with(
+        a_read.text,
+        b_read.text,
+        a_read.trailing_newline,
+        b_read.trailing_newline,
+        engine,
+        opts,
+    ) {
         Ok(id) => {
             let label = format!("{} ↔ {}", basename(&a), basename(&b));
             let recent = recents::RecentEntry::TwoWay {
@@ -1536,22 +1543,22 @@ fn open_three_way_paths(
     local: PathBuf,
     remote: PathBuf,
 ) {
-    let base_text = match fileio::read_text(&base) {
-        Ok(t) => t.text,
+    let base_read = match fileio::read_text(&base) {
+        Ok(t) => t,
         Err(e) => {
             state.status = format!("Read error (BASE): {e}");
             return;
         }
     };
-    let local_text = match fileio::read_text(&local) {
-        Ok(t) => t.text,
+    let local_read = match fileio::read_text(&local) {
+        Ok(t) => t,
         Err(e) => {
             state.status = format!("Read error (LOCAL): {e}");
             return;
         }
     };
-    let remote_text = match fileio::read_text(&remote) {
-        Ok(t) => t.text,
+    let remote_read = match fileio::read_text(&remote) {
+        Ok(t) => t,
         Err(e) => {
             state.status = format!("Read error (REMOTE): {e}");
             return;
@@ -1561,7 +1568,16 @@ fn open_three_way_paths(
     let opts = state.preferences.default_options;
     match state
         .sessions
-        .open_three_way_with(&base_text, &local_text, &remote_text, engine, opts)
+        .open_three_way_with(
+            base_read.text,
+            local_read.text,
+            remote_read.text,
+            base_read.trailing_newline,
+            local_read.trailing_newline,
+            remote_read.trailing_newline,
+            engine,
+            opts,
+        )
     {
         Ok(id) => {
             let label = format!("{} (3-way)", basename(&base));

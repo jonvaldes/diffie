@@ -7,7 +7,7 @@
 
 use undo::{Edit, Merged};
 
-use crate::session::{SessionId, SessionMode, SessionStore, TwoWaySide};
+use crate::session::{lines_of, SessionId, SessionMode, SessionStore, SideRef, TwoWaySide};
 
 /// Operations the undo stack knows how to apply / reverse.
 #[derive(Clone)]
@@ -28,9 +28,9 @@ pub enum DiffEdit {
         session_id: SessionId,
         hunk_id: u32,
         target: TwoWaySide,
-        /// Snapshot of the whole `target` side's lines BEFORE the replace,
+        /// Snapshot of the whole `target` side's text BEFORE the replace,
         /// captured inside `edit()`. Restored by `undo()`.
-        old_target_lines: Option<Vec<String>>,
+        old_target_text: Option<String>,
     },
     /// Range-replace within one side's line vector. Used for line deletion
     /// (replacement empty), line insertion (range empty), and selection-
@@ -41,7 +41,7 @@ pub enum DiffEdit {
         start: usize,
         end: usize,
         replacement: Vec<String>,
-        old_target_lines: Option<Vec<String>>,
+        old_target_text: Option<String>,
     },
 }
 
@@ -58,41 +58,43 @@ impl Edit for DiffEdit {
                 new_text,
                 old_text,
             } => {
+                let Ok(snap) = store.snapshot(*session_id) else { return };
+                let SessionMode::TwoWay { a_text, b_text, .. } = &snap.mode else { return };
+                let cur_text = match side {
+                    TwoWaySide::A => a_text,
+                    TwoWaySide::B => b_text,
+                };
+                let lines = lines_of(cur_text);
+                let idx = (*line_no as usize).checked_sub(1).unwrap_or(0);
                 if old_text.is_none() {
-                    if let Ok(snap) = store.snapshot(*session_id) {
-                        if let SessionMode::TwoWay { a_lines, b_lines, .. } = &snap.mode {
-                            let lines = match side {
-                                TwoWaySide::A => a_lines,
-                                TwoWaySide::B => b_lines,
-                            };
-                            let idx = (*line_no as usize).checked_sub(1).unwrap_or(0);
-                            if idx < lines.len() {
-                                *old_text = Some(lines[idx].clone());
-                            }
-                        }
-                    }
+                    *old_text = Some(lines.get(idx).copied().unwrap_or("").to_string());
                 }
-                let _ = store.set_two_way_line(
+                if idx >= lines.len() {
+                    return;
+                }
+                let mut new_lines: Vec<&str> = lines.clone();
+                new_lines[idx] = new_text.as_str();
+                let new_full = new_lines.join("\n");
+                let _ = store.set_side_text(
                     *session_id,
-                    *side,
-                    *line_no,
-                    new_text.clone(),
+                    SideRef::TwoWay(*side),
+                    new_full,
                 );
             }
             DiffEdit::ReplaceHunkSide {
                 session_id,
                 hunk_id,
                 target,
-                old_target_lines,
+                old_target_text,
             } => {
-                if old_target_lines.is_none() {
+                if old_target_text.is_none() {
                     if let Ok(snap) = store.snapshot(*session_id) {
-                        if let SessionMode::TwoWay { a_lines, b_lines, .. } = &snap.mode {
-                            let lines = match target {
-                                TwoWaySide::A => a_lines,
-                                TwoWaySide::B => b_lines,
+                        if let SessionMode::TwoWay { a_text, b_text, .. } = &snap.mode {
+                            let text = match target {
+                                TwoWaySide::A => a_text,
+                                TwoWaySide::B => b_text,
                             };
-                            *old_target_lines = Some(lines.clone());
+                            *old_target_text = Some(text.clone());
                         }
                     }
                 }
@@ -104,24 +106,29 @@ impl Edit for DiffEdit {
                 start,
                 end,
                 replacement,
-                old_target_lines,
+                old_target_text,
             } => {
-                if old_target_lines.is_none() {
-                    if let Ok(snap) = store.snapshot(*session_id) {
-                        if let SessionMode::TwoWay { a_lines, b_lines, .. } = &snap.mode {
-                            let lines = match side {
-                                TwoWaySide::A => a_lines,
-                                TwoWaySide::B => b_lines,
-                            };
-                            *old_target_lines = Some(lines.clone());
-                        }
-                    }
+                let Ok(snap) = store.snapshot(*session_id) else { return };
+                let SessionMode::TwoWay { a_text, b_text, .. } = &snap.mode else { return };
+                let cur_text = match side {
+                    TwoWaySide::A => a_text,
+                    TwoWaySide::B => b_text,
+                };
+                if old_target_text.is_none() {
+                    *old_target_text = Some(cur_text.clone());
                 }
-                let _ = store.splice_two_way_lines(
+                let lines = lines_of(cur_text);
+                let s = (*start).min(lines.len());
+                let e = (*end).min(lines.len()).max(s);
+                let mut out: Vec<String> = Vec::new();
+                out.extend(lines[..s].iter().map(|x| x.to_string()));
+                out.extend(replacement.iter().cloned());
+                out.extend(lines[e..].iter().map(|x| x.to_string()));
+                let new_full = out.join("\n");
+                let _ = store.set_side_text(
                     *session_id,
-                    *side,
-                    *start..*end,
-                    replacement.clone(),
+                    SideRef::TwoWay(*side),
+                    new_full,
                 );
             }
         }
@@ -136,28 +143,45 @@ impl Edit for DiffEdit {
                 old_text,
                 ..
             } => {
-                if let Some(old) = old_text.clone() {
-                    let _ = store.set_two_way_line(*session_id, *side, *line_no, old);
+                let Some(old) = old_text.clone() else { return };
+                let Ok(snap) = store.snapshot(*session_id) else { return };
+                let SessionMode::TwoWay { a_text, b_text, .. } = &snap.mode else { return };
+                let cur_text = match side {
+                    TwoWaySide::A => a_text,
+                    TwoWaySide::B => b_text,
+                };
+                let lines = lines_of(cur_text);
+                let idx = (*line_no as usize).checked_sub(1).unwrap_or(0);
+                if idx >= lines.len() {
+                    return;
                 }
+                let mut new_lines: Vec<&str> = lines.clone();
+                new_lines[idx] = old.as_str();
+                let new_full = new_lines.join("\n");
+                let _ = store.set_side_text(
+                    *session_id,
+                    SideRef::TwoWay(*side),
+                    new_full,
+                );
             }
             DiffEdit::ReplaceHunkSide {
                 session_id,
                 target,
-                old_target_lines,
+                old_target_text,
                 ..
             } => {
-                if let Some(old) = old_target_lines.clone() {
-                    let _ = store.set_two_way_lines(*session_id, *target, old);
+                if let Some(old) = old_target_text.clone() {
+                    let _ = store.set_side_text(*session_id, SideRef::TwoWay(*target), old);
                 }
             }
             DiffEdit::SpliceTwoWayLines {
                 session_id,
                 side,
-                old_target_lines,
+                old_target_text,
                 ..
             } => {
-                if let Some(old) = old_target_lines.clone() {
-                    let _ = store.set_two_way_lines(*session_id, *side, old);
+                if let Some(old) = old_target_text.clone() {
+                    let _ = store.set_side_text(*session_id, SideRef::TwoWay(*side), old);
                 }
             }
         }

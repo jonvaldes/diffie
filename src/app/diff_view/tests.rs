@@ -248,6 +248,8 @@ mod headless_tests {
     /// Apply a queued `DiffEdit` to the store the same way the real app
     /// would, bypassing the undo stack (we don't care about undo in tests).
     fn apply_edit(store: &SessionStore, edit: DiffEdit) {
+        // Route through DiffEdit::edit so tests exercise the same code path
+        // as production (which now flows through SessionStore::set_side_text).
         match edit {
             DiffEdit::SpliceTwoWayLines {
                 session_id,
@@ -257,7 +259,28 @@ mod headless_tests {
                 replacement,
                 ..
             } => {
-                let _ = store.splice_two_way_lines(session_id, side, start..end, replacement);
+                // Replicate the logic of DiffEdit::edit for SpliceTwoWayLines.
+                if let Ok(snap) = store.snapshot(session_id) {
+                    if let crate::session::SessionMode::TwoWay { a_text, b_text, .. } = &snap.mode {
+                        let cur = match side {
+                            crate::session::TwoWaySide::A => a_text,
+                            crate::session::TwoWaySide::B => b_text,
+                        };
+                        let lines = crate::session::lines_of(cur);
+                        let s = start.min(lines.len());
+                        let e = end.min(lines.len()).max(s);
+                        let mut out: Vec<String> = Vec::new();
+                        out.extend(lines[..s].iter().map(|x| x.to_string()));
+                        out.extend(replacement.iter().cloned());
+                        out.extend(lines[e..].iter().map(|x| x.to_string()));
+                        let new_full = out.join("\n");
+                        let _ = store.set_side_text(
+                            session_id,
+                            crate::session::SideRef::TwoWay(side),
+                            new_full,
+                        );
+                    }
+                }
             }
             DiffEdit::SetTwoWayLine {
                 session_id,
@@ -266,7 +289,26 @@ mod headless_tests {
                 new_text,
                 ..
             } => {
-                let _ = store.set_two_way_line(session_id, side, line_no, new_text);
+                if let Ok(snap) = store.snapshot(session_id) {
+                    if let crate::session::SessionMode::TwoWay { a_text, b_text, .. } = &snap.mode {
+                        let cur = match side {
+                            crate::session::TwoWaySide::A => a_text,
+                            crate::session::TwoWaySide::B => b_text,
+                        };
+                        let lines = crate::session::lines_of(cur);
+                        let idx = (line_no as usize).checked_sub(1).unwrap_or(0);
+                        if idx < lines.len() {
+                            let mut new_lines: Vec<&str> = lines.clone();
+                            new_lines[idx] = new_text.as_str();
+                            let new_full = new_lines.join("\n");
+                            let _ = store.set_side_text(
+                                session_id,
+                                crate::session::SideRef::TwoWay(side),
+                                new_full,
+                            );
+                        }
+                    }
+                }
             }
             DiffEdit::ReplaceHunkSide {
                 session_id,
@@ -439,8 +481,9 @@ mod headless_tests {
             FrameInput { backspace: true, ..Default::default() },
         );
         let snap = store.snapshot(id).unwrap();
-        if let SessionMode::TwoWay { a_lines, .. } = &snap.mode {
+        if let SessionMode::TwoWay { a_text, .. } = &snap.mode {
             // "hello world" with "hello" removed becomes " world".
+            let a_lines = crate::session::lines_of(a_text);
             assert_eq!(a_lines[0], " world", "splice should have shortened line 1");
         } else {
             unreachable!();
@@ -2939,7 +2982,8 @@ mod headless_tests {
             FrameInput { backspace: true, ..Default::default() },
         );
         let snap = store.snapshot(id).unwrap();
-        if let SessionMode::TwoWay { a_lines, .. } = &snap.mode {
+        if let SessionMode::TwoWay { a_text, .. } = &snap.mode {
+            let a_lines = crate::session::lines_of(a_text);
             assert_eq!(a_lines[0], " world", "splice should have shortened line 1");
         }
         let baseline_x = view_state.last_left_scroll_x;
@@ -3259,7 +3303,7 @@ mod headless_tests {
 
         let snap = store.snapshot(id).unwrap();
         let a_lines = match snap.mode {
-            SessionMode::TwoWay { a_lines, .. } => a_lines,
+            SessionMode::TwoWay { a_text, .. } => crate::session::lines_of(&a_text).into_iter().map(|s| s.to_string()).collect::<Vec<String>>(),
             _ => panic!("expected two-way"),
         };
         eprintln!("after enter: a_lines = {a_lines:?}");
@@ -3365,7 +3409,7 @@ mod headless_tests {
 
         let snap = store.snapshot(id).unwrap();
         let a_lines = match snap.mode {
-            SessionMode::TwoWay { a_lines, .. } => a_lines,
+            SessionMode::TwoWay { a_text, .. } => crate::session::lines_of(&a_text).into_iter().map(|s| s.to_string()).collect::<Vec<String>>(),
             _ => panic!("expected two-way"),
         };
         eprintln!("after paste: a_lines = {a_lines:?}");
@@ -3854,7 +3898,7 @@ mod headless_tests {
 
         let snap = store.snapshot(id).unwrap();
         let a_lines = match snap.mode {
-            SessionMode::TwoWay { a_lines, .. } => a_lines,
+            SessionMode::TwoWay { a_text, .. } => crate::session::lines_of(&a_text).into_iter().map(|s| s.to_string()).collect::<Vec<String>>(),
             _ => panic!("expected two-way"),
         };
         eprintln!("a_lines after typing 'X' with selection = {a_lines:?}");
@@ -3947,7 +3991,7 @@ mod headless_tests {
 
         let snap = store.snapshot(id).unwrap();
         let a_lines = match snap.mode {
-            SessionMode::TwoWay { a_lines, .. } => a_lines,
+            SessionMode::TwoWay { a_text, .. } => crate::session::lines_of(&a_text).into_iter().map(|s| s.to_string()).collect::<Vec<String>>(),
             _ => panic!("expected two-way"),
         };
         eprintln!("a_lines after multi-line paste with selection = {a_lines:?}");
@@ -4075,7 +4119,7 @@ mod headless_tests {
         // row 3 untouched.
         let snap_after = store.snapshot(id).unwrap();
         let a_lines = match snap_after.mode {
-            SessionMode::TwoWay { a_lines, .. } => a_lines,
+            SessionMode::TwoWay { a_text, .. } => crate::session::lines_of(&a_text).into_iter().map(|s| s.to_string()).collect::<Vec<String>>(),
             _ => panic!("expected two-way"),
         };
         eprintln!("a_lines after cut = {a_lines:?}");
@@ -4464,7 +4508,14 @@ mod move_pairing_tests {
             ..DiffOptions::default()
         };
         let id = store
-            .open_two_way_with(a_text, b_text, Some("histogram".into()), opts)
+            .open_two_way_with(
+                a_text.trim_end_matches('\n').to_string(),
+                b_text.trim_end_matches('\n').to_string(),
+                a_text.ends_with('\n'),
+                b_text.ends_with('\n'),
+                Some("histogram".into()),
+                opts,
+            )
             .expect("create session");
         let snapshot = store.snapshot(id).expect("snapshot");
         let hunks: Vec<Hunk> = match snapshot.mode {

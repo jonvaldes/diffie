@@ -287,7 +287,7 @@ fn draw_control_overlay(
             session_id,
             hunk_id,
             target: TwoWaySide::B,
-            old_target_lines: None,
+            old_target_text: None,
         });
     }
     ui.same_line();
@@ -296,7 +296,7 @@ fn draw_control_overlay(
             session_id,
             hunk_id,
             target: TwoWaySide::A,
-            old_target_lines: None,
+            old_target_text: None,
         });
     }
     if is_moved_with_pair {
@@ -1037,7 +1037,7 @@ fn draw_row(
             start: line_idx,
             end: line_idx + 1,
             replacement,
-            old_target_lines: None,
+            old_target_text: None,
         }));
     // Live commit: any change pushes a `SetTwoWayLine` onto the undo stack,
     // and the next frame's diff reflects it. Equivalent edits on the same
@@ -1076,7 +1076,7 @@ fn draw_row(
                 start: line_idx,
                 end: line_idx + 1,
                 replacement: Vec::new(),
-                old_target_lines: None,
+                old_target_text: None,
             }));
         }
     }

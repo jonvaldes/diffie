@@ -421,7 +421,14 @@ mod tests {
             ..DiffOptions::default()
         };
         let id = store
-            .open_two_way_with(a_text, b_text, Some("histogram".into()), opts)
+            .open_two_way_with(
+                a_text.trim_end_matches('\n').to_string(),
+                b_text.trim_end_matches('\n').to_string(),
+                a_text.ends_with('\n'),
+                b_text.ends_with('\n'),
+                Some("histogram".into()),
+                opts,
+            )
             .expect("create session");
         let session = store.snapshot(id).expect("snapshot");
         let hunks = match &session.mode {

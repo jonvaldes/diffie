@@ -294,12 +294,14 @@ impl Side {
 /// Build the source text for `sel.side` and slice out the selected range
 /// directly from the line vector (no row mapping needed — line_no is the key).
 pub fn extract_selection_text(snap: &crate::session::DiffSession, sel: &Selection) -> String {
-    let crate::session::SessionMode::TwoWay { a_lines, b_lines, .. } = &snap.mode else {
+    let crate::session::SessionMode::TwoWay { a_text, b_text, .. } = &snap.mode else {
         return String::new();
     };
-    let source = match sel.side {
-        Side::Left => a_lines,
-        Side::Right => b_lines,
+    let a_lines_vec: Vec<String> = crate::session::lines_of(a_text).into_iter().map(|s| s.to_string()).collect();
+    let b_lines_vec: Vec<String> = crate::session::lines_of(b_text).into_iter().map(|s| s.to_string()).collect();
+    let source: &[String] = match sel.side {
+        Side::Left => &a_lines_vec,
+        Side::Right => &b_lines_vec,
     };
     if source.is_empty() {
         return String::new();
@@ -322,12 +324,14 @@ pub fn extract_selection_text(snap: &crate::session::DiffSession, sel: &Selectio
 
 /// Select all of `side` in the active diff session.
 pub fn select_all(snap: &crate::session::DiffSession, side: Side) -> Option<Selection> {
-    let crate::session::SessionMode::TwoWay { a_lines, b_lines, .. } = &snap.mode else {
+    let crate::session::SessionMode::TwoWay { a_text, b_text, .. } = &snap.mode else {
         return None;
     };
-    let source = match side {
-        Side::Left => a_lines,
-        Side::Right => b_lines,
+    let a_lines_vec: Vec<String> = crate::session::lines_of(a_text).into_iter().map(|s| s.to_string()).collect();
+    let b_lines_vec: Vec<String> = crate::session::lines_of(b_text).into_iter().map(|s| s.to_string()).collect();
+    let source: &[String] = match side {
+        Side::Left => &a_lines_vec,
+        Side::Right => &b_lines_vec,
     };
     if source.is_empty() {
         return None;

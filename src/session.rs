@@ -3,7 +3,7 @@ use std::sync::{Mutex, atomic::{AtomicU64, Ordering}};
 
 use serde::{Deserialize, Serialize};
 
-use crate::diff::{anchored::AnchoredDiff, build_engine as build_diff_engine, group_into_hunks, myers::MyersDiff, split_lines, Anchor, DiffEngine, DiffOp, DiffOptions, Hunk};
+use crate::diff::{anchored::AnchoredDiff, build_engine as build_diff_engine, group_into_hunks, myers::MyersDiff, Anchor, DiffEngine, DiffOp, DiffOptions, Hunk};
 use crate::merge::{apply_resolutions, MergeAnchor, MergeHunk, Resolution, ThreeWayMerge};
 
 pub type SessionId = u64;
@@ -49,20 +49,36 @@ pub enum HunkDecision {
 #[derive(Debug, Clone)]
 pub enum SessionMode {
     TwoWay {
-        a_lines: Vec<String>,
-        b_lines: Vec<String>,
+        a_text: String,
+        b_text: String,
+        a_trailing_newline: bool,
+        b_trailing_newline: bool,
         anchors: Vec<Anchor>,
         hunks: Vec<Hunk>,
         decisions: HashMap<u32, HunkDecision>,
     },
     ThreeWay {
-        base_lines: Vec<String>,
-        local_lines: Vec<String>,
-        remote_lines: Vec<String>,
+        base_text: String,
+        local_text: String,
+        remote_text: String,
+        base_trailing_newline: bool,
+        local_trailing_newline: bool,
+        remote_trailing_newline: bool,
         anchors: Vec<MergeAnchor>,
         hunks: Vec<MergeHunk>,
         resolutions: HashMap<u32, Resolution>,
     },
+}
+
+/// Split a side's `String` into the `&[&str]` shape the diff engine
+/// wants. Empty strings produce one empty line; otherwise splits on
+/// `'\n'`. Cheap; do not memoize.
+pub(crate) fn lines_of(s: &str) -> Vec<&str> {
+    if s.is_empty() {
+        vec![""]
+    } else {
+        s.split('\n').collect()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -115,57 +131,57 @@ fn default_engine_name() -> String {
         .unwrap_or_else(|| "myers".to_string())
 }
 
-/// Walk all hunks in order and emit the lines that should make up the
-/// rebuilt `target` side: untouched hunks keep their current target-side
-/// content (Equal + the target's own change-op text), but the targeted
-/// hunk uses the OTHER side's content. Used by `replace_hunk_side`.
-fn rebuild_for_replace(hunks: &[Hunk], target_hunk: u32, target: TwoWaySide) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    for h in hunks {
-        let is_target = h.id == target_hunk;
-        for op in &h.ops {
-            let (include, text) = match op {
-                DiffOp::Equal { text, .. } => (true, text.clone()),
-                DiffOp::Delete { text, .. } => {
-                    let keep = if is_target {
-                        target == TwoWaySide::B
-                    } else {
-                        target == TwoWaySide::A
-                    };
-                    (keep, text.clone())
-                }
-                DiffOp::Insert { text, .. } => {
-                    let keep = if is_target {
-                        target == TwoWaySide::A
-                    } else {
-                        target == TwoWaySide::B
-                    };
-                    (keep, text.clone())
-                }
-            };
-            if include {
-                out.push(text);
-            }
-        }
+/// Return the substring of `text` covering the line range
+/// `(start_line..=end_line)`, 1-based, inclusive on both ends.
+/// If either endpoint is 0, returns "".
+fn extract_line_range(text: &str, range: (u32, u32)) -> String {
+    if range.0 == 0 || range.1 == 0 || range.0 > range.1 {
+        return String::new();
     }
-    out
+    let lines: Vec<&str> = lines_of(text);
+    let lo = (range.0 as usize).saturating_sub(1).min(lines.len());
+    let hi = (range.1 as usize).min(lines.len());
+    if lo >= hi {
+        return String::new();
+    }
+    lines[lo..hi].join("\n")
 }
 
-fn refs<'a>(v: &'a [String]) -> Vec<&'a str> {
-    v.iter().map(|s| s.as_str()).collect()
+/// Replace lines in `text` covering `range` (1-based inclusive) with
+/// `replacement`. If range is (0, 0), insert at the end.
+fn replace_line_range_in_text(text: &mut String, range: (u32, u32), replacement: &str) {
+    if range.0 == 0 || range.1 == 0 {
+        if !text.is_empty() && !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str(replacement);
+        return;
+    }
+    let lines: Vec<&str> = lines_of(text);
+    let lo = (range.0 as usize).saturating_sub(1).min(lines.len());
+    let hi = (range.1 as usize).min(lines.len());
+    let mut out: Vec<&str> = Vec::new();
+    out.extend(lines[..lo].iter().copied());
+    if !replacement.is_empty() {
+        out.extend(replacement.split('\n'));
+    }
+    out.extend(lines[hi..].iter().copied());
+    *text = out.join("\n");
 }
 
 fn recompute_two_way(
     engine_name: &str,
-    a_lines: &[String],
-    b_lines: &[String],
+    a_text: &str,
+    b_text: &str,
     anchors: &[Anchor],
     opts: &DiffOptions,
 ) -> Result<Vec<Hunk>, SessionError> {
     let inner = build_engine(engine_name)?;
     let caps = inner.capabilities();
-    let a = refs(a_lines);
-    let b = refs(b_lines);
+    let a_lines_vec = lines_of(a_text);
+    let b_lines_vec = lines_of(b_text);
+    let a: Vec<&str> = a_lines_vec.iter().copied().collect();
+    let b: Vec<&str> = b_lines_vec.iter().copied().collect();
     let ops: Vec<DiffOp> = if anchors.is_empty() {
         inner.diff(&a, &b, opts)
     } else {
@@ -214,26 +230,32 @@ fn split_trivial_equals(ops: Vec<DiffOp>) -> Vec<DiffOp> {
 
 fn recompute_three_way(
     engine_name: &str,
-    base: &[String],
-    local: &[String],
-    remote: &[String],
+    base_text: &str,
+    local_text: &str,
+    remote_text: &str,
     anchors: &[MergeAnchor],
     opts: &DiffOptions,
 ) -> Result<Vec<MergeHunk>, SessionError> {
+    let base_vec = lines_of(base_text);
+    let local_vec = lines_of(local_text);
+    let remote_vec = lines_of(remote_text);
+    let base: Vec<&str> = base_vec.iter().copied().collect();
+    let local: Vec<&str> = local_vec.iter().copied().collect();
+    let remote: Vec<&str> = remote_vec.iter().copied().collect();
     // Three-way merge is generic over a concrete engine type for performance,
     // so we dispatch by name. Initial set: myers, patience, histogram.
     match engine_name {
         "myers" => {
             let m = ThreeWayMerge::new(MyersDiff);
-            Ok(m.merge(&refs(base), &refs(local), &refs(remote), anchors, opts))
+            Ok(m.merge(&base, &local, &remote, anchors, opts))
         }
         "patience" => {
             let m = ThreeWayMerge::new(crate::diff::patience::PatienceDiff);
-            Ok(m.merge(&refs(base), &refs(local), &refs(remote), anchors, opts))
+            Ok(m.merge(&base, &local, &remote, anchors, opts))
         }
         "histogram" => {
             let m = ThreeWayMerge::new(crate::diff::histogram::HistogramDiff);
-            Ok(m.merge(&refs(base), &refs(local), &refs(remote), anchors, opts))
+            Ok(m.merge(&base, &local, &remote, anchors, opts))
         }
         other => Err(SessionError::UnknownEngine(other.to_string())),
     }
@@ -250,25 +272,38 @@ impl SessionStore {
         b_text: &str,
         engine: Option<String>,
     ) -> Result<SessionId, SessionError> {
-        self.open_two_way_with(a_text, b_text, engine, DiffOptions::default())
+        self.open_two_way_with(
+            a_text.trim_end_matches('\n').to_string(),
+            b_text.trim_end_matches('\n').to_string(),
+            a_text.ends_with('\n'),
+            b_text.ends_with('\n'),
+            engine,
+            DiffOptions::default(),
+        )
     }
 
     pub fn open_two_way_with(
         &self,
-        a_text: &str,
-        b_text: &str,
+        a_text: String,
+        b_text: String,
+        a_trailing_newline: bool,
+        b_trailing_newline: bool,
         engine: Option<String>,
         options: DiffOptions,
     ) -> Result<SessionId, SessionError> {
         let engine = engine.unwrap_or_else(default_engine_name);
-        let a_lines: Vec<String> = split_lines(a_text).into_iter().map(|s| s.to_string()).collect();
-        let b_lines: Vec<String> = split_lines(b_text).into_iter().map(|s| s.to_string()).collect();
-        let hunks = recompute_two_way(&engine, &a_lines, &b_lines, &[], &options)?;
+        let hunks = recompute_two_way(&engine, &a_text, &b_text, &[], &options)?;
         let id = self.alloc_id();
         let s = DiffSession {
             id, engine, options,
             mode: SessionMode::TwoWay {
-                a_lines, b_lines, anchors: vec![], hunks, decisions: HashMap::new(),
+                a_text,
+                b_text,
+                a_trailing_newline,
+                b_trailing_newline,
+                anchors: vec![],
+                hunks,
+                decisions: HashMap::new(),
             },
             manual_result: None,
         };
@@ -283,27 +318,44 @@ impl SessionStore {
         remote_text: &str,
         engine: Option<String>,
     ) -> Result<SessionId, SessionError> {
-        self.open_three_way_with(base_text, local_text, remote_text, engine, DiffOptions::default())
+        self.open_three_way_with(
+            base_text.trim_end_matches('\n').to_string(),
+            local_text.trim_end_matches('\n').to_string(),
+            remote_text.trim_end_matches('\n').to_string(),
+            base_text.ends_with('\n'),
+            local_text.ends_with('\n'),
+            remote_text.ends_with('\n'),
+            engine,
+            DiffOptions::default(),
+        )
     }
 
     pub fn open_three_way_with(
         &self,
-        base_text: &str,
-        local_text: &str,
-        remote_text: &str,
+        base_text: String,
+        local_text: String,
+        remote_text: String,
+        base_trailing_newline: bool,
+        local_trailing_newline: bool,
+        remote_trailing_newline: bool,
         engine: Option<String>,
         options: DiffOptions,
     ) -> Result<SessionId, SessionError> {
         let engine = engine.unwrap_or_else(default_engine_name);
-        let base_lines: Vec<String> = split_lines(base_text).into_iter().map(|s| s.to_string()).collect();
-        let local_lines: Vec<String> = split_lines(local_text).into_iter().map(|s| s.to_string()).collect();
-        let remote_lines: Vec<String> = split_lines(remote_text).into_iter().map(|s| s.to_string()).collect();
-        let hunks = recompute_three_way(&engine, &base_lines, &local_lines, &remote_lines, &[], &options)?;
+        let hunks = recompute_three_way(&engine, &base_text, &local_text, &remote_text, &[], &options)?;
         let id = self.alloc_id();
         let s = DiffSession {
             id, engine, options,
             mode: SessionMode::ThreeWay {
-                base_lines, local_lines, remote_lines, anchors: vec![], hunks, resolutions: HashMap::new(),
+                base_text,
+                local_text,
+                remote_text,
+                base_trailing_newline,
+                local_trailing_newline,
+                remote_trailing_newline,
+                anchors: vec![],
+                hunks,
+                resolutions: HashMap::new(),
             },
             manual_result: None,
         };
@@ -340,145 +392,73 @@ impl SessionStore {
         hunk_id: u32,
         target: TwoWaySide,
     ) -> Result<(), SessionError> {
-        self.with(id, |s| {
-            let engine = s.engine.clone();
-            let options = s.options;
-            match &mut s.mode {
-                SessionMode::TwoWay {
-                    a_lines,
-                    b_lines,
-                    anchors,
-                    hunks,
-                    ..
-                } => {
-                    let rebuilt = rebuild_for_replace(hunks, hunk_id, target);
-                    match target {
-                        TwoWaySide::A => *a_lines = rebuilt,
-                        TwoWaySide::B => *b_lines = rebuilt,
-                    }
-                    let new_hunks = recompute_two_way(&engine, a_lines, b_lines, anchors, &options)?;
-                    *hunks = new_hunks;
-                    Ok(())
-                }
-                _ => Err(SessionError::WrongMode),
+        let mut sessions = self.sessions.lock().unwrap();
+        let s = sessions.get_mut(&id).ok_or(SessionError::UnknownSession(id))?;
+        let hunk = {
+            let SessionMode::TwoWay { hunks, .. } = &s.mode else {
+                return Err(SessionError::WrongMode);
+            };
+            hunks
+                .iter()
+                .find(|h| h.id == hunk_id)
+                .ok_or(SessionError::WrongMode)?
+                .clone()
+        };
+        let (source_slice, target_range, target_is_b) = {
+            let SessionMode::TwoWay { a_text, b_text, .. } = &s.mode else {
+                unreachable!()
+            };
+            match target {
+                TwoWaySide::B => (extract_line_range(a_text, hunk.a_range), hunk.b_range, true),
+                TwoWaySide::A => (extract_line_range(b_text, hunk.b_range), hunk.a_range, false),
             }
-        })
+        };
+        let SessionMode::TwoWay { a_text, b_text, .. } = &mut s.mode else { unreachable!() };
+        if target_is_b {
+            replace_line_range_in_text(b_text, target_range, &source_slice);
+        } else {
+            replace_line_range_in_text(a_text, target_range, &source_slice);
+        }
+        let engine = s.engine.clone();
+        let options = s.options;
+        match &mut s.mode {
+            SessionMode::TwoWay { a_text, b_text, anchors, hunks, .. } => {
+                *hunks = recompute_two_way(&engine, a_text, b_text, anchors, &options)?;
+            }
+            _ => unreachable!(),
+        }
+        Ok(())
     }
 
-    /// Replace `target_side[range]` with `replacement` and recompute hunks.
-    /// The unified "structural edit" used by line deletes, line inserts, and
-    /// range deletions of selected text.
-    pub fn splice_two_way_lines(
+    /// Replace the entire text of one side and recompute hunks. The unified
+    /// editor entry point — Task 11 will route all UI edits through this.
+    pub fn set_side_text(
         &self,
         id: SessionId,
-        side: TwoWaySide,
-        range: std::ops::Range<usize>,
-        replacement: Vec<String>,
+        side: SideRef,
+        new_text: String,
     ) -> Result<(), SessionError> {
-        self.with(id, |s| {
-            let engine = s.engine.clone();
-            let options = s.options;
-            match &mut s.mode {
-                SessionMode::TwoWay {
-                    a_lines,
-                    b_lines,
-                    anchors,
-                    hunks,
-                    ..
-                } => {
-                    let target_len = match side {
-                        TwoWaySide::A => a_lines.len(),
-                        TwoWaySide::B => b_lines.len(),
-                    };
-                    let start = range.start.min(target_len);
-                    let end = range.end.min(target_len).max(start);
-                    match side {
-                        TwoWaySide::A => {
-                            a_lines.splice(start..end, replacement.into_iter());
-                        }
-                        TwoWaySide::B => {
-                            b_lines.splice(start..end, replacement.into_iter());
-                        }
-                    }
-                    let new_hunks = recompute_two_way(&engine, a_lines, b_lines, anchors, &options)?;
-                    *hunks = new_hunks;
-                    Ok(())
-                }
-                _ => Err(SessionError::WrongMode),
+        let mut sessions = self.sessions.lock().unwrap();
+        let s = sessions.get_mut(&id).ok_or(SessionError::UnknownSession(id))?;
+        match (&mut s.mode, side) {
+            (SessionMode::TwoWay { a_text, .. }, SideRef::TwoWay(TwoWaySide::A)) => *a_text = new_text,
+            (SessionMode::TwoWay { b_text, .. }, SideRef::TwoWay(TwoWaySide::B)) => *b_text = new_text,
+            (SessionMode::ThreeWay { base_text, .. }, SideRef::ThreeWay(ThreeWaySide::Base)) => *base_text = new_text,
+            (SessionMode::ThreeWay { local_text, .. }, SideRef::ThreeWay(ThreeWaySide::Local)) => *local_text = new_text,
+            (SessionMode::ThreeWay { remote_text, .. }, SideRef::ThreeWay(ThreeWaySide::Remote)) => *remote_text = new_text,
+            _ => return Err(SessionError::WrongMode),
+        }
+        let engine = s.engine.clone();
+        let options = s.options;
+        match &mut s.mode {
+            SessionMode::TwoWay { a_text, b_text, anchors, hunks, .. } => {
+                *hunks = recompute_two_way(&engine, a_text, b_text, anchors, &options)?;
             }
-        })
-    }
-
-    /// Replace the entire contents of one side of a 2-way session and
-    /// recompute hunks. Used by undo to restore a whole-buffer snapshot
-    /// after `replace_hunk_side`.
-    pub fn set_two_way_lines(
-        &self,
-        id: SessionId,
-        side: TwoWaySide,
-        new_lines: Vec<String>,
-    ) -> Result<(), SessionError> {
-        self.with(id, |s| {
-            let engine = s.engine.clone();
-            let options = s.options;
-            match &mut s.mode {
-                SessionMode::TwoWay {
-                    a_lines,
-                    b_lines,
-                    anchors,
-                    hunks,
-                    ..
-                } => {
-                    match side {
-                        TwoWaySide::A => *a_lines = new_lines,
-                        TwoWaySide::B => *b_lines = new_lines,
-                    }
-                    let new_hunks = recompute_two_way(&engine, a_lines, b_lines, anchors, &options)?;
-                    *hunks = new_hunks;
-                    Ok(())
-                }
-                _ => Err(SessionError::WrongMode),
+            SessionMode::ThreeWay { base_text, local_text, remote_text, anchors, hunks, .. } => {
+                *hunks = recompute_three_way(&engine, base_text, local_text, remote_text, anchors, &options)?;
             }
-        })
-    }
-
-    /// Replace a single line of the underlying A or B file (1-based line
-    /// number) and recompute hunks. Used by the diff view's in-place row
-    /// editor in 2-way comparisons.
-    pub fn set_two_way_line(
-        &self,
-        id: SessionId,
-        side: TwoWaySide,
-        line_no: u32,
-        text: String,
-    ) -> Result<(), SessionError> {
-        self.with(id, |s| {
-            let engine = s.engine.clone();
-            let options = s.options;
-            match &mut s.mode {
-                SessionMode::TwoWay {
-                    a_lines,
-                    b_lines,
-                    anchors,
-                    hunks,
-                    ..
-                } => {
-                    let idx = (line_no as usize).checked_sub(1).unwrap_or(0);
-                    let target = match side {
-                        TwoWaySide::A => &mut *a_lines,
-                        TwoWaySide::B => &mut *b_lines,
-                    };
-                    if idx >= target.len() {
-                        return Err(SessionError::WrongMode);
-                    }
-                    target[idx] = text;
-                    let new_hunks = recompute_two_way(&engine, a_lines, b_lines, anchors, &options)?;
-                    *hunks = new_hunks;
-                    Ok(())
-                }
-                _ => Err(SessionError::WrongMode),
-            }
-        })
+        }
+        Ok(())
     }
 
     pub fn add_anchor_two_way(&self, id: SessionId, anchor: Anchor) -> Result<(), SessionError> {
@@ -486,11 +466,11 @@ impl SessionStore {
             let engine = s.engine.clone();
             let options = s.options;
             match &mut s.mode {
-                SessionMode::TwoWay { a_lines, b_lines, anchors, hunks, .. } => {
+                SessionMode::TwoWay { a_text, b_text, anchors, hunks, .. } => {
                     let mut new_anchors = anchors.clone();
                     new_anchors.push(anchor);
                     new_anchors.sort_by_key(|a| (a.a, a.b));
-                    let new_hunks = recompute_two_way(&engine, a_lines, b_lines, &new_anchors, &options)?;
+                    let new_hunks = recompute_two_way(&engine, a_text, b_text, &new_anchors, &options)?;
                     *anchors = new_anchors;
                     *hunks = new_hunks;
                     Ok(())
@@ -505,11 +485,11 @@ impl SessionStore {
             let engine = s.engine.clone();
             let options = s.options;
             match &mut s.mode {
-                SessionMode::ThreeWay { base_lines, local_lines, remote_lines, anchors, hunks, .. } => {
+                SessionMode::ThreeWay { base_text, local_text, remote_text, anchors, hunks, .. } => {
                     let mut new_anchors = anchors.clone();
                     new_anchors.push(anchor);
                     new_anchors.sort_by_key(|a| a.base);
-                    let new_hunks = recompute_three_way(&engine, base_lines, local_lines, remote_lines, &new_anchors, &options)?;
+                    let new_hunks = recompute_three_way(&engine, base_text, local_text, remote_text, &new_anchors, &options)?;
                     *anchors = new_anchors;
                     *hunks = new_hunks;
                     Ok(())
@@ -524,16 +504,16 @@ impl SessionStore {
             let engine = s.engine.clone();
             let options = s.options;
             match &mut s.mode {
-                SessionMode::TwoWay { a_lines, b_lines, anchors, hunks, .. } => {
+                SessionMode::TwoWay { a_text, b_text, anchors, hunks, .. } => {
                     if idx >= anchors.len() { return Ok(()); }
                     anchors.remove(idx);
-                    *hunks = recompute_two_way(&engine, a_lines, b_lines, anchors, &options)?;
+                    *hunks = recompute_two_way(&engine, a_text, b_text, anchors, &options)?;
                     Ok(())
                 }
-                SessionMode::ThreeWay { base_lines, local_lines, remote_lines, anchors, hunks, .. } => {
+                SessionMode::ThreeWay { base_text, local_text, remote_text, anchors, hunks, .. } => {
                     if idx >= anchors.len() { return Ok(()); }
                     anchors.remove(idx);
-                    *hunks = recompute_three_way(&engine, base_lines, local_lines, remote_lines, anchors, &options)?;
+                    *hunks = recompute_three_way(&engine, base_text, local_text, remote_text, anchors, &options)?;
                     Ok(())
                 }
             }
@@ -547,11 +527,11 @@ impl SessionStore {
             s.engine = engine.clone();
             let options = s.options;
             match &mut s.mode {
-                SessionMode::TwoWay { a_lines, b_lines, anchors, hunks, .. } => {
-                    *hunks = recompute_two_way(&engine, a_lines, b_lines, anchors, &options)?;
+                SessionMode::TwoWay { a_text, b_text, anchors, hunks, .. } => {
+                    *hunks = recompute_two_way(&engine, a_text, b_text, anchors, &options)?;
                 }
-                SessionMode::ThreeWay { base_lines, local_lines, remote_lines, anchors, hunks, .. } => {
-                    *hunks = recompute_three_way(&engine, base_lines, local_lines, remote_lines, anchors, &options)?;
+                SessionMode::ThreeWay { base_text, local_text, remote_text, anchors, hunks, .. } => {
+                    *hunks = recompute_three_way(&engine, base_text, local_text, remote_text, anchors, &options)?;
                 }
             }
             Ok(())
@@ -563,11 +543,11 @@ impl SessionStore {
             s.options = options;
             let engine = s.engine.clone();
             match &mut s.mode {
-                SessionMode::TwoWay { a_lines, b_lines, anchors, hunks, .. } => {
-                    *hunks = recompute_two_way(&engine, a_lines, b_lines, anchors, &options)?;
+                SessionMode::TwoWay { a_text, b_text, anchors, hunks, .. } => {
+                    *hunks = recompute_two_way(&engine, a_text, b_text, anchors, &options)?;
                 }
-                SessionMode::ThreeWay { base_lines, local_lines, remote_lines, anchors, hunks, .. } => {
-                    *hunks = recompute_three_way(&engine, base_lines, local_lines, remote_lines, anchors, &options)?;
+                SessionMode::ThreeWay { base_text, local_text, remote_text, anchors, hunks, .. } => {
+                    *hunks = recompute_three_way(&engine, base_text, local_text, remote_text, anchors, &options)?;
                 }
             }
             Ok(())
