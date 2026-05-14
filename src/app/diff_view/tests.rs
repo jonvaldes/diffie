@@ -12,7 +12,7 @@ pub(super) use super::render;
 pub(super) use super::super::undo_stack::DiffEdit;
 
 use crate::diff::{DiffOp, DiffOptions};
-use crate::session::{SessionId, SessionMode, SessionStore, SideRef, TwoWaySide};
+use crate::session::{SessionId, SessionMode, SessionStore, TwoWaySide};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 /// `imgui::Context` is a process-global singleton. `cargo test` runs
@@ -65,47 +65,6 @@ fn apply_edit(store: &SessionStore, edit: DiffEdit) {
             session_id, hunk_id, target, ..
         } => {
             let _ = store.replace_hunk_side(session_id, hunk_id, target);
-        }
-        // Legacy variants — route through set_side_text for completeness.
-        DiffEdit::SpliceTwoWayLines {
-            session_id, side, start, end, replacement, ..
-        } => {
-            if let Ok(snap) = store.snapshot(session_id) {
-                if let SessionMode::TwoWay { a_text, b_text, .. } = &snap.mode {
-                    let cur = match side {
-                        TwoWaySide::A => a_text,
-                        TwoWaySide::B => b_text,
-                    };
-                    let lines: Vec<&str> = cur.split('\n').collect();
-                    let s = start.min(lines.len());
-                    let e = end.min(lines.len()).max(s);
-                    let mut out: Vec<String> = Vec::new();
-                    out.extend(lines[..s].iter().map(|x| x.to_string()));
-                    out.extend(replacement.iter().cloned());
-                    out.extend(lines[e..].iter().map(|x| x.to_string()));
-                    let new_full = out.join("\n");
-                    let _ = store.set_side_text(session_id, SideRef::TwoWay(side), new_full);
-                }
-            }
-        }
-        DiffEdit::SetTwoWayLine {
-            session_id, side, line_no, new_text, ..
-        } => {
-            if let Ok(snap) = store.snapshot(session_id) {
-                if let SessionMode::TwoWay { a_text, b_text, .. } = &snap.mode {
-                    let cur = match side {
-                        TwoWaySide::A => a_text,
-                        TwoWaySide::B => b_text,
-                    };
-                    let mut lines: Vec<String> = cur.split('\n').map(|s| s.to_string()).collect();
-                    let idx = (line_no as usize).checked_sub(1).unwrap_or(0);
-                    if idx < lines.len() {
-                        lines[idx] = new_text;
-                        let new_full = lines.join("\n");
-                        let _ = store.set_side_text(session_id, SideRef::TwoWay(side), new_full);
-                    }
-                }
-            }
         }
     }
 }

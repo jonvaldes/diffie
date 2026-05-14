@@ -48,10 +48,6 @@ pub struct MergeViewState {
     last: [f32; 3],
     /// Pending scroll value to apply next frame on a given pane.
     pending: [Option<f32>; 3],
-    /// Held for ABI compatibility with `mod.rs`: legacy 3-way Copy/Select-All
-    /// plumbing reads `state.merge_views[..].selection`. Always `None`
-    /// post-rewrite; multiline widgets handle Ctrl+C/Ctrl+A natively.
-    pub selection: Option<()>,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -69,20 +65,6 @@ impl Pane {
             Pane::Remote => crate::app::FocusedPane::ThreeWayRemote,
         }
     }
-}
-
-/// Legacy 3-way Copy hook. The multiline widgets handle Ctrl+C natively
-/// now; this stub keeps `app::mod` compiling and may be reintroduced in
-/// task 11 if cross-pane copy needs custom plumbing.
-#[allow(dead_code)]
-pub fn extract_selection_text(_snap: &crate::session::DiffSession, _sel: &()) -> String {
-    String::new()
-}
-
-/// Legacy 3-way Select-All hook. Multiline widgets handle Ctrl+A natively.
-#[allow(dead_code)]
-pub fn select_all(_snap: &crate::session::DiffSession, _pane: Pane) -> Option<()> {
-    None
 }
 
 // ---------- layout (per-pane line ranges, used by connector + sync) ----------

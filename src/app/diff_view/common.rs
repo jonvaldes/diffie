@@ -76,20 +76,13 @@ pub enum Side {
 }
 
 impl Side {
+    #[allow(dead_code)]
     pub fn as_focused_pane(self) -> crate::app::FocusedPane {
         match self {
             Side::Left => crate::app::FocusedPane::TwoWayA,
             Side::Right => crate::app::FocusedPane::TwoWayB,
         }
     }
-}
-
-/// TODO(task 11): re-implement once selection state is reintroduced on
-/// the multiline widget. For now this is a no-op stub so the
-/// app-level Copy plumbing still compiles.
-#[allow(dead_code)]
-pub fn extract_selection_text(_snap: &crate::session::DiffSession) -> String {
-    String::new()
 }
 
 // ---------------------------------------------------------------------------

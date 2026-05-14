@@ -131,13 +131,11 @@ struct AppState {
     /// Set by the File > Quit menu / Ctrl+Q shortcut. The event-loop handler
     /// checks this after each frame and calls `event_loop.exit()`.
     quit_requested: bool,
-    /// Which pane (in which session) holds the input focus. Drives the
-    /// Edit menu items so Copy/Paste/Select-All route to the right view.
+    /// Which pane (in which session) holds the input focus. Currently only
+    /// updated by view code for diagnostics; the Edit menu no longer routes
+    /// clipboard operations through this field since `input_text_multiline`
+    /// handles Cut/Copy/Paste/Select-All natively inside the focused widget.
     focused: Option<(SessionId, FocusedPane)>,
-    /// Edit-menu key events to inject before the next frame so imgui's
-    /// `input_text_multiline` handles Cut/Copy/Paste/SelectAll natively
-    /// when the result pane is the focused widget.
-    pending_keys: Vec<PendingKey>,
     /// Set when the user changes code-font zoom; the next render call clears
     /// the imgui font atlas, re-adds Roboto + Roboto Mono at the new size,
     /// reloads the GPU font texture, and stores the new mono `FontId`.
@@ -165,17 +163,10 @@ struct AppState {
     preferences_draft: preferences::AppPreferences,
 }
 
-#[derive(Clone, Copy, Debug)]
-enum PendingKey {
-    Cut,
-    Copy,
-    Paste,
-    SelectAll,
-}
-
-/// Identifier shared between diff/merge views and the result pane so the
-/// Edit menu and clipboard handlers can talk about "the focused pane"
-/// without a generic-side enum.
+/// Identifier shared between diff/merge views and the result pane so view
+/// code can record "the focused pane" without a generic-side enum. The Edit
+/// menu no longer dispatches by this — imgui's `input_text_multiline`
+/// handles clipboard ops inside the focused widget.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FocusedPane {
     TwoWayA,
@@ -199,7 +190,6 @@ impl Default for AppState {
             mono_font: None,
             quit_requested: false,
             focused: None,
-            pending_keys: Vec::new(),
             font_rebuild_pending: false,
             recents: recents::load(),
             undo_stacks: HashMap::new(),
@@ -416,16 +406,6 @@ fn render(gpu: &mut Gpu, state: &mut AppState) {
             .reload_font_texture(&mut gpu.imgui, &gpu.device, &gpu.queue);
     }
 
-    // Drain Edit-menu key events into imgui's input queue *before* NewFrame
-    // so imgui's input_text widget sees them this frame (it polls io's
-    // events at the start of new_frame).
-    {
-        let io = gpu.imgui.io_mut();
-        for k in state.pending_keys.drain(..) {
-            inject_pending_key(io, k);
-        }
-    }
-
     gpu.platform
         .prepare_frame(gpu.imgui.io_mut(), &gpu.window)
         .expect("prepare imgui frame");
@@ -498,27 +478,6 @@ fn frame_ui(ui: &imgui::Ui, state: &mut AppState) {
             ui.separator();
             current_session_summary(ui, state);
         });
-
-    // Re-apply our cross-row clipboard write AFTER all input_text widgets
-    // have built. ImGui's input_text processes Ctrl+C inside
-    // stb_textedit BEFORE our suppression callback fires, so a focused
-    // row's widget can write its single-line selection to the clipboard
-    // mid-frame and overwrite our text. Running do_copy again here makes
-    // our extract the last write of the frame. For Result-pane focus we
-    // skip — imgui's input_text_multiline owns the clipboard semantics
-    // there.
-    //
-    // Ctrl+X is NOT handled here: the splice handler inside
-    // `diff_view::render` clears `state.selection` (the cut range no
-    // longer exists), so `copy_enabled` would return false on this path.
-    // Cut's clipboard write runs inside that same splice handler,
-    // before the selection is cleared.
-    if ui.io().key_ctrl && ui.is_key_pressed(imgui::Key::C) {
-        let result_focused = matches!(state.focused, Some((_, FocusedPane::Result)));
-        if !result_focused && copy_enabled(state) {
-            do_copy(ui, state);
-        }
-    }
 }
 
 fn menu_bar(ui: &imgui::Ui, state: &mut AppState) {
@@ -614,9 +573,6 @@ fn menu_bar(ui: &imgui::Ui, state: &mut AppState) {
             }
         });
         ui.menu("Edit", || {
-            let result_focused = matches!(state.focused, Some((_, FocusedPane::Result)));
-            let copy_ok = copy_enabled(state) || result_focused;
-            let select_all_ok = state.focused.is_some();
             let (can_undo, can_redo) = state
                 .active
                 .and_then(|id| state.undo_stacks.get(&id))
@@ -638,48 +594,9 @@ fn menu_bar(ui: &imgui::Ui, state: &mut AppState) {
             {
                 do_redo(state);
             }
-            ui.separator();
-            if ui
-                .menu_item_config("Cut")
-                .shortcut("Ctrl+X")
-                .enabled(result_focused)
-                .build()
-            {
-                state.pending_keys.push(PendingKey::Cut);
-            }
-            if ui
-                .menu_item_config("Copy")
-                .shortcut("Ctrl+C")
-                .enabled(copy_ok)
-                .build()
-            {
-                if result_focused {
-                    state.pending_keys.push(PendingKey::Copy);
-                } else {
-                    do_copy(ui, state);
-                }
-            }
-            if ui
-                .menu_item_config("Paste")
-                .shortcut("Ctrl+V")
-                .enabled(result_focused)
-                .build()
-            {
-                state.pending_keys.push(PendingKey::Paste);
-            }
-            ui.separator();
-            if ui
-                .menu_item_config("Select All")
-                .shortcut("Ctrl+A")
-                .enabled(select_all_ok)
-                .build()
-            {
-                if result_focused {
-                    state.pending_keys.push(PendingKey::SelectAll);
-                } else {
-                    do_select_all(state);
-                }
-            }
+            // Cut / Copy / Paste / Select All intentionally omitted:
+            // imgui's `input_text_multiline` handles those natively inside
+            // the focused pane.
         });
         ui.menu("View", || {
             if ui
@@ -778,17 +695,12 @@ fn keyboard_shortcuts(ui: &imgui::Ui, state: &mut AppState) {
     if ui.is_key_pressed(Key::Tab) {
         cycle_tab(state, if shift { -1 } else { 1 });
     }
-    // Keyboard shortcuts: when the result pane is focused, imgui's
-    // `input_text_multiline` already handles Ctrl+C/X/V/A natively, so we
-    // skip our handler for that case. Otherwise we route to our custom
-    // selection logic.
+    // Ctrl+C / Ctrl+X / Ctrl+V / Ctrl+A are handled natively by imgui's
+    // `input_text_multiline` inside the focused pane. Ctrl+Z is the
+    // exception — we route it through the app-level undo stack, but only
+    // when the focus isn't inside the 3-way Result pane (where imgui's
+    // built-in text undo wins).
     let result_focused = matches!(state.focused, Some((_, FocusedPane::Result)));
-    if !shift && ui.is_key_pressed(Key::C) && !result_focused && copy_enabled(state) {
-        do_copy(ui, state);
-    }
-    if !shift && ui.is_key_pressed(Key::A) && !result_focused && state.focused.is_some() {
-        do_select_all(state);
-    }
     if !shift && (ui.is_key_pressed(Key::Equal) || ui.is_key_pressed(Key::KeypadAdd)) {
         bump_zoom(state, CODE_FONT_ZOOM_STEP);
     }
@@ -804,62 +716,6 @@ fn keyboard_shortcuts(ui: &imgui::Ui, state: &mut AppState) {
             do_redo(state);
         } else {
             do_undo(state);
-        }
-    }
-}
-
-fn copy_enabled(state: &AppState) -> bool {
-    let Some((sid, focused)) = state.focused else {
-        return false;
-    };
-    match focused {
-        // TODO(task 11): re-enable once selection state is reintroduced on
-        // the multiline widget. The new `input_text_multiline` owns its own
-        // selection internally, so Copy is handled by imgui directly when
-        // the pane has focus; this path is a no-op for now.
-        FocusedPane::TwoWayA | FocusedPane::TwoWayB => {
-            let _ = &state.diff_views;
-            let _ = sid;
-            false
-        }
-        FocusedPane::ThreeWayBase | FocusedPane::ThreeWayLocal | FocusedPane::ThreeWayRemote => {
-            state
-                .merge_views
-                .get(&sid)
-                .and_then(|v| v.selection.as_ref())
-                .is_some()
-        }
-        FocusedPane::Result => false, // routed through key-event injection later
-    }
-}
-
-fn do_copy(ui: &imgui::Ui, state: &AppState) {
-    let Some((sid, focused)) = state.focused else {
-        return;
-    };
-    let Ok(snap) = state.sessions.snapshot(sid) else {
-        return;
-    };
-    let text = match focused {
-        // TODO(task 11): wire 2-way Copy back up when selection state is
-        // reintroduced on the multiline widget. For now the multiline
-        // widget handles Ctrl+C natively, so this path is a no-op.
-        FocusedPane::TwoWayA | FocusedPane::TwoWayB => {
-            let _ = (&state.diff_views, &snap, &diff_view::extract_selection_text);
-            None
-        }
-        FocusedPane::ThreeWayBase | FocusedPane::ThreeWayLocal | FocusedPane::ThreeWayRemote => {
-            state
-                .merge_views
-                .get(&sid)
-                .and_then(|v| v.selection.as_ref())
-                .map(|sel| merge_view::extract_selection_text(&snap, sel))
-        }
-        FocusedPane::Result => None,
-    };
-    if let Some(t) = text {
-        if !t.is_empty() {
-            ui.set_clipboard_text(t);
         }
     }
 }
@@ -910,20 +766,6 @@ static EXTRA_GLYPH_RANGES: &[u32] = &[
     0,
 ];
 
-fn inject_pending_key(io: &mut imgui::Io, key: PendingKey) {
-    use imgui::Key;
-    let k = match key {
-        PendingKey::Cut => Key::X,
-        PendingKey::Copy => Key::C,
-        PendingKey::Paste => Key::V,
-        PendingKey::SelectAll => Key::A,
-    };
-    io.add_key_event(Key::ModCtrl, true);
-    io.add_key_event(k, true);
-    io.add_key_event(k, false);
-    io.add_key_event(Key::ModCtrl, false);
-}
-
 fn do_undo(state: &mut AppState) {
     let Some(id) = state.active else {
         return;
@@ -934,12 +776,8 @@ fn do_undo(state: &mut AppState) {
     };
     if record.can_undo() {
         record.undo(store);
-        // TODO(task 11): bump per-view epoch so the multiline widget
-        // re-syncs from session text after an undo. The new state has
-        // no `input_epoch` yet — buffers are synced unconditionally at
-        // the top of `diff_view::render` for now.
-        let _ = &state.diff_views;
-        let _ = id;
+        // The diff/merge views sync their buffers from session text at the
+        // top of every render, so no per-view epoch bump is required.
         state.status = "undone".to_string();
     } else {
         state.status = "nothing to undo".to_string();
@@ -956,42 +794,9 @@ fn do_redo(state: &mut AppState) {
     };
     if record.can_redo() {
         record.redo(store);
-        // TODO(task 11): see do_undo.
-        let _ = &state.diff_views;
-        let _ = id;
         state.status = "redone".to_string();
     } else {
         state.status = "nothing to redo".to_string();
-    }
-}
-
-fn do_select_all(state: &mut AppState) {
-    let Some((sid, focused)) = state.focused else {
-        return;
-    };
-    let Ok(snap) = state.sessions.snapshot(sid) else {
-        return;
-    };
-    match focused {
-        FocusedPane::TwoWayA | FocusedPane::TwoWayB => {
-            // TODO(task 11): re-implement Select All for the multiline
-            // widget. For now imgui handles Ctrl+A inside the focused
-            // pane natively.
-            let _ = (&state.diff_views, &snap, sid);
-        }
-        FocusedPane::ThreeWayBase | FocusedPane::ThreeWayLocal | FocusedPane::ThreeWayRemote => {
-            let pane = match focused {
-                FocusedPane::ThreeWayBase => merge_view::Pane::Base,
-                FocusedPane::ThreeWayLocal => merge_view::Pane::Local,
-                _ => merge_view::Pane::Remote,
-            };
-            if let Some(sel) = merge_view::select_all(&snap, pane) {
-                state.merge_views.entry(sid).or_default().selection = Some(sel);
-            }
-        }
-        FocusedPane::Result => {
-            // Routed through key-event injection later.
-        }
     }
 }
 

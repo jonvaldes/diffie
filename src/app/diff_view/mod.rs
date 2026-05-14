@@ -18,7 +18,7 @@ mod overlay;
 #[cfg(test)]
 mod tests;
 
-pub use common::{extract_selection_text, DiffViewState, Side};
+pub use common::{DiffViewState, Side};
 use common::{build_pane_ranges, gutter_w, line_h, target_scroll, PendingJump, CONNECTOR_W};
 
 /// Minimum scroll change (px) to treat as intentional user input.
