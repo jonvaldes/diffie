@@ -8,11 +8,30 @@ use crate::merge::{apply_resolutions, MergeAnchor, MergeHunk, Resolution, ThreeW
 
 pub type SessionId = u64;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TwoWaySide {
     A,
     B,
+}
+
+/// Which side is being addressed in a 3-way diff/merge session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThreeWaySide {
+    Base,
+    Local,
+    Remote,
+}
+
+/// Side reference unifying 2-way and 3-way edits. Used by the new
+/// `DiffEdit::SetSide` variant so a single edit type can target any
+/// editable pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SideRef {
+    TwoWay(TwoWaySide),
+    ThreeWay(ThreeWaySide),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
