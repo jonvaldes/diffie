@@ -1,24 +1,32 @@
 //! 3-way merge view.
 //!
-//! Three virtualized panes (BASE, LOCAL, REMOTE) separated by two bezier
-//! connector strips. Inline resolution buttons in the LOCAL pane drive
-//! `SessionStore::set_three_way_resolution`. Scroll sync mirrors the 2-way
-//! center-anchored algorithm extended to a designated driver among 3.
+//! Three `input_text_multiline` panes (BASE / LOCAL / REMOTE) — all
+//! **editable** — separated by bezier connector strips. Edits emit
+//! `DiffEdit::SetSide { side: SideRef::ThreeWay(...) }` so a re-merge runs
+//! on the next frame. Resolution buttons live in a small hover overlay
+//! anchored to the top of each non-stable hunk.
+//!
+//! This module mirrors `diff_view::render_pane` / `paint_row_overlays`
+//! generalized to three panes; the row-painting logic is inlined here
+//! rather than abstracted because the colour palette and per-pane hunk
+//! semantics are different from the 2-way view.
 
 use std::cell::Cell;
 use std::collections::HashMap;
 
-use imgui::{FontId, ListClipper, StyleVar, Ui};
+use imgui::{FontId, StyleVar, Ui};
 
 use super::theme;
+use super::undo_stack::DiffEdit;
 use crate::merge::{MergeAnchor, MergeHunk, Resolution};
-use crate::session::{SessionId, SessionStore};
+use crate::session::{SessionId, SessionMode, SessionStore, SideRef, ThreeWaySide};
 
 /// Match diff_view: tall enough for the 1.5x Roboto Mono used in code rows
 /// at zoom=1.0.
 const ROW_H_BASE: f32 = 24.0;
 const GUTTER_W_BASE: f32 = 60.0;
 const CONNECTOR_W: f32 = 56.0;
+const ECHO_TOLERANCE: f32 = 1.0;
 
 fn row_h() -> f32 {
     ROW_H_BASE * crate::app::code_font_zoom()
@@ -27,31 +35,23 @@ fn row_h() -> f32 {
 fn gutter_w() -> f32 {
     GUTTER_W_BASE * crate::app::code_font_zoom()
 }
-const ECHO_TOLERANCE: f32 = 0.5;
 
 #[derive(Default)]
 pub struct MergeViewState {
+    /// Buffer mirrors of `session.base_text`/`local_text`/`remote_text`.
+    /// Synced at frame start; written-back on every `input_text_multiline`
+    /// change.
+    base_buf: String,
+    local_buf: String,
+    remote_buf: String,
+    /// Last scroll_y per pane (for sync math).
     last: [f32; 3],
-    written: [Option<f32>; 3],
+    /// Pending scroll value to apply next frame on a given pane.
     pending: [Option<f32>; 3],
-    pub selection: Option<Selection>,
-}
-
-#[derive(Clone)]
-pub struct Selection {
-    pub pane: Pane,
-    pub anchor: (usize, usize),
-    pub caret: (usize, usize),
-    pub dragging: bool,
-}
-
-fn normalize_selection(sel: &Selection) -> (usize, usize, usize, usize) {
-    let (a, b) = (sel.anchor, sel.caret);
-    if a.0 < b.0 || (a.0 == b.0 && a.1 <= b.1) {
-        (a.0, a.1, b.0, b.1)
-    } else {
-        (b.0, b.1, a.0, a.1)
-    }
+    /// Held for ABI compatibility with `mod.rs`: legacy 3-way Copy/Select-All
+    /// plumbing reads `state.merge_views[..].selection`. Always `None`
+    /// post-rewrite; multiline widgets handle Ctrl+C/Ctrl+A natively.
+    pub selection: Option<()>,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -71,73 +71,21 @@ impl Pane {
     }
 }
 
-pub fn extract_selection_text(snap: &crate::session::DiffSession, sel: &Selection) -> String {
-    let crate::session::SessionMode::ThreeWay { hunks, .. } = &snap.mode else {
-        return String::new();
-    };
-    let pane = build_layout(hunks, sel.pane);
-    if pane.rows.is_empty() {
-        return String::new();
-    }
-    let (s_row, s_col, e_row, e_col) = normalize_selection(sel);
-    let last = pane.rows.len() - 1;
-    let s_row = s_row.min(last);
-    let e_row = e_row.min(last);
-    let mut out = String::new();
-    for r in s_row..=e_row {
-        let row = &pane.rows[r];
-        let chars: Vec<char> = row.text.chars().collect();
-        let l = if r == s_row { s_col } else { 0 }.min(chars.len());
-        let h = if r == e_row { e_col } else { chars.len() }.min(chars.len());
-        out.extend(chars[l..h].iter());
-        if r < e_row {
-            out.push('\n');
-        }
-    }
-    out
+/// Legacy 3-way Copy hook. The multiline widgets handle Ctrl+C natively
+/// now; this stub keeps `app::mod` compiling and may be reintroduced in
+/// task 11 if cross-pane copy needs custom plumbing.
+#[allow(dead_code)]
+pub fn extract_selection_text(_snap: &crate::session::DiffSession, _sel: &()) -> String {
+    String::new()
 }
 
-pub fn select_all(snap: &crate::session::DiffSession, pane: Pane) -> Option<Selection> {
-    let crate::session::SessionMode::ThreeWay { hunks, .. } = &snap.mode else {
-        return None;
-    };
-    let layout = build_layout(hunks, pane);
-    if layout.rows.is_empty() {
-        return None;
-    }
-    let last_idx = layout.rows.len() - 1;
-    let last_chars = layout.rows[last_idx].text.chars().count();
-    Some(Selection {
-        pane,
-        anchor: (0, 0),
-        caret: (last_idx, last_chars),
-        dragging: false,
-    })
+/// Legacy 3-way Select-All hook. Multiline widgets handle Ctrl+A natively.
+#[allow(dead_code)]
+pub fn select_all(_snap: &crate::session::DiffSession, _pane: Pane) -> Option<()> {
+    None
 }
 
-#[derive(Clone, Copy)]
-enum Cls {
-    Equal,
-    Stable,
-    LocalOnly,
-    RemoteOnly,
-    Conflict,
-}
-
-#[derive(Clone)]
-struct Row {
-    line_no: u32,
-    text: String,
-    cls: Cls,
-    hunk_id: u32,
-    /// One of LocalOnly / RemoteOnly / Conflict if this row belongs to a
-    /// non-stable hunk (i.e., a hunk the resolution overlay can act on),
-    /// else None for stable hunks.
-    kind: Option<HunkKind>,
-    /// First row of this hunk in the pane's `rows` Vec. Used to anchor the
-    /// hover overlay at the top of the hunk.
-    hunk_first_row: usize,
-}
+// ---------- layout (per-pane line ranges, used by connector + sync) ----------
 
 #[derive(Clone, Copy)]
 enum HunkKind {
@@ -146,22 +94,16 @@ enum HunkKind {
     Conflict,
 }
 
-struct PaneLayout {
-    rows: Vec<Row>,
-    ranges: Vec<(u32, f32, f32)>,
-    line_ys: HashMap<u32, f32>,
-}
-
-fn cls_for(h: &MergeHunk) -> Cls {
+fn hunk_kind(h: &MergeHunk) -> Option<HunkKind> {
     match h {
-        MergeHunk::Stable { .. } => Cls::Stable,
-        MergeHunk::LocalOnly { .. } => Cls::LocalOnly,
-        MergeHunk::RemoteOnly { .. } => Cls::RemoteOnly,
-        MergeHunk::Conflict { .. } => Cls::Conflict,
+        MergeHunk::Stable { .. } => None,
+        MergeHunk::LocalOnly { .. } => Some(HunkKind::LocalOnly),
+        MergeHunk::RemoteOnly { .. } => Some(HunkKind::RemoteOnly),
+        MergeHunk::Conflict { .. } => Some(HunkKind::Conflict),
     }
 }
 
-fn select_text<'a>(h: &'a MergeHunk, pane: Pane) -> &'a [String] {
+fn pane_text<'a>(h: &'a MergeHunk, pane: Pane) -> &'a [String] {
     match (h, pane) {
         (MergeHunk::Stable { text, .. }, _) => text,
         (MergeHunk::LocalOnly { base, .. }, Pane::Base) => base,
@@ -176,49 +118,45 @@ fn select_text<'a>(h: &'a MergeHunk, pane: Pane) -> &'a [String] {
     }
 }
 
-fn hunk_kind(h: &MergeHunk) -> Option<HunkKind> {
-    match h {
-        MergeHunk::Stable { .. } => None,
-        MergeHunk::LocalOnly { .. } => Some(HunkKind::LocalOnly),
-        MergeHunk::RemoteOnly { .. } => Some(HunkKind::RemoteOnly),
-        MergeHunk::Conflict { .. } => Some(HunkKind::Conflict),
-    }
+/// (hunk_id, kind, first_line_1based, last_line_1based) for one pane.
+/// Stable hunks have `kind = None`.
+struct PaneLayout {
+    /// Per-hunk row layout: id, kind, first line (1-based), last line (1-based)
+    hunks: Vec<(u32, Option<HunkKind>, u32, u32)>,
+    /// Content-y ranges per hunk in pane content space; used by scroll-sync
+    /// and the connector.
+    ranges: Vec<(u32, f32, f32)>,
+    /// Content y of the *top* of a given 1-based line, used by the connector
+    /// to draw per-anchor curves.
+    line_ys: HashMap<u32, f32>,
 }
 
 fn build_layout(hunks: &[MergeHunk], pane: Pane) -> PaneLayout {
-    let mut rows: Vec<Row> = Vec::new();
+    let mut hunks_out: Vec<(u32, Option<HunkKind>, u32, u32)> = Vec::new();
     let mut ranges: Vec<(u32, f32, f32)> = Vec::new();
     let mut line_ys: HashMap<u32, f32> = HashMap::new();
     let mut y: f32 = 0.0;
     let mut line_n: u32 = 1;
+    let lh = row_h();
     for h in hunks {
         let start_y = y;
-        let hunk_first_row = rows.len();
+        let start_line = line_n;
         let kind = hunk_kind(h);
-        let cls = cls_for(h);
-        let cls_for_row = match cls {
-            Cls::Stable => Cls::Equal,
-            other => other,
-        };
-        for t in select_text(h, pane) {
-            rows.push(Row {
-                line_no: line_n,
-                text: t.clone(),
-                cls: cls_for_row,
-                hunk_id: h.id(),
-                kind,
-                hunk_first_row,
-            });
+        for _t in pane_text(h, pane) {
             line_ys.insert(line_n, y);
             line_n += 1;
-            y += row_h();
+            y += lh;
         }
+        let end_line = line_n.saturating_sub(1);
         if y > start_y {
             ranges.push((h.id(), start_y, y));
+            hunks_out.push((h.id(), kind, start_line, end_line));
         }
     }
-    PaneLayout { rows, ranges, line_ys }
+    PaneLayout { hunks: hunks_out, ranges, line_ys }
 }
+
+// ---------------------------------- render -----------------------------------
 
 #[allow(clippy::too_many_arguments)]
 pub fn render(
@@ -231,260 +169,323 @@ pub fn render(
     state: &mut MergeViewState,
     mono_font: Option<FontId>,
     focus_request: &mut Option<crate::app::FocusedPane>,
+    pending_edits: &mut Vec<DiffEdit>,
 ) {
-    let base = build_layout(hunks, Pane::Base);
-    let local = build_layout(hunks, Pane::Local);
-    let remote = build_layout(hunks, Pane::Remote);
+    // Sync buffers from session at frame start.
+    let snap = match store.snapshot(session_id) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    let SessionMode::ThreeWay { base_text, local_text, remote_text, .. } = &snap.mode else {
+        return;
+    };
+    if state.base_buf != *base_text {
+        state.base_buf = base_text.clone();
+    }
+    if state.local_buf != *local_text {
+        state.local_buf = local_text.clone();
+    }
+    if state.remote_buf != *remote_text {
+        state.remote_buf = remote_text.clone();
+    }
+
+    let base_layout = build_layout(hunks, Pane::Base);
+    let local_layout = build_layout(hunks, Pane::Local);
+    let remote_layout = build_layout(hunks, Pane::Remote);
 
     let avail = ui.content_region_avail();
-    let pane_w = ((avail[0] - CONNECTOR_W * 2.0) / 3.0).max(80.0);
+    let total_w = avail[0];
+    let pane_w = ((total_w - CONNECTOR_W * 2.0) / 3.0).max(80.0);
+    let pane_h = avail[1].max(100.0);
 
-    let scrolls: [Cell<f32>; 3] =
-        [Cell::new(0.0), Cell::new(0.0), Cell::new(0.0)];
-    let origins: [Cell<[f32; 2]>; 3] = [
-        Cell::new([0.0; 2]),
-        Cell::new([0.0; 2]),
-        Cell::new([0.0; 2]),
-    ];
-    let visibles: [Cell<f32>; 3] =
-        [Cell::new(avail[1]), Cell::new(avail[1]), Cell::new(avail[1])];
+    let _font_tok = mono_font.map(|f| ui.push_font(f));
+
+    let panes_top_left = ui.cursor_screen_pos();
+    let base_pos = panes_top_left;
+    let connector_bl_pos = [base_pos[0] + pane_w, base_pos[1]];
+    let local_pos = [connector_bl_pos[0] + CONNECTOR_W, base_pos[1]];
+    let connector_lr_pos = [local_pos[0] + pane_w, base_pos[1]];
+    let remote_pos = [connector_lr_pos[0] + CONNECTOR_W, base_pos[1]];
+
+    let hover_panes: [Cell<Option<(u32, HunkKind, [f32; 2])>>; 3] =
+        [Cell::new(None), Cell::new(None), Cell::new(None)];
     let focus_event: Cell<Option<crate::app::FocusedPane>> = Cell::new(None);
 
-    let applies: [Option<f32>; 3] = [
-        state.pending[0].take(),
-        state.pending[1].take(),
-        state.pending[2].take(),
-    ];
-
-    render_pane(
-        ui,
-        "diffie_base",
-        pane_w,
-        avail[1],
-        &base.rows,
-        Pane::Base,
-        store,
-        session_id,
-        status,
-        applies[0],
-        &mut state.written[Pane::Base as usize],
-        &scrolls[Pane::Base as usize],
-        &origins[Pane::Base as usize],
-        &visibles[Pane::Base as usize],
-        mono_font,
-        &mut state.selection,
-        &focus_event,
+    let (_base_rect, base_scroll, base_origin) = render_pane(
+        ui, state, base_pos, pane_w, pane_h, Pane::Base, session_id,
+        pending_edits, &base_layout, &hover_panes[0], &focus_event,
     );
 
-    ui.same_line_with_spacing(0.0, 0.0);
-    let connector_bl = ui.cursor_screen_pos();
-    ui.dummy([CONNECTOR_W, avail[1]]);
-    ui.same_line_with_spacing(0.0, 0.0);
+    // Connector BASE↔LOCAL: empty area for the bezier ribbons.
+    ui.set_cursor_screen_pos(connector_bl_pos);
+    ui.invisible_button("merge_connector_bl", [CONNECTOR_W, pane_h]);
 
-    render_pane(
-        ui,
-        "diffie_local",
-        pane_w,
-        avail[1],
-        &local.rows,
-        Pane::Local,
-        store,
-        session_id,
-        status,
-        applies[1],
-        &mut state.written[Pane::Local as usize],
-        &scrolls[Pane::Local as usize],
-        &origins[Pane::Local as usize],
-        &visibles[Pane::Local as usize],
-        mono_font,
-        &mut state.selection,
-        &focus_event,
+    let (_local_rect, local_scroll, local_origin) = render_pane(
+        ui, state, local_pos, pane_w, pane_h, Pane::Local, session_id,
+        pending_edits, &local_layout, &hover_panes[1], &focus_event,
     );
 
-    ui.same_line_with_spacing(0.0, 0.0);
-    let connector_lr = ui.cursor_screen_pos();
-    ui.dummy([CONNECTOR_W, avail[1]]);
-    ui.same_line_with_spacing(0.0, 0.0);
+    ui.set_cursor_screen_pos(connector_lr_pos);
+    ui.invisible_button("merge_connector_lr", [CONNECTOR_W, pane_h]);
 
-    render_pane(
-        ui,
-        "diffie_remote",
-        pane_w,
-        avail[1],
-        &remote.rows,
-        Pane::Remote,
-        store,
-        session_id,
-        status,
-        applies[2],
-        &mut state.written[Pane::Remote as usize],
-        &scrolls[Pane::Remote as usize],
-        &origins[Pane::Remote as usize],
-        &visibles[Pane::Remote as usize],
-        mono_font,
-        &mut state.selection,
-        &focus_event,
+    let (_remote_rect, remote_scroll, remote_origin) = render_pane(
+        ui, state, remote_pos, pane_w, pane_h, Pane::Remote, session_id,
+        pending_edits, &remote_layout, &hover_panes[2], &focus_event,
     );
 
     if let Some(p) = focus_event.get() {
         *focus_request = Some(p);
     }
-    if !ui.is_mouse_down(imgui::MouseButton::Left) {
-        if let Some(sel) = state.selection.as_mut() {
-            sel.dragging = false;
-        }
-    }
 
-    let s = [scrolls[0].get(), scrolls[1].get(), scrolls[2].get()];
-    let v = [visibles[0].get(), visibles[1].get(), visibles[2].get()];
-    sync_scrolls(state, s, v, &base.ranges, &local.ranges, &remote.ranges);
+    let scrolls = [base_scroll, local_scroll, remote_scroll];
+    let view_hs = [pane_h, pane_h, pane_h];
+    sync_scrolls(
+        state,
+        scrolls,
+        view_hs,
+        &base_layout.ranges,
+        &local_layout.ranges,
+        &remote_layout.ranges,
+    );
 
+    // Draw bezier connectors on top, *after* the panes have all rendered.
+    // origin y is the top of each pane's text widget in screen space; the
+    // y0 of each pane's connector strip is the same.
     draw_connector(
         ui,
-        connector_bl,
+        connector_bl_pos,
         CONNECTOR_W,
-        avail[1],
-        origins[0].get()[1],
-        origins[1].get()[1],
-        &base.ranges,
-        &local.ranges,
-        &base.line_ys,
-        &local.line_ys,
+        pane_h,
+        base_origin[1] - base_scroll,
+        local_origin[1] - local_scroll,
+        &base_layout.ranges,
+        &local_layout.ranges,
+        &base_layout.line_ys,
+        &local_layout.line_ys,
         anchors.iter().map(|a| (a.base, a.local)).collect::<Vec<_>>().as_slice(),
         hunks,
     );
     draw_connector(
         ui,
-        connector_lr,
+        connector_lr_pos,
         CONNECTOR_W,
-        avail[1],
-        origins[1].get()[1],
-        origins[2].get()[1],
-        &local.ranges,
-        &remote.ranges,
-        &local.line_ys,
-        &remote.line_ys,
+        pane_h,
+        local_origin[1] - local_scroll,
+        remote_origin[1] - remote_scroll,
+        &local_layout.ranges,
+        &remote_layout.ranges,
+        &local_layout.line_ys,
+        &remote_layout.line_ys,
         anchors.iter().map(|a| (a.local, a.remote)).collect::<Vec<_>>().as_slice(),
         hunks,
     );
+
+    // Hover overlay panels. Drawn last so they sit above panes + connectors.
+    for (i, cell) in hover_panes.iter().enumerate() {
+        if let Some((hunk_id, kind, pos)) = cell.get() {
+            let _ = i;
+            draw_control_overlay(ui, store, session_id, hunk_id, kind, status, pos);
+        }
+    }
+
+    // Reserve space so subsequent widgets land below the panes.
+    ui.set_cursor_screen_pos([panes_top_left[0], panes_top_left[1] + pane_h]);
 }
 
+/// Returns (widget_rect, scroll_y, content_origin_screen_pos).
 #[allow(clippy::too_many_arguments)]
 fn render_pane(
     ui: &Ui,
-    id: &str,
-    w: f32,
-    h: f32,
-    rows: &[Row],
+    state: &mut MergeViewState,
+    pane_pos: [f32; 2],
+    pane_w: f32,
+    pane_h: f32,
     pane: Pane,
-    store: &SessionStore,
     session_id: SessionId,
-    status: &mut String,
-    apply: Option<f32>,
-    written: &mut Option<f32>,
-    scroll_out: &Cell<f32>,
-    origin_out: &Cell<[f32; 2]>,
-    visible_out: &Cell<f32>,
-    mono_font: Option<FontId>,
-    selection: &mut Option<Selection>,
+    pending_edits: &mut Vec<DiffEdit>,
+    layout: &PaneLayout,
+    hover_out: &Cell<Option<(u32, HunkKind, [f32; 2])>>,
     focus_event: &Cell<Option<crate::app::FocusedPane>>,
-) {
-    ui.child_window(id).size([w, h]).border(true).build(|| {
-        if let Some(y) = apply {
-            ui.set_scroll_y(y);
-            *written = Some(y);
+) -> ([f32; 4], f32, [f32; 2]) {
+    let g_w = gutter_w();
+    let widget_pos = [pane_pos[0] + g_w, pane_pos[1]];
+    let widget_w = (pane_w - g_w).max(20.0);
+
+    // Apply any pending scroll set last frame.
+    let pending_scroll = state.pending[pane as usize].take();
+    if let Some(y) = pending_scroll {
+        unsafe {
+            imgui::sys::igSetNextWindowScroll(imgui::sys::ImVec2 { x: -1.0, y });
         }
-        scroll_out.set(ui.scroll_y());
-        origin_out.set(ui.cursor_screen_pos());
-        visible_out.set(ui.content_region_avail()[1]);
-        draw_pane(
-            ui, rows, pane, store, session_id, status, mono_font, selection, focus_event,
-        );
-    });
+    }
+
+    ui.set_cursor_screen_pos(widget_pos);
+
+    let buf_ref: &str = match pane {
+        Pane::Base => &state.base_buf,
+        Pane::Local => &state.local_buf,
+        Pane::Remote => &state.remote_buf,
+    };
+    let n = buf_ref.lines().count().max(1);
+    let trailing = buf_ref.is_empty() || buf_ref.ends_with('\n');
+    let buf_line_count = n + if trailing { 1 } else { 0 };
+
+    let lh = row_h();
+    let content_h = (buf_line_count as f32 * lh).max(pane_h);
+
+    let widget_id = format!("##merge_pane_{:?}", pane);
+    let child_id = format!("##merge_pane_child_{:?}", pane);
+
+    let widget_rect = [
+        widget_pos[0],
+        widget_pos[1],
+        widget_pos[0] + widget_w,
+        widget_pos[1] + pane_h,
+    ];
+
+    let mut scroll_y_out: f32 = 0.0;
+    let mut origin_out: [f32; 2] = widget_pos;
+
+    ui.child_window(&child_id)
+        .size([widget_w, pane_h])
+        .scroll_bar(true)
+        .build(|| {
+            origin_out = ui.cursor_screen_pos();
+            let buf = match pane {
+                Pane::Base => &mut state.base_buf,
+                Pane::Local => &mut state.local_buf,
+                Pane::Remote => &mut state.remote_buf,
+            };
+            // ItemSpacing zero so the input_text grows exactly content_h
+            // (the multiline widget uses Item* style vars internally).
+            let _spacing = ui.push_style_var(StyleVar::ItemSpacing([0.0, 0.0]));
+            let changed = ui
+                .input_text_multiline(&widget_id, buf, [widget_w, content_h])
+                .no_undo_redo(true)
+                .build();
+            if ui.is_item_active() {
+                focus_event.set(Some(pane.as_focused_pane()));
+            }
+            drop(_spacing);
+            scroll_y_out = ui.scroll_y();
+            if changed {
+                let side_ref = SideRef::ThreeWay(match pane {
+                    Pane::Base => ThreeWaySide::Base,
+                    Pane::Local => ThreeWaySide::Local,
+                    Pane::Remote => ThreeWaySide::Remote,
+                });
+                pending_edits.push(DiffEdit::SetSide {
+                    session_id,
+                    side: side_ref,
+                    new_text: buf.clone(),
+                    old_text: None,
+                });
+            }
+
+            paint_row_overlays(ui, widget_rect, layout, pane, scroll_y_out, hover_out);
+        });
+
+    // Gutter on the left of this pane (line numbers).
+    paint_gutter(ui, pane_pos, g_w, pane_h, scroll_y_out, buf_line_count as u32);
+
+    (widget_rect, scroll_y_out, origin_out)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn draw_pane(
+fn paint_gutter(
     ui: &Ui,
-    rows: &[Row],
-    pane: Pane,
-    store: &SessionStore,
-    session_id: SessionId,
-    status: &mut String,
-    mono_font: Option<FontId>,
-    selection: &mut Option<Selection>,
-    focus_event: &Cell<Option<crate::app::FocusedPane>>,
+    pane_pos: [f32; 2],
+    g_w: f32,
+    pane_h: f32,
+    scroll_y: f32,
+    line_count: u32,
 ) {
-    let total = rows.len() as i32;
-    if total == 0 {
+    let dl = ui.get_window_draw_list();
+    let lh = row_h();
+    if lh <= 0.0 {
         return;
     }
-    let pane_origin = ui.cursor_screen_pos();
-    let visible_h = ui.content_region_avail()[1];
-    let cur_scroll = ui.scroll_y();
-
-    // See diff_view::draw_pane for why ItemSpacing.y must be zero: each row
-    // must consume exactly row_h() so the connector's content-y model lines
-    // up with the actually-rendered screen positions.
-    let _spacing = ui.push_style_var(StyleVar::ItemSpacing([0.0, 0.0]));
-    let hover: Cell<Option<(u32, HunkKind, [f32; 2])>> = Cell::new(None);
-    let mut clipper = ListClipper::new(total).items_height(row_h()).begin(ui);
-    while clipper.step() {
-        for i in clipper.display_start()..clipper.display_end() {
-            draw_row(
-                ui,
-                &rows[i as usize],
-                i,
-                pane,
-                mono_font,
-                &hover,
-                selection,
-                focus_event,
-            );
+    let g_top = pane_pos[1];
+    let g_bottom = pane_pos[1] + pane_h;
+    let g_left = pane_pos[0];
+    let first_line = (scroll_y / lh).floor() as u32 + 1;
+    let last_line = ((scroll_y + pane_h) / lh).ceil() as u32 + 1;
+    for line in first_line..=last_line.min(line_count) {
+        let y = g_top + (line as f32 - 1.0) * lh - scroll_y;
+        if y + lh < g_top || y > g_bottom {
+            continue;
         }
+        let text = format!("{line}");
+        let text_w = ui.calc_text_size(&text)[0];
+        dl.add_text([g_left + g_w - 4.0 - text_w, y + 2.0], theme::OVERLAY1, &text);
     }
-    drop(_spacing);
+}
 
-    // Drag auto-scroll. See `diff_view::draw_pane` for the rationale.
-    if let Some(sel) = selection.as_mut() {
-        if sel.dragging
-            && sel.pane == pane
-            && ui.is_mouse_down(imgui::MouseButton::Left)
-        {
-            let mouse_y = ui.io().mouse_pos[1];
-            let pane_top = pane_origin[1] + cur_scroll;
-            let pane_bot = pane_top + visible_h;
-            let max_scroll = (rows.len() as f32 * row_h() - visible_h).max(0.0);
-            let new_scroll = if mouse_y < pane_top {
-                let dist = (pane_top - mouse_y).min(160.0);
-                let speed = 8.0 + dist * 0.5;
-                Some((cur_scroll - speed).max(0.0))
-            } else if mouse_y > pane_bot {
-                let dist = (mouse_y - pane_bot).min(160.0);
-                let speed = 8.0 + dist * 0.5;
-                Some((cur_scroll + speed).min(max_scroll))
-            } else {
-                None
-            };
-            if let Some(s) = new_scroll {
-                ui.set_scroll_y(s);
-                if mouse_y < pane_top {
-                    let row_idx = ((s / row_h()) as usize).min(rows.len().saturating_sub(1));
-                    sel.caret = (row_idx, 0);
-                } else {
-                    let bot_content = s + visible_h;
-                    let row_idx = ((bot_content / row_h()) as usize)
-                        .saturating_sub(1)
-                        .min(rows.len().saturating_sub(1));
-                    let last_col = rows[row_idx].text.chars().count();
-                    sel.caret = (row_idx, last_col);
-                }
+/// Paint per-row hunk backgrounds and detect hover for the resolution
+/// overlay. Mirrors `diff_view::overlay::paint_row_overlays` adapted to
+/// MergeHunk's pane-specific row ranges.
+fn paint_row_overlays(
+    ui: &Ui,
+    widget_rect: [f32; 4],
+    layout: &PaneLayout,
+    _pane: Pane,
+    scroll_y: f32,
+    hover_out: &Cell<Option<(u32, HunkKind, [f32; 2])>>,
+) {
+    let dl = ui.get_window_draw_list();
+    let lh = row_h();
+    let widget_top = widget_rect[1];
+    let widget_bottom = widget_rect[3];
+    let widget_h = widget_bottom - widget_top;
+    if widget_h <= 0.0 || lh <= 0.0 {
+        return;
+    }
+    let first_line = (scroll_y / lh).floor() as u32 + 1;
+    let last_line = ((scroll_y + widget_h) / lh).ceil() as u32 + 1;
+
+    for (_id, kind, lo, hi) in &layout.hunks {
+        let Some(kind_v) = *kind else { continue };
+        if *hi < first_line || *lo > last_line {
+            continue;
+        }
+        let bg = match kind_v {
+            HunkKind::LocalOnly => theme::with_alpha(theme::BLUE, 0.22),
+            HunkKind::RemoteOnly => theme::with_alpha(theme::MAUVE, 0.22),
+            HunkKind::Conflict => theme::with_alpha(theme::PEACH, 0.30),
+        };
+        for ln in *lo..=*hi {
+            let y = widget_top + (ln as f32 - 1.0) * lh - scroll_y;
+            let y0 = y.max(widget_top);
+            let y1 = (y + lh).min(widget_bottom);
+            if y1 > y0 {
+                dl.add_rect([widget_rect[0], y0], [widget_rect[2], y1], bg)
+                    .filled(true)
+                    .build();
             }
         }
     }
 
-    if let Some((hunk_id, kind, pos)) = hover.get() {
-        draw_control_overlay(ui, store, session_id, hunk_id, kind, status, pos);
+    // Hover → set overlay anchor at the top-left of the hunk's first
+    // visible row, clamped to the widget top.
+    let mouse_pos = ui.io().mouse_pos;
+    let mx = mouse_pos[0];
+    let my = mouse_pos[1];
+    if mx >= widget_rect[0]
+        && mx <= widget_rect[2]
+        && my >= widget_top
+        && my <= widget_bottom
+    {
+        let content_y = (my - widget_top) + scroll_y;
+        let line = (content_y / lh).floor() as i64;
+        let line = line.max(0) as u32 + 1;
+        for (hid, kind, lo, hi) in &layout.hunks {
+            let Some(kind_v) = *kind else { continue };
+            if line >= *lo && line <= *hi {
+                let anchor_y = (widget_top + (*lo as f32 - 1.0) * lh - scroll_y)
+                    .max(widget_top);
+                hover_out.set(Some((*hid, kind_v, [widget_rect[0], anchor_y])));
+                break;
+            }
+        }
     }
 }
 
@@ -583,133 +584,7 @@ fn apply_res(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn draw_row(
-    ui: &Ui,
-    row: &Row,
-    idx: i32,
-    pane: Pane,
-    mono_font: Option<FontId>,
-    hover_out: &Cell<Option<(u32, HunkKind, [f32; 2])>>,
-    selection: &mut Option<Selection>,
-    focus_event: &Cell<Option<crate::app::FocusedPane>>,
-) {
-    let p0 = ui.cursor_screen_pos();
-    let row_w = ui.content_region_avail()[0];
-    let p1 = [p0[0] + row_w, p0[1] + row_h()];
-
-    let _ = ui.invisible_button(format!("mrow_{idx}"), [row_w, row_h()]);
-    // See `diff_view::draw_row` for why drag-related hit detection uses
-    // `is_mouse_hovering_rect` instead of `is_item_hovered`.
-    let mouse_in_row = ui.is_mouse_hovering_rect(p0, p1);
-    let hovered = ui.is_item_hovered();
-    let activated = ui.is_item_activated();
-    if let Some(kind) = row.kind {
-        if hovered {
-            // Anchor the overlay at the hunk's first row, clamped to the
-            // pane's visible top so it stays in view while the user moves
-            // around inside a hunk.
-            let pane_origin_y = p0[1] - (idx as f32) * row_h();
-            let pane_visible_top = pane_origin_y + ui.scroll_y();
-            let first_row_y = pane_origin_y + (row.hunk_first_row as f32) * row_h();
-            let anchor_y = first_row_y.max(pane_visible_top);
-            hover_out.set(Some((row.hunk_id, kind, [p0[0], anchor_y])));
-        }
-    }
-
-    let _font_tok = mono_font.map(|f| ui.push_font(f));
-    let char_w = ui.calc_text_size("m")[0].max(1.0);
-    let text_start_x = p0[0] + gutter_w();
-    let char_count = row.text.chars().count();
-
-    let col_at_mouse = if mouse_in_row {
-        let mx = ui.io().mouse_pos[0];
-        let raw = ((mx - text_start_x) / char_w).round();
-        Some(raw.clamp(0.0, char_count as f32) as usize)
-    } else {
-        None
-    };
-
-    if activated {
-        let col = col_at_mouse.unwrap_or(0);
-        let row_idx = idx as usize;
-        let shift = ui.io().key_shift;
-        if shift && selection.as_ref().map_or(false, |s| s.pane == pane) {
-            let sel = selection.as_mut().unwrap();
-            sel.caret = (row_idx, col);
-            sel.dragging = true;
-        } else {
-            *selection = Some(Selection {
-                pane,
-                anchor: (row_idx, col),
-                caret: (row_idx, col),
-                dragging: true,
-            });
-        }
-        focus_event.set(Some(pane.as_focused_pane()));
-    }
-    if mouse_in_row {
-        if let Some(sel) = selection.as_mut() {
-            if sel.dragging && sel.pane == pane && ui.is_mouse_down(imgui::MouseButton::Left) {
-                if let Some(col) = col_at_mouse {
-                    sel.caret = (idx as usize, col);
-                }
-            }
-        }
-    }
-
-    let dl = ui.get_window_draw_list();
-    let bg = match row.cls {
-        Cls::Equal => None,
-        Cls::Stable => None,
-        Cls::LocalOnly => Some(theme::with_alpha(theme::BLUE, 0.22)),
-        Cls::RemoteOnly => Some(theme::with_alpha(theme::MAUVE, 0.22)),
-        Cls::Conflict => Some(theme::with_alpha(theme::PEACH, 0.30)),
-    };
-    if let Some(bg_rgba) = bg {
-        dl.add_rect(p0, p1, bg_rgba).filled(true).build();
-    }
-    // Selection background overlay.
-    if let Some(sel) = selection.as_ref() {
-        if sel.pane == pane {
-            let (s_row, s_col, e_row, e_col) = normalize_selection(sel);
-            let row_idx = idx as usize;
-            if row_idx >= s_row && row_idx <= e_row {
-                let l_col = if row_idx == s_row { s_col } else { 0 };
-                let r_col = if row_idx == e_row { e_col } else { char_count };
-                if r_col > l_col {
-                    let sel_x0 = text_start_x + l_col as f32 * char_w;
-                    let sel_x1 = text_start_x + r_col as f32 * char_w;
-                    dl.add_rect(
-                        [sel_x0, p0[1]],
-                        [sel_x1, p1[1]],
-                        theme::with_alpha(theme::BLUE, 0.40),
-                    )
-                    .filled(true)
-                    .build();
-                }
-            }
-        }
-    }
-    let line_text = format!("{:>4}", row.line_no);
-    let text_y = p0[1] + 3.0;
-    dl.add_text([p0[0] + 6.0, text_y], theme::OVERLAY1, &line_text);
-    let fg = match row.cls {
-        Cls::Equal | Cls::Stable => theme::TEXT,
-        Cls::LocalOnly => theme::SAPPHIRE,
-        Cls::RemoteOnly => theme::LAVENDER,
-        Cls::Conflict => theme::YELLOW,
-    };
-    let display = if row.text.is_empty() {
-        " "
-    } else {
-        row.text.as_str()
-    };
-    dl.add_text([p0[0] + gutter_w(), text_y], fg, display);
-    drop(_font_tok);
-}
-
-// ----------------- connector & sync -----------------
+// ----------------- connector & sync (mostly unchanged from pre-rewrite) ------
 
 fn pack_color(c: [f32; 4]) -> u32 {
     let to8 = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u32;
@@ -889,9 +764,6 @@ fn draw_connector(
             stroke_bezier_curve(x_l, x_r, ly, ry, theme::CRUST, 3.0);
         }
     });
-    // dl is only used inside the closure for clipping; the path ops use
-    // sys::igGetWindowDrawList directly. Touching the binding silences
-    // unused-variable lints if the loops happen to skip everything.
     let _ = dl;
 }
 
@@ -907,8 +779,7 @@ fn sync_scrolls(
     let mut driver: Option<usize> = None;
     for i in 0..3 {
         let changed = (curr[i] - state.last[i]).abs() > ECHO_TOLERANCE;
-        let echo = state.written[i].map_or(false, |w| (curr[i] - w).abs() < ECHO_TOLERANCE);
-        if changed && !echo {
+        if changed {
             driver = Some(i);
             break;
         }
@@ -926,13 +797,6 @@ fn sync_scrolls(
         }
     }
     state.last = curr;
-    for i in 0..3 {
-        if let Some(w) = state.written[i] {
-            if (curr[i] - w).abs() < ECHO_TOLERANCE {
-                state.written[i] = None;
-            }
-        }
-    }
 }
 
 fn target_scroll(

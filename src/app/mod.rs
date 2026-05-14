@@ -1378,6 +1378,7 @@ fn current_session_summary(ui: &imgui::Ui, state: &mut AppState) {
                 let mono = state.mono_font;
                 let view_state = state.merge_views.entry(id).or_default();
                 let mut focus_request: Option<FocusedPane> = None;
+                let mut pending_edits: Vec<undo_stack::DiffEdit> = Vec::new();
                 ui.child_window("merge_area")
                     .size([0.0, diff_h])
                     .build(|| {
@@ -1391,10 +1392,18 @@ fn current_session_summary(ui: &imgui::Ui, state: &mut AppState) {
                             view_state,
                             mono,
                             &mut focus_request,
+                            &mut pending_edits,
                         );
                     });
                 if let Some(p) = focus_request {
                     state.focused = Some((id, p));
+                }
+                if !pending_edits.is_empty() {
+                    let record = state.undo_stacks.entry(id).or_default();
+                    for edit in pending_edits {
+                        record.edit(&mut state.sessions, edit);
+                    }
+                    state.status = "edited (Ctrl+Z to undo)".to_string();
                 }
             }
             {
