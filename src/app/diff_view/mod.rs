@@ -62,6 +62,23 @@ pub fn render(
     let pane_w = ((total_w - CONNECTOR_W) * 0.5).max(100.0);
     let pane_h = avail[1].max(100.0);
 
+    // Consume any pending jump set by last frame's hover overlay (↕ button).
+    // Translates `pending_jump` into a centered scroll on the target pane.
+    if let Some(jump) = state.pending_jump.take() {
+        if jump.session_id == session_id {
+            let lh = line_h();
+            // Center the target line in the pane.
+            let target_y = ((jump.target_line as f32 - 1.0) * lh
+                - pane_h * 0.5
+                + lh * 0.5)
+                .max(0.0);
+            match jump.pane {
+                Side::Left => state.pending_left_scroll = Some(target_y),
+                Side::Right => state.pending_right_scroll = Some(target_y),
+            }
+        }
+    }
+
     let panes_top_left = ui.cursor_screen_pos();
     let left_pos = panes_top_left;
     let connector_pos = [left_pos[0] + pane_w, left_pos[1]];
