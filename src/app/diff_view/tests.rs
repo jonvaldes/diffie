@@ -591,15 +591,15 @@ mod anchor_pick_tests {
         next_anchor_pick, AnchorPick, RailAction, RailClick, RailEvent, Side,
     };
 
-    fn click(side: Side, line: u32, anchored: bool, idx: Option<usize>) -> RailClick {
-        RailClick { side, line, already_anchored: anchored, anchor_idx: idx }
+    fn click(side: Side, line: u32, anchor_idx: Option<usize>) -> RailClick {
+        RailClick { side, line, anchor_idx }
     }
 
     #[test]
     fn idle_unanchored_click_enters_picking() {
         let (next, act) = next_anchor_pick(
             AnchorPick::Idle,
-            RailEvent::Click(click(Side::Left, 3, false, None)),
+            RailEvent::Click(click(Side::Left, 3, None)),
         );
         assert_eq!(next, AnchorPick::Picking { side: Side::Left, line: 3 });
         assert_eq!(act, RailAction::None);
@@ -609,7 +609,7 @@ mod anchor_pick_tests {
     fn idle_anchored_click_removes() {
         let (next, act) = next_anchor_pick(
             AnchorPick::Idle,
-            RailEvent::Click(click(Side::Right, 7, true, Some(2))),
+            RailEvent::Click(click(Side::Right, 7, Some(2))),
         );
         assert_eq!(next, AnchorPick::Idle);
         assert_eq!(act, RailAction::RemoveAnchor { idx: 2 });
@@ -639,7 +639,7 @@ mod anchor_pick_tests {
     fn picking_opposite_unanchored_creates() {
         let (next, act) = next_anchor_pick(
             AnchorPick::Picking { side: Side::Left, line: 5 },
-            RailEvent::Click(click(Side::Right, 11, false, None)),
+            RailEvent::Click(click(Side::Right, 11, None)),
         );
         assert_eq!(next, AnchorPick::Idle);
         assert_eq!(act, RailAction::AddAnchor { a: 5, b: 11 });
@@ -650,7 +650,7 @@ mod anchor_pick_tests {
         let pick = AnchorPick::Picking { side: Side::Left, line: 5 };
         let (next, act) = next_anchor_pick(
             pick,
-            RailEvent::Click(click(Side::Right, 11, true, Some(0))),
+            RailEvent::Click(click(Side::Right, 11, Some(0))),
         );
         assert_eq!(next, pick);
         assert_eq!(act, RailAction::None);
@@ -660,7 +660,7 @@ mod anchor_pick_tests {
     fn picking_same_side_replaces_source() {
         let (next, act) = next_anchor_pick(
             AnchorPick::Picking { side: Side::Left, line: 5 },
-            RailEvent::Click(click(Side::Left, 9, false, None)),
+            RailEvent::Click(click(Side::Left, 9, None)),
         );
         assert_eq!(next, AnchorPick::Picking { side: Side::Left, line: 9 });
         assert_eq!(act, RailAction::None);
@@ -672,7 +672,7 @@ mod anchor_pick_tests {
         // side the user clicked first.
         let (next, act) = next_anchor_pick(
             AnchorPick::Picking { side: Side::Right, line: 8 },
-            RailEvent::Click(click(Side::Left, 2, false, None)),
+            RailEvent::Click(click(Side::Left, 2, None)),
         );
         assert_eq!(next, AnchorPick::Idle);
         assert_eq!(act, RailAction::AddAnchor { a: 2, b: 8 });

@@ -177,9 +177,8 @@ fn locate_hunk(ranges: &[(u32, f32, f32)], y: f32) -> Option<(u32, f32)> {
 pub struct RailClick {
     pub side: Side,
     pub line: crate::diff::LineNo,
-    /// Whether `line` is already part of an anchor in `session.anchors`.
-    pub already_anchored: bool,
-    /// If `already_anchored`, the index of the anchor in `session.anchors`.
+    /// If `Some(idx)`, the index of the anchor in `session.anchors` that
+    /// includes this line. `None` if this line is not yet anchored.
     pub anchor_idx: Option<usize>,
 }
 
@@ -233,15 +232,9 @@ pub(super) fn next_anchor_pick(current: AnchorPick, event: RailEvent) -> (Anchor
         (Idle, RailEvent::ClickedElsewhere) => (Idle, RailAction::None),
 
         // Idle + click.
-        (Idle, RailEvent::Click(c)) => {
-            if c.already_anchored {
-                match c.anchor_idx {
-                    Some(idx) => (Idle, RailAction::RemoveAnchor { idx }),
-                    None => (Idle, RailAction::None),
-                }
-            } else {
-                (Picking { side: c.side, line: c.line }, RailAction::None)
-            }
+        (Idle, RailEvent::Click(c)) => match c.anchor_idx {
+            Some(idx) => (Idle, RailAction::RemoveAnchor { idx }),
+            None => (Picking { side: c.side, line: c.line }, RailAction::None),
         }
 
         // Picking + click on same-side icon: move source.
@@ -250,11 +243,12 @@ pub(super) fn next_anchor_pick(current: AnchorPick, event: RailEvent) -> (Anchor
         }
 
         // Picking + click on opposite-side icon.
-        (Picking { side: src_side, line: src_line }, RailEvent::Click(c)) => {
-            if c.already_anchored {
+        (Picking { side: src_side, line: src_line }, RailEvent::Click(c)) => match c.anchor_idx {
+            Some(_) => {
                 // Ambiguous — keep dragging. User must remove first.
                 (Picking { side: src_side, line: src_line }, RailAction::None)
-            } else {
+            }
+            None => {
                 let (a, b) = match src_side {
                     Side::Left => (src_line, c.line),
                     Side::Right => (c.line, src_line),
