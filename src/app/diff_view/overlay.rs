@@ -10,7 +10,7 @@ use crate::app::undo_stack::DiffEdit;
 use crate::diff::{Anchor, DiffOp, Hunk, SubSpan, SubSpanKind};
 use crate::session::{SessionId, TwoWaySide};
 
-use super::common::{PendingJump, Side};
+use super::common::{AnchorPick, PendingJump, Side};
 use crate::app::syntax::LineSpans;
 
 /// Pure: 1-based row from a mouse y, the widget's top in screen space,
@@ -66,6 +66,22 @@ fn is_change_hunk(hunk: &Hunk) -> bool {
 /// widget's top-left content y, the widget's scroll_y, and line height.
 pub(super) fn line_screen_y(widget_top: f32, line: u32, scroll_y: f32, lh: f32) -> f32 {
     widget_top + (line as f32 - 1.0) * lh - scroll_y
+}
+
+/// Screen-space center of the anchor icon for a given rail row.
+/// `rail_left` + `rail_right` are the rail's x-extents on screen.
+#[allow(dead_code)]
+pub(super) fn anchor_icon_center(
+    rail_left: f32,
+    rail_right: f32,
+    pane_top: f32,
+    line: u32,
+    scroll_y: f32,
+    lh: f32,
+) -> [f32; 2] {
+    let x = (rail_left + rail_right) * 0.5;
+    let y = line_screen_y(pane_top, line, scroll_y, lh) + lh * 0.5;
+    [x, y]
 }
 
 /// Compute the x offset of a byte position within `line`, clamped to a
@@ -692,12 +708,89 @@ fn side_tag(side: Side) -> &'static str {
     }
 }
 
+/// Paint anchor icons on a single rail. Outline icon on the hovered row (if any
+/// and unanchored), filled icon for every row that is part of an anchor.
+/// `pane_top` is the top of the *pane*, used together with `scroll_y` to map
+/// content lines onto screen y.
+#[allow(dead_code)]
+#[allow(clippy::too_many_arguments)]
+pub(super) fn paint_anchor_rail(
+    ui: &Ui,
+    rail_rect: [f32; 4],
+    pane_top: f32,
+    scroll_y: f32,
+    lh: f32,
+    side: Side,
+    anchors: &[Anchor],
+    hovered_line: Option<u32>,
+    pick: AnchorPick,
+) {
+    let dl = ui.get_window_draw_list();
+    let rail_left = rail_rect[0];
+    let rail_right = rail_rect[2];
+    let rail_top = rail_rect[1];
+    let rail_bot = rail_rect[3];
+    let glyph = "\u{f13d}"; // Nerd Font: anchor
+
+    let filled_color = theme::LAVENDER();
+    let outline_color = theme::with_alpha(theme::OVERLAY1(), 0.7);
+
+    let line_for_anchor = |anc: &Anchor| match side {
+        Side::Left => anc.a,
+        Side::Right => anc.b,
+    };
+
+    // Filled icons for every anchored row.
+    for anc in anchors {
+        let line = line_for_anchor(anc);
+        let center = anchor_icon_center(rail_left, rail_right, pane_top, line, scroll_y, lh);
+        if center[1] + lh * 0.5 < rail_top || center[1] - lh * 0.5 > rail_bot {
+            continue;
+        }
+        let size = ui.calc_text_size(glyph);
+        dl.add_text(
+            [center[0] - size[0] * 0.5, center[1] - size[1] * 0.5],
+            filled_color,
+            glyph,
+        );
+    }
+
+    // Outline icon for the hovered row, if it isn't already filled.
+    if let Some(hl) = hovered_line {
+        let already_filled = anchors.iter().any(|a| line_for_anchor(a) == hl);
+        if !already_filled {
+            let center = anchor_icon_center(rail_left, rail_right, pane_top, hl, scroll_y, lh);
+            if center[1] + lh * 0.5 >= rail_top && center[1] - lh * 0.5 <= rail_bot {
+                let size = ui.calc_text_size(glyph);
+                dl.add_text(
+                    [center[0] - size[0] * 0.5, center[1] - size[1] * 0.5],
+                    outline_color,
+                    glyph,
+                );
+            }
+        }
+    }
+
+    // While Picking on this side, brighten the source icon slightly by re-stamping.
+    if let AnchorPick::Picking { side: psd, line } = pick {
+        if psd == side {
+            let center = anchor_icon_center(rail_left, rail_right, pane_top, line, scroll_y, lh);
+            let size = ui.calc_text_size(glyph);
+            dl.add_text(
+                [center[0] - size[0] * 0.5, center[1] - size[1] * 0.5],
+                theme::SAPPHIRE(),
+                glyph,
+            );
+        }
+    }
+}
+
 /// Paint per-row line numbers + anchor dots in the gutter strip.
 pub(super) fn paint_gutter(
     ui: &Ui,
     gutter_rect: [f32; 4],
-    anchors: &[Anchor],
-    side: Side,
+    _anchors: &[Anchor],
+    _side: Side,
     scroll_y: f32,
     lh: f32,
     line_count: u32,
@@ -723,21 +816,6 @@ pub(super) fn paint_gutter(
         let text = format!("{line}");
         let text_w = ui.calc_text_size(&text)[0];
         dl.add_text([g_left + g_w - 4.0 - text_w, y + 2.0], line_no_color, &text);
-    }
-
-    let dot_color = theme::LAVENDER();
-    for anc in anchors {
-        let line = match side {
-            Side::Left => anc.a,
-            Side::Right => anc.b,
-        };
-        let y = line_screen_y(g_top, line, scroll_y, lh) + lh * 0.5;
-        if y < g_top || y > g_bottom {
-            continue;
-        }
-        dl.add_circle([g_left + g_w * 0.5, y], 3.0, dot_color)
-            .filled(true)
-            .build();
     }
 }
 
