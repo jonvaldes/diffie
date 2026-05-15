@@ -529,6 +529,9 @@ pub(super) fn draw_connector(
     anchors: &[Anchor],
     hunks: &[Hunk],
     lh: f32,
+    pick: AnchorPick,
+    left_rail_center_x: f32,
+    right_rail_center_x: f32,
 ) {
     let dl = ui.get_window_draw_list();
     dl.with_clip_rect_intersect(origin, [origin[0] + w, origin[1] + h], || {
@@ -589,6 +592,24 @@ pub(super) fn draw_connector(
                 continue;
             }
             stroke_bezier_curve(x_l, x_r, ly, ry, theme::CRUST(), 3.0);
+        }
+
+        // Live drag bezier while the user is picking an anchor target.
+        if let AnchorPick::Picking { side, line } = pick {
+            let (src_x, src_origin_y) = match side {
+                Side::Left => (left_rail_center_x, left_origin_y),
+                Side::Right => (right_rail_center_x, right_origin_y),
+            };
+            let src_y = src_origin_y + (line as f32 - 1.0) * lh + lh * 0.5;
+            let [mx, my] = ui.io().mouse_pos;
+            // Use the same shape as anchor curves: cubic with horizontal handles.
+            // x_l is the smaller x; flip args if user picked from the right.
+            let (x_l, y1, x_r, y2) = if src_x < mx {
+                (src_x, src_y, mx, my)
+            } else {
+                (mx, my, src_x, src_y)
+            };
+            stroke_bezier_curve(x_l, x_r, y1, y2, theme::CRUST(), 3.0);
         }
     });
     let _ = dl;

@@ -232,6 +232,9 @@ pub fn render(
         anchors,
         hunks,
         lh,
+        state.anchor_pick,
+        connector_pos[0],                // placeholder; Task 4 supplies real rail centers
+        connector_pos[0] + CONNECTOR_W,  // placeholder
     );
 
     // Draw the hover panel(s) on top, after both panes have rendered.
