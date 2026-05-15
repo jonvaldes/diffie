@@ -5,7 +5,44 @@
 
 #[cfg(feature = "gui")]
 fn main() {
-    diffie_lib::app::run();
+    use std::path::PathBuf;
+
+    let argv: Vec<String> = std::env::args().collect();
+    let prog = argv.first().map(String::as_str).unwrap_or("diffie");
+    let args: Vec<&str> = argv.iter().skip(1).map(String::as_str).collect();
+
+    if args.iter().any(|a| *a == "-h" || *a == "--help") {
+        print_usage(prog, &mut std::io::stdout());
+        std::process::exit(0);
+    }
+
+    let initial = match args.len() {
+        0 => None,
+        2 => Some(diffie_lib::app::InitialOpen::TwoWay {
+            a: PathBuf::from(args[0]),
+            b: PathBuf::from(args[1]),
+        }),
+        4 => Some(diffie_lib::app::InitialOpen::ThreeWay {
+            base: PathBuf::from(args[0]),
+            local: PathBuf::from(args[1]),
+            remote: PathBuf::from(args[2]),
+            result: PathBuf::from(args[3]),
+        }),
+        _ => {
+            print_usage(prog, &mut std::io::stderr());
+            std::process::exit(2);
+        }
+    };
+
+    diffie_lib::app::run_with(initial);
+}
+
+#[cfg(feature = "gui")]
+fn print_usage<W: std::io::Write>(prog: &str, out: &mut W) {
+    let _ = writeln!(out, "Usage:");
+    let _ = writeln!(out, "  {prog}                                  Launch with no session");
+    let _ = writeln!(out, "  {prog} <fileA> <fileB>                  Open a 2-way diff");
+    let _ = writeln!(out, "  {prog} <base> <fileA> <fileB> <result>  Open a 3-way merge");
 }
 
 #[cfg(not(feature = "gui"))]

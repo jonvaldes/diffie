@@ -90,9 +90,32 @@ impl imgui::ClipboardBackend for ArboardClipboard {
 /// divide by this to get a comparable per-line value.
 const PIXEL_DELTA_PER_LINE: f32 = 16.0;
 
+/// Files to open immediately on launch, supplied via CLI args.
+#[derive(Debug, Clone)]
+pub enum InitialOpen {
+    TwoWay {
+        a: PathBuf,
+        b: PathBuf,
+    },
+    ThreeWay {
+        base: PathBuf,
+        local: PathBuf,
+        remote: PathBuf,
+        /// Bound save target for the merged result. If the file exists at
+        /// launch its contents are loaded into `manual_result`; otherwise the
+        /// path is just recorded so Ctrl+S writes there without prompting.
+        result: PathBuf,
+    },
+}
+
 pub fn run() {
+    run_with(None);
+}
+
+pub fn run_with(initial: Option<InitialOpen>) {
     let event_loop = EventLoop::new().expect("create event loop");
     let mut app = App::default();
+    app.state.pending_initial = initial;
     event_loop.run_app(&mut app).expect("run event loop");
 }
 
@@ -113,6 +136,10 @@ struct Tab {
     /// Used so Save File A / Save File B / Save Result As can write back
     /// without re-prompting.
     paths: Vec<PathBuf>,
+    /// 3-way only: bound save target for the merged result. Set when the
+    /// user picks a path via "Save Result As…" or supplies one via the CLI.
+    /// When `Some`, plain Save (Ctrl+S) writes here without prompting.
+    result_path: Option<PathBuf>,
 }
 
 struct AppState {
@@ -160,6 +187,9 @@ struct AppState {
     preferences_open: bool,
     /// Working copy of preferences while the dialog is open.
     preferences_draft: preferences::AppPreferences,
+    /// CLI-supplied session to open on the first frame. Drained inside
+    /// `frame_ui` once the GPU / imgui context is up.
+    pending_initial: Option<InitialOpen>,
 }
 
 /// Identifier shared between diff/merge views and the result pane so view
@@ -196,6 +226,7 @@ impl Default for AppState {
             preferences: preferences::load(),
             preferences_open: false,
             preferences_draft: preferences::AppPreferences::default(),
+            pending_initial: None,
         }
     }
 }
@@ -450,6 +481,14 @@ fn render(gpu: &mut Gpu, state: &mut AppState) {
 // --- UI -------------------------------------------------------------------
 
 fn frame_ui(ui: &imgui::Ui, state: &mut AppState) {
+    if let Some(initial) = state.pending_initial.take() {
+        match initial {
+            InitialOpen::TwoWay { a, b } => open_two_way_paths(state, a, b),
+            InitialOpen::ThreeWay { base, local, remote, result } => {
+                open_three_way_paths_with_result(state, base, local, remote, Some(result));
+            }
+        }
+    }
     keyboard_shortcuts(ui, state);
     menu_bar(ui, state);
     preferences_modal(ui, state);
@@ -542,12 +581,19 @@ fn menu_bar(ui: &imgui::Ui, state: &mut AppState) {
                 save_two_way_side(state, crate::session::TwoWaySide::B);
             }
             if ui
-                .menu_item_config("Save Result As…")
+                .menu_item_config("Save Result")
                 .shortcut("Ctrl+S")
                 .enabled(is_three_way)
                 .build()
             {
-                save_as(state);
+                save_result(state);
+            }
+            if ui
+                .menu_item_config("Save Result As…")
+                .enabled(is_three_way)
+                .build()
+            {
+                save_result_as(state);
             }
             if ui
                 .menu_item_config("Close Tab")
@@ -681,7 +727,7 @@ fn keyboard_shortcuts(ui: &imgui::Ui, state: &mut AppState) {
                     save_two_way_side(state, crate::session::TwoWaySide::A);
                 }
             }
-            Some(TabMode::ThreeWay) if !shift => save_as(state),
+            Some(TabMode::ThreeWay) if !shift => save_result(state),
             _ => {}
         }
     }
@@ -1069,7 +1115,29 @@ fn save_two_way_side(state: &mut AppState, side: crate::session::TwoWaySide) {
     }
 }
 
-fn save_as(state: &mut AppState) {
+/// Save the merged result. If the active tab has a `result_path` bound
+/// (via CLI args or a prior "Save Result As…"), write directly to it.
+/// Otherwise fall through to the prompt-and-bind variant.
+fn save_result(state: &mut AppState) {
+    let Some(id) = state.active else {
+        return;
+    };
+    let bound = state
+        .tabs
+        .iter()
+        .find(|t| t.session_id == id)
+        .and_then(|t| t.result_path.clone());
+    let Some(path) = bound else {
+        save_result_as(state);
+        return;
+    };
+    write_result_to(state, id, &path);
+}
+
+/// Prompt for a result path, write the current merged result to it, and
+/// bind the chosen path to the active tab so future Save (Ctrl+S) calls
+/// write there without prompting.
+fn save_result_as(state: &mut AppState) {
     let Some(id) = state.active else {
         return;
     };
@@ -1079,6 +1147,13 @@ fn save_as(state: &mut AppState) {
     else {
         return;
     };
+    write_result_to(state, id, &path);
+    if let Some(tab) = state.tabs.iter_mut().find(|t| t.session_id == id) {
+        tab.result_path = Some(path);
+    }
+}
+
+fn write_result_to(state: &mut AppState, id: SessionId, path: &std::path::Path) {
     let text = match state.sessions.compute_result(id) {
         Ok(t) => t,
         Err(e) => {
@@ -1086,7 +1161,7 @@ fn save_as(state: &mut AppState) {
             return;
         }
     };
-    match fileio::write_text(&path, &text, false) {
+    match fileio::write_text(path, &text, false) {
         Ok(()) => state.status = format!("saved: {}", path.display()),
         Err(e) => state.status = format!("save error: {e}"),
     }
@@ -1341,6 +1416,7 @@ fn open_two_way_paths(state: &mut AppState, a: PathBuf, b: PathBuf) {
                 label: label.clone(),
                 mode: TabMode::TwoWay,
                 paths: vec![a, b],
+                result_path: None,
             });
             state.active = Some(id);
             state.status = format!("Opened 2-way: {label}");
@@ -1368,6 +1444,16 @@ fn open_three_way_paths(
     base: PathBuf,
     local: PathBuf,
     remote: PathBuf,
+) {
+    open_three_way_paths_with_result(state, base, local, remote, None);
+}
+
+fn open_three_way_paths_with_result(
+    state: &mut AppState,
+    base: PathBuf,
+    local: PathBuf,
+    remote: PathBuf,
+    result: Option<PathBuf>,
 ) {
     let base_read = match fileio::read_text(&base) {
         Ok(t) => t,
@@ -1412,11 +1498,27 @@ fn open_three_way_paths(
                 local: local.clone(),
                 remote: remote.clone(),
             };
+            // If a result path was supplied and the file already exists,
+            // pre-load it as the manual result so the user sees their
+            // in-progress merge buffer.
+            if let Some(rp) = result.as_ref() {
+                if rp.exists() {
+                    match fileio::read_text(rp) {
+                        Ok(t) => {
+                            let _ = state.sessions.update_manual_result(id, t.text);
+                        }
+                        Err(e) => {
+                            state.status = format!("Read error (RESULT): {e}");
+                        }
+                    }
+                }
+            }
             state.tabs.push(Tab {
                 session_id: id,
                 label: label.clone(),
                 mode: TabMode::ThreeWay,
                 paths: vec![base, local, remote],
+                result_path: result,
             });
             state.active = Some(id);
             state.status = format!("Opened 3-way: {label}");
