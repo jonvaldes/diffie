@@ -31,21 +31,6 @@ pub(super) struct PendingJump {
     pub(super) target_line: crate::diff::LineNo,
 }
 
-/// Brief peach flash painted on top of a hunk's rows for a few frames
-/// after the user arrives via the `↕` jump button.
-#[allow(dead_code)]
-#[derive(Clone, Copy, Debug)]
-pub(super) struct MoveFlash {
-    pub(super) session_id: crate::session::SessionId,
-    pub(super) hunk_id: u32,
-    pub(super) frames_remaining: u8,
-}
-
-#[allow(dead_code)]
-pub(super) const MOVE_FLASH_FRAMES: u8 = 30;
-#[allow(dead_code)]
-pub(super) const MOVE_FLASH_PEAK_ALPHA: f32 = 0.20;
-
 /// Per-session view state that must persist across frames.
 #[derive(Default)]
 pub struct DiffViewState {
@@ -60,15 +45,11 @@ pub struct DiffViewState {
     /// `igSetNextWindowScroll`.
     pub(super) pending_left_scroll: Option<f32>,
     pub(super) pending_right_scroll: Option<f32>,
-    /// Last scroll_x per pane (test harness reads these).
-    pub last_left_scroll_x: f32,
-    pub last_right_scroll_x: f32,
     /// Two-click anchor creation: line picked on side A awaiting partner on B.
     pub(super) pending_a: Option<u32>,
     pub(super) pending_b: Option<u32>,
-    /// Jump-to-pair and arrival flash (unchanged).
+    /// Jump-to-pair target consumed on the next render.
     pub(super) pending_jump: Option<PendingJump>,
-    pub(super) flash: Option<MoveFlash>,
     /// Bumped on external buffer mutations (undo/redo, Apply A->B/B->A)
     /// and mixed into the widget ID so imgui re-initialises its
     /// stb_textedit state from `buf` instead of writing stale internal

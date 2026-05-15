@@ -14,7 +14,9 @@ use tree_sitter::{Language, Parser};
 use super::theme;
 
 /// Coarse category we map tree-sitter node kinds onto. Each variant resolves
-/// to a single palette color.
+/// to a single palette color. `Function` and `Preproc` are reserved palette
+/// slots that no language mapping currently emits.
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SyntaxKind {
     Keyword,
@@ -74,7 +76,11 @@ pub enum HlBg {
 }
 
 /// Per-`SyntaxKind` foreground colors precomputed for one background.
-/// `default` covers un-tokenized stretches.
+/// `default` covers un-tokenized stretches. The current renderer pulls
+/// colors directly from `SyntaxKind::color()`; these tables are precomputed
+/// at startup for the contrast-aware path that future hunk-bg rendering
+/// will read.
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug)]
 pub struct ColorTable {
     pub keyword: [f32; 4],
@@ -86,23 +92,6 @@ pub struct ColorTable {
     pub preproc: [f32; 4],
     pub constant: [f32; 4],
     pub default: [f32; 4],
-}
-
-impl ColorTable {
-    pub fn get(&self, kind: Option<SyntaxKind>) -> [f32; 4] {
-        match kind {
-            Some(SyntaxKind::Keyword) => self.keyword,
-            Some(SyntaxKind::Type) => self.type_,
-            Some(SyntaxKind::String) => self.string,
-            Some(SyntaxKind::Number) => self.number,
-            Some(SyntaxKind::Comment) => self.comment,
-            Some(SyntaxKind::Function) => self.function,
-            Some(SyntaxKind::Preproc) => self.preproc,
-            Some(SyntaxKind::Constant) => self.constant,
-            Some(SyntaxKind::Bracket(d)) => SyntaxKind::Bracket(d).color(),
-            None => self.default,
-        }
-    }
 }
 
 /// Scale a color's distance from its luma (Rec. 601 weights) by `factor` —
@@ -257,14 +246,6 @@ fn shift_lightness(fg: [f32; 4], bg: [f32; 4]) -> [f32; 4] {
         current = lab_to_rgb([target_l, fg_lab[1], fg_lab[2]], fg[3]);
     }
     current
-}
-
-/// CIE ΔE*76 — Euclidean distance in Lab. Ranges roughly 0–110+ for
-/// sRGB; values ≥ ~25 are clearly distinguishable, ≥ ~50 are very different.
-fn perceptual_distance(a: [f32; 4], b: [f32; 4]) -> f32 {
-    let la = lab_of(a);
-    let lb = lab_of(b);
-    ((la[0] - lb[0]).powi(2) + (la[1] - lb[1]).powi(2) + (la[2] - lb[2]).powi(2)).sqrt()
 }
 
 fn negate(c: [f32; 4]) -> [f32; 4] {
@@ -499,11 +480,6 @@ impl HighlightCache {
             );
         }
         &self.entries.get(&key).unwrap().lines
-    }
-
-    /// Drop the cache entry for `key`. Called when a session closes.
-    pub fn forget(&mut self, key: u64) {
-        self.entries.remove(&key);
     }
 
     fn compute(&mut self, lang: Lang, lines: &[String]) -> Vec<LineSpans> {

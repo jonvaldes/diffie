@@ -24,7 +24,6 @@ use crate::diff::Anchor;
 use crate::io as fileio;
 use crate::session::{SessionId, SessionMode, SessionStore};
 
-mod char_diff;
 mod diff_view;
 mod engine_bar;
 mod merge_view;
