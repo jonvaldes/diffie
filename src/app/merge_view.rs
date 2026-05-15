@@ -27,6 +27,9 @@ const ROW_H_BASE: f32 = 24.0;
 const GUTTER_W_BASE: f32 = 60.0;
 const CONNECTOR_W: f32 = 56.0;
 const ECHO_TOLERANCE: f32 = 1.0;
+const SCROLL_LINES_PER_WHEEL_TICK: f32 = 3.0;
+const SCROLL_SMOOTH_SPEED: f32 = 25.0;
+const SCROLL_SNAP_EPSILON: f32 = 0.5;
 
 /// Deprecated: use `ui.text_line_height()` inside the mono font scope.
 /// Kept for any callers we missed.
@@ -47,8 +50,12 @@ pub struct MergeViewState {
     base_buf: String,
     local_buf: String,
     remote_buf: String,
-    /// Last scroll_y per pane (for sync math).
+    /// Last *displayed* scroll_y per pane — the eased value pushed to imgui
+    /// last frame. Used by overlay paint and as the start of the next ease.
     last: [f32; 3],
+    /// Where each pane is scrolling toward. Wheel, sync, and jump update
+    /// this; `last` eases toward it each frame.
+    target: [f32; 3],
     /// Pending scroll value to apply next frame on a given pane.
     pending: [Option<f32>; 3],
     /// Bumped on external buffer mutations (undo/redo, Apply Local/Base/Remote);
@@ -202,6 +209,12 @@ pub fn render(
         [Cell::new(None), Cell::new(None), Cell::new(None)];
     let focus_event: Cell<Option<crate::app::FocusedPane>> = Cell::new(None);
 
+    // Snapshot last frame's targets before any render_pane call mutates
+    // them. Sync detection compares targets (not eased displayed scroll)
+    // so a single user gesture fires sync exactly once instead of every
+    // animation frame.
+    let prev_targets = state.target;
+
     let (_base_rect, base_scroll, base_origin) = render_pane(
         ui, state, base_pos, pane_w, pane_h, Pane::Base, session_id,
         pending_edits, &base_layout, &hover_panes[0], &focus_event, lh,
@@ -228,11 +241,10 @@ pub fn render(
         *focus_request = Some(p);
     }
 
-    let scrolls = [base_scroll, local_scroll, remote_scroll];
     let view_hs = [pane_h, pane_h, pane_h];
     sync_scrolls(
         state,
-        scrolls,
+        prev_targets,
         view_hs,
         &base_layout.ranges,
         &local_layout.ranges,
@@ -305,17 +317,7 @@ fn render_pane(
     let widget_pos = [pane_pos[0] + g_w, pane_pos[1]];
     let widget_w = (pane_w - g_w).max(20.0);
 
-    // Apply any pending scroll set last frame. `igSetNextWindowScroll`
-    // targets the multiline's internal child; the ALWAYS callback below
-    // also applies it as a fallback when the widget is active.
     let pending_scroll = state.pending[pane as usize].take();
-    if let Some(y) = pending_scroll {
-        unsafe {
-            imgui::sys::igSetNextWindowScroll(imgui::sys::ImVec2 { x: -1.0, y });
-        }
-    }
-
-    ui.set_cursor_screen_pos(widget_pos);
 
     let buf_ref: &str = match pane {
         Pane::Base => &state.base_buf,
@@ -325,6 +327,49 @@ fn render_pane(
     let n = buf_ref.lines().count().max(1);
     let trailing = buf_ref.is_empty() || buf_ref.ends_with('\n');
     let buf_line_count = n + if trailing { 1 } else { 0 };
+    let content_h = (buf_line_count as f32) * lh;
+    let max_scroll = (content_h - pane_h).max(0.0);
+
+    // Wheel input: only the hovered pane consumes io.mouse_wheel for its
+    // own target. imgui's child window also sees the wheel internally, but
+    // we pin its scroll via igSetNextWindowScroll below so any internal
+    // movement is overwritten next frame.
+    let wheel = if ui.is_mouse_hovering_rect(
+        [widget_pos[0], widget_pos[1]],
+        [widget_pos[0] + widget_w, widget_pos[1] + pane_h],
+    ) {
+        ui.io().mouse_wheel
+    } else {
+        0.0
+    };
+    let prev_target = state.target[pane as usize];
+    let mut target = pending_scroll
+        .unwrap_or(prev_target - wheel * lh * SCROLL_LINES_PER_WHEEL_TICK);
+    if target < 0.0 {
+        target = 0.0;
+    }
+    if target > max_scroll {
+        target = max_scroll;
+    }
+    state.target[pane as usize] = target;
+
+    let prev_displayed = state.last[pane as usize];
+    let dt = ui.io().delta_time.max(0.0).min(0.1);
+    let k = 1.0 - (-dt * SCROLL_SMOOTH_SPEED).exp();
+    let mut displayed = prev_displayed + (target - prev_displayed) * k;
+    if (target - displayed).abs() < SCROLL_SNAP_EPSILON {
+        displayed = target;
+    }
+
+    // Pin the multiline's internal child scroll to our value every frame
+    // so the rendered text aligns with our overlay. The widget IS the next
+    // window for purposes of igSetNextWindowScroll. Imgui may still process
+    // the wheel internally; our override the next frame wins.
+    unsafe {
+        imgui::sys::igSetNextWindowScroll(imgui::sys::ImVec2 { x: -1.0, y: displayed });
+    }
+
+    ui.set_cursor_screen_pos(widget_pos);
 
     let widget_id = format!("##merge_pane_{:?}_e{}", pane, state.input_epoch);
 
@@ -336,9 +381,6 @@ fn render_pane(
     ];
 
     let caret_byte: Cell<i32> = Cell::new(-1);
-    let last_scroll = state.last[pane as usize];
-    let scroll_y_cell: Cell<f32> = Cell::new(pending_scroll.unwrap_or(last_scroll));
-    let pending_scroll_cell: Cell<Option<f32>> = Cell::new(pending_scroll);
     let origin_out: [f32; 2] = widget_pos;
 
     let (changed, new_text_opt, widget_active) = {
@@ -358,18 +400,10 @@ fn render_pane(
 
         struct CaretCapture<'a> {
             cursor: &'a Cell<i32>,
-            scroll_y: &'a Cell<f32>,
-            pending: &'a Cell<Option<f32>>,
         }
         impl<'a> imgui::InputTextCallbackHandler for CaretCapture<'a> {
             fn on_always(&mut self, data: imgui::TextCallbackData) {
                 self.cursor.set(data.cursor_pos() as i32);
-                unsafe {
-                    if let Some(target) = self.pending.take() {
-                        imgui::sys::igSetScrollY(target);
-                    }
-                    self.scroll_y.set(imgui::sys::igGetScrollY());
-                }
             }
         }
 
@@ -378,18 +412,15 @@ fn render_pane(
             .no_undo_redo(true)
             .callback(
                 imgui::InputTextMultilineCallback::ALWAYS,
-                CaretCapture {
-                    cursor: &caret_byte,
-                    scroll_y: &scroll_y_cell,
-                    pending: &pending_scroll_cell,
-                },
+                CaretCapture { cursor: &caret_byte },
             )
             .build();
         let active = ui.is_item_active();
         let new_text = if changed { Some(buf.clone()) } else { None };
         (changed, new_text, active)
     };
-    let scroll_y_out = scroll_y_cell.get();
+    let scroll_y_out = displayed;
+    state.last[pane as usize] = displayed;
     if widget_active {
         focus_event.set(Some(pane.as_focused_pane()));
     }
@@ -879,7 +910,7 @@ fn draw_connector(
 
 fn sync_scrolls(
     state: &mut MergeViewState,
-    curr: [f32; 3],
+    prev_targets: [f32; 3],
     view_h: [f32; 3],
     base_ranges: &[(u32, f32, f32)],
     local_ranges: &[(u32, f32, f32)],
@@ -888,8 +919,7 @@ fn sync_scrolls(
     let ranges = [base_ranges, local_ranges, remote_ranges];
     let mut driver: Option<usize> = None;
     for i in 0..3 {
-        let changed = (curr[i] - state.last[i]).abs() > ECHO_TOLERANCE;
-        if changed {
+        if (state.target[i] - prev_targets[i]).abs() > ECHO_TOLERANCE {
             driver = Some(i);
             break;
         }
@@ -899,14 +929,17 @@ fn sync_scrolls(
             if dst == src {
                 continue;
             }
-            if let Some(target) =
-                target_scroll(curr[src], view_h[src], view_h[dst], ranges[src], ranges[dst])
-            {
+            if let Some(target) = target_scroll(
+                state.target[src],
+                view_h[src],
+                view_h[dst],
+                ranges[src],
+                ranges[dst],
+            ) {
                 state.pending[dst] = Some(target);
             }
         }
     }
-    state.last = curr;
 }
 
 fn target_scroll(

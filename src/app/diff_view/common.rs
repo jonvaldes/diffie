@@ -38,9 +38,18 @@ pub struct DiffViewState {
     /// render; written-back on every `input_text_multiline` change.
     pub(super) a_buf: String,
     pub(super) b_buf: String,
-    /// Last scroll_y per pane (for sync math).
+    /// Last *displayed* scroll_y per pane — the eased value pushed to imgui
+    /// last frame. Returned to overlay paint code so highlights/caret align
+    /// with what the user sees.
     pub(super) last_left_scroll_y: f32,
     pub(super) last_right_scroll_y: f32,
+    /// Where each pane is scrolling toward. Wheel input, pending sync, and
+    /// jumps mutate the target; the displayed scroll eases toward it each
+    /// frame. Used by the sync detector — comparing targets (not eased
+    /// displayed) keeps a single sync event from being mistaken for ongoing
+    /// scroll feedback.
+    pub(super) target_left_scroll: f32,
+    pub(super) target_right_scroll: f32,
     /// Pending scroll set by sync; consumed on next render via
     /// `igSetNextWindowScroll`.
     pub(super) pending_left_scroll: Option<f32>,

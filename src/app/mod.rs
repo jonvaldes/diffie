@@ -788,7 +788,7 @@ fn load_fonts(imgui: &mut Context, ui_font_size: f32) -> FontId {
     }]);
     let code_size = ui_font_size * CODE_FONT_BASE_SCALE * code_font_zoom();
     fonts.add_font(&[FontSource::TtfData {
-        data: include_bytes!("../../assets/RobotoMono-Regular.ttf"),
+        data: include_bytes!("../../assets/RobotoMonoNerdFont-Regular.ttf"),
         size_pixels: code_size,
         config: Some(imgui::FontConfig {
             size_pixels: code_size,

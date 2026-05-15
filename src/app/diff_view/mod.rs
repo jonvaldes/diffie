@@ -28,6 +28,14 @@ const ECHO_TOLERANCE: f32 = 1.0;
 /// Lines of scroll per mouse-wheel tick. Matches typical text-editor feel.
 const SCROLL_LINES_PER_WHEEL_TICK: f32 = 3.0;
 
+/// Exponential easing rate for smooth scroll. ~25 gives a half-life of
+/// roughly 28 ms — snappy but visibly animated. Higher = stiffer / less
+/// smoothing.
+const SCROLL_SMOOTH_SPEED: f32 = 25.0;
+/// When displayed is within this many pixels of target, snap to avoid an
+/// endless asymptotic tail.
+const SCROLL_SNAP_EPSILON: f32 = 0.5;
+
 use super::undo_stack::DiffEdit;
 
 #[allow(clippy::too_many_arguments)]
@@ -97,6 +105,11 @@ pub fn render(
     let hover_right: Cell<Option<(u32, [f32; 2])>> = Cell::new(None);
     let pending_jump_cell: Cell<Option<PendingJump>> = Cell::new(None);
 
+    // Snapshot the previous frame's targets before render_pane mutates them,
+    // so the sync detector can tell which pane the user touched this frame.
+    let prev_left_target_for_sync = state.target_left_scroll;
+    let prev_right_target_for_sync = state.target_right_scroll;
+
     let (left_widget_rect, left_scroll_y) = render_pane(
         ui, state, left_pos, pane_w, pane_h, Side::Left, session_id,
         pending_edits, hunks, anchors, &hover_left, status, store,
@@ -114,28 +127,30 @@ pub fn render(
         b_highlights, lh,
     );
 
-    let prev_left = state.last_left_scroll_y;
-    let prev_right = state.last_right_scroll_y;
+    let prev_left_target = prev_left_target_for_sync;
+    let prev_right_target = prev_right_target_for_sync;
     state.last_left_scroll_y = left_scroll_y;
     state.last_right_scroll_y = right_scroll_y;
     let _ = left_widget_rect;
     let _ = right_widget_rect;
 
-    // Scroll sync: whichever pane moved this frame drives the other.
-    let left_changed = (left_scroll_y - prev_left).abs() > ECHO_TOLERANCE;
-    let right_changed = (right_scroll_y - prev_right).abs() > ECHO_TOLERANCE;
+    // Scroll sync: compare *targets*, not eased displayed values, so the
+    // sync trigger fires once per user gesture rather than every animation
+    // frame.
+    let left_changed = (state.target_left_scroll - prev_left_target).abs() > ECHO_TOLERANCE;
+    let right_changed = (state.target_right_scroll - prev_right_target).abs() > ECHO_TOLERANCE;
     let left_ranges = build_pane_ranges(hunks, Side::Left, lh);
     let right_ranges = build_pane_ranges(hunks, Side::Right, lh);
 
     if left_changed && !right_changed {
         if let Some(target) = target_scroll(
-            left_scroll_y, pane_h, pane_h, &left_ranges, &right_ranges,
+            state.target_left_scroll, pane_h, pane_h, &left_ranges, &right_ranges,
         ) {
             state.pending_right_scroll = Some(target);
         }
     } else if right_changed && !left_changed {
         if let Some(target) = target_scroll(
-            right_scroll_y, pane_h, pane_h, &right_ranges, &left_ranges,
+            state.target_right_scroll, pane_h, pane_h, &right_ranges, &left_ranges,
         ) {
             state.pending_left_scroll = Some(target);
         }
@@ -287,28 +302,46 @@ fn render_pane(
         Side::Left => state.pending_left_scroll.take(),
         Side::Right => state.pending_right_scroll.take(),
     };
-    let prev_own_scroll = match side {
+    let prev_target = match side {
+        Side::Left => state.target_left_scroll,
+        Side::Right => state.target_right_scroll,
+    };
+    let prev_displayed = match side {
         Side::Left => state.last_left_scroll_y,
         Side::Right => state.last_right_scroll_y,
     };
-    let wheel = if pending_scroll.is_none()
-        && ui.is_mouse_hovering_rect(
-            [widget_pos[0], widget_pos[1]],
-            [widget_pos[0] + widget_w, widget_pos[1] + pane_h],
-        )
-    {
+    let wheel = if ui.is_mouse_hovering_rect(
+        [widget_pos[0], widget_pos[1]],
+        [widget_pos[0] + widget_w, widget_pos[1] + pane_h],
+    ) {
         ui.io().mouse_wheel
     } else {
         0.0
     };
-    let mut own_scroll = pending_scroll
-        .unwrap_or_else(|| prev_own_scroll - wheel * lh * SCROLL_LINES_PER_WHEEL_TICK);
-    if own_scroll < 0.0 {
-        own_scroll = 0.0;
+    // Compute this frame's *target*. Pending (sync / jump) overrides; otherwise
+    // mouse wheel deflects from the previous target so multiple wheel ticks
+    // before the easing catches up still register fully.
+    let mut target = pending_scroll
+        .unwrap_or_else(|| prev_target - wheel * lh * SCROLL_LINES_PER_WHEEL_TICK);
+    if target < 0.0 {
+        target = 0.0;
     }
-    if own_scroll > max_scroll {
-        own_scroll = max_scroll;
+    if target > max_scroll {
+        target = max_scroll;
     }
+    match side {
+        Side::Left => state.target_left_scroll = target,
+        Side::Right => state.target_right_scroll = target,
+    }
+
+    // Ease the displayed scroll toward target with an exponential decay.
+    let dt = ui.io().delta_time.max(0.0).min(0.1);
+    let k = 1.0 - (-dt * SCROLL_SMOOTH_SPEED).exp();
+    let mut displayed = prev_displayed + (target - prev_displayed) * k;
+    if (target - displayed).abs() < SCROLL_SNAP_EPSILON {
+        displayed = target;
+    }
+    let own_scroll = displayed;
 
     // Pin the widget's internal child scroll to our value every frame so
     // the rendered text aligns with our overlay. The widget IS the next
