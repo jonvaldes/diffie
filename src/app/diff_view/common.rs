@@ -10,6 +10,8 @@ pub(super) const GUTTER_W_BASE: f32 = 60.0;
 
 pub(super) const CONNECTOR_W: f32 = 60.0;
 
+/// Deprecated: use `ui.text_line_height()` inside the mono font scope.
+/// Kept for any callers we missed.
 #[allow(dead_code)]
 pub(super) fn line_h() -> f32 {
     ROW_H_BASE * crate::app::code_font_zoom()

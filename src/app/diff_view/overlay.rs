@@ -10,7 +10,7 @@ use crate::app::undo_stack::DiffEdit;
 use crate::diff::{Anchor, DiffOp, Hunk, SubSpan, SubSpanKind};
 use crate::session::{SessionId, TwoWaySide};
 
-use super::common::{line_h, PendingJump, Side};
+use super::common::{PendingJump, Side};
 use crate::app::syntax::LineSpans;
 
 /// Pure: 1-based row from a mouse y, the widget's top in screen space,
@@ -97,11 +97,11 @@ pub(super) fn paint_pane_text(
     hunks: &[Hunk],
     side: Side,
     scroll_y: f32,
+    lh: f32,
     caret_byte: i32,
     widget_active: bool,
     hover_out: &Cell<Option<(u32, [f32; 2])>>,
 ) {
-    let lh = line_h();
     let widget_top = widget_rect[1];
     let widget_bottom = widget_rect[3];
     let widget_left = widget_rect[0];
@@ -511,6 +511,7 @@ pub(super) fn draw_connector(
     right_ranges: &[(u32, f32, f32)],
     anchors: &[Anchor],
     hunks: &[Hunk],
+    lh: f32,
 ) {
     let dl = ui.get_window_draw_list();
     dl.with_clip_rect_intersect(origin, [origin[0] + w, origin[1] + h], || {
@@ -564,7 +565,6 @@ pub(super) fn draw_connector(
 
         // Anchor curves: thin line from anchor.a row centre on left to
         // anchor.b row centre on right.
-        let lh = line_h();
         for anc in anchors {
             let ly = left_origin_y + (anc.a as f32 - 1.0) * lh + lh * 0.5;
             let ry = right_origin_y + (anc.b as f32 - 1.0) * lh + lh * 0.5;
@@ -591,6 +591,7 @@ pub(super) fn draw_control_overlay(
     session_id: SessionId,
     hunk_id: u32,
     pos: [f32; 2],
+    lh: f32,
     pending_edits: &mut Vec<DiffEdit>,
     hunks: &[Hunk],
     side: Side,
@@ -607,7 +608,7 @@ pub(super) fn draw_control_overlay(
     let panel_x = pos[0] + 4.0;
     let panel_y = pos[1] + 2.0;
     let panel_w: f32 = if is_moved_with_pair { 240.0 } else { 200.0 };
-    let panel_h = line_h() - 4.0;
+    let panel_h = lh - 4.0;
 
     let dl = ui.get_window_draw_list();
     dl.add_rect(
@@ -674,10 +675,10 @@ pub(super) fn paint_gutter(
     anchors: &[Anchor],
     side: Side,
     scroll_y: f32,
+    lh: f32,
     line_count: u32,
 ) {
     let dl = ui.get_window_draw_list();
-    let lh = line_h();
     let g_top = gutter_rect[1];
     let g_bottom = gutter_rect[3];
     let g_h = g_bottom - g_top;

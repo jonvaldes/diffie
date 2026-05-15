@@ -492,9 +492,11 @@ fn scrolling_one_pane_targets_the_other() {
     let store = SessionStore::new();
     let mut a = String::new();
     let mut b = String::new();
-    for i in 1..=50 {
-        a.push_str(&format!("line{i:02}\n"));
-        b.push_str(&format!("line{i:02}\n"));
+    // Use enough lines to overflow the pane regardless of the active font
+    // size (200 lines × even 13 px/line = 2600 px, well above any test pane).
+    for i in 1..=200 {
+        a.push_str(&format!("line{i:03}\n"));
+        b.push_str(&format!("line{i:03}\n"));
     }
     let id = store.open_two_way(&a, &b, None).unwrap();
 
@@ -510,7 +512,11 @@ fn scrolling_one_pane_targets_the_other() {
         run_frame_with_wgpu(&mut ctx, &mut renderer, &device, &queue, target_format, &store, id, &mut view, None, FrameInput::default());
     }
     view.pending_left_scroll = Some(200.0);
-    for _ in 0..2 {
+    // Frame 1: left pane applies the pending scroll (igSetNextWindowScroll);
+    //   scroll_y_out may still read 0 until imgui commits the scroll.
+    // Frame 2: left scroll is now reflected → sync fires → pending_right_scroll set.
+    // Frame 3: right pane applies its pending scroll.
+    for _ in 0..3 {
         run_frame_with_wgpu(&mut ctx, &mut renderer, &device, &queue, target_format, &store, id, &mut view, None, FrameInput::default());
     }
     assert!(

@@ -19,7 +19,7 @@ mod overlay;
 mod tests;
 
 pub use common::{DiffViewState, Side};
-use common::{build_pane_ranges, gutter_w, line_h, target_scroll, PendingJump, CONNECTOR_W};
+use common::{build_pane_ranges, gutter_w, target_scroll, PendingJump, CONNECTOR_W};
 
 /// Minimum scroll change (px) to treat as intentional user input.
 /// Dampens single-pixel echo oscillation when we push a new scroll value.
@@ -62,11 +62,22 @@ pub fn render(
     let pane_w = ((total_w - CONNECTOR_W) * 0.5).max(100.0);
     let pane_h = avail[1].max(100.0);
 
+    let panes_top_left = ui.cursor_screen_pos();
+    let left_pos = panes_top_left;
+    let connector_pos = [left_pos[0] + pane_w, left_pos[1]];
+    let right_pos = [connector_pos[0] + CONNECTOR_W, left_pos[1]];
+
+    let _font_tok = mono_font.map(|f| ui.push_font(f));
+    // Use imgui's actual line height (from the active/mono font metrics) for
+    // all overlay positioning so our draw-list text aligns with what
+    // input_text_multiline renders.
+    let lh = ui.text_line_height();
+
     // Consume any pending jump set by last frame's hover overlay (↕ button).
     // Translates `pending_jump` into a centered scroll on the target pane.
+    // Done after font push so `lh` (text_line_height) reflects the mono font.
     if let Some(jump) = state.pending_jump.take() {
         if jump.session_id == session_id {
-            let lh = line_h();
             // Center the target line in the pane.
             let target_y = ((jump.target_line as f32 - 1.0) * lh
                 - pane_h * 0.5
@@ -79,13 +90,6 @@ pub fn render(
         }
     }
 
-    let panes_top_left = ui.cursor_screen_pos();
-    let left_pos = panes_top_left;
-    let connector_pos = [left_pos[0] + pane_w, left_pos[1]];
-    let right_pos = [connector_pos[0] + CONNECTOR_W, left_pos[1]];
-
-    let _font_tok = mono_font.map(|f| ui.push_font(f));
-
     let hover_left: Cell<Option<(u32, [f32; 2])>> = Cell::new(None);
     let hover_right: Cell<Option<(u32, [f32; 2])>> = Cell::new(None);
     let pending_jump_cell: Cell<Option<PendingJump>> = Cell::new(None);
@@ -93,7 +97,7 @@ pub fn render(
     let (left_widget_rect, left_scroll_y) = render_pane(
         ui, state, left_pos, pane_w, pane_h, Side::Left, session_id,
         pending_edits, hunks, anchors, &hover_left, status, store,
-        a_highlights,
+        a_highlights, lh,
     );
 
     // Connector strip: reserve the area; ribbons painted after both panes
@@ -104,7 +108,7 @@ pub fn render(
     let (right_widget_rect, right_scroll_y) = render_pane(
         ui, state, right_pos, pane_w, pane_h, Side::Right, session_id,
         pending_edits, hunks, anchors, &hover_right, status, store,
-        b_highlights,
+        b_highlights, lh,
     );
 
     let prev_left = state.last_left_scroll_y;
@@ -115,7 +119,6 @@ pub fn render(
     let _ = right_widget_rect;
 
     // Scroll sync: whichever pane moved this frame drives the other.
-    let lh = line_h();
     let left_changed = (left_scroll_y - prev_left).abs() > ECHO_TOLERANCE;
     let right_changed = (right_scroll_y - prev_right).abs() > ECHO_TOLERANCE;
     let left_ranges = build_pane_ranges(hunks, Side::Left, lh);
@@ -148,18 +151,19 @@ pub fn render(
         &right_ranges,
         anchors,
         hunks,
+        lh,
     );
 
     // Draw the hover panel(s) on top, after both panes have rendered.
     if let Some((hid, pos)) = hover_left.get() {
         overlay::draw_control_overlay(
-            ui, session_id, hid, pos, pending_edits, hunks, Side::Left,
+            ui, session_id, hid, pos, lh, pending_edits, hunks, Side::Left,
             &pending_jump_cell,
         );
     }
     if let Some((hid, pos)) = hover_right.get() {
         overlay::draw_control_overlay(
-            ui, session_id, hid, pos, pending_edits, hunks, Side::Right,
+            ui, session_id, hid, pos, lh, pending_edits, hunks, Side::Right,
             &pending_jump_cell,
         );
     }
@@ -211,6 +215,7 @@ fn render_pane(
     status: &mut String,
     store: &SessionStore,
     highlights: &[crate::app::syntax::LineSpans],
+    lh: f32,
 ) -> ([f32; 4], f32) {
     let g_w = gutter_w();
     let widget_pos = [pane_pos[0] + g_w, pane_pos[1]];
@@ -225,7 +230,7 @@ fn render_pane(
     };
     if gutter_clicked {
         let mouse_y = ui.io().mouse_pos[1];
-        let line = overlay::mouse_y_to_line(mouse_y, pane_pos[1], scroll_y_for_anchor, line_h());
+        let line = overlay::mouse_y_to_line(mouse_y, pane_pos[1], scroll_y_for_anchor, lh);
         handle_anchor_click(state, side, line, status, store, session_id);
     }
     let gutter_rect = [pane_pos[0], pane_pos[1], pane_pos[0] + g_w, pane_pos[1] + pane_h];
@@ -242,6 +247,7 @@ fn render_pane(
         anchors,
         side,
         scroll_y_for_anchor,
+        lh,
         buf_line_count_for_gutter,
     );
 
@@ -271,7 +277,6 @@ fn render_pane(
         (n + if trailing { 1 } else { 0 }, ())
     };
 
-    let lh = crate::app::diff_view::common::line_h();
     let content_h = (buf_line_count as f32 * lh).max(pane_h);
 
     let widget_id = format!("##diffie_pane_{:?}_e{}", side, state.input_epoch);
@@ -355,6 +360,7 @@ fn render_pane(
                 hunks,
                 side,
                 scroll_y_out,
+                lh,
                 caret_byte.get(),
                 widget_active.get(),
                 hover_out,

@@ -28,6 +28,9 @@ const GUTTER_W_BASE: f32 = 60.0;
 const CONNECTOR_W: f32 = 56.0;
 const ECHO_TOLERANCE: f32 = 1.0;
 
+/// Deprecated: use `ui.text_line_height()` inside the mono font scope.
+/// Kept for any callers we missed.
+#[allow(dead_code)]
 fn row_h() -> f32 {
     ROW_H_BASE * crate::app::code_font_zoom()
 }
@@ -116,13 +119,12 @@ struct PaneLayout {
     line_ys: HashMap<u32, f32>,
 }
 
-fn build_layout(hunks: &[MergeHunk], pane: Pane) -> PaneLayout {
+fn build_layout(hunks: &[MergeHunk], pane: Pane, lh: f32) -> PaneLayout {
     let mut hunks_out: Vec<(u32, Option<HunkKind>, u32, u32)> = Vec::new();
     let mut ranges: Vec<(u32, f32, f32)> = Vec::new();
     let mut line_ys: HashMap<u32, f32> = HashMap::new();
     let mut y: f32 = 0.0;
     let mut line_n: u32 = 1;
-    let lh = row_h();
     for h in hunks {
         let start_y = y;
         let start_line = line_n;
@@ -174,16 +176,20 @@ pub fn render(
         state.remote_buf = remote_text.clone();
     }
 
-    let base_layout = build_layout(hunks, Pane::Base);
-    let local_layout = build_layout(hunks, Pane::Local);
-    let remote_layout = build_layout(hunks, Pane::Remote);
-
     let avail = ui.content_region_avail();
     let total_w = avail[0];
     let pane_w = ((total_w - CONNECTOR_W * 2.0) / 3.0).max(80.0);
     let pane_h = avail[1].max(100.0);
 
     let _font_tok = mono_font.map(|f| ui.push_font(f));
+    // Use imgui's actual line height (from the active/mono font metrics) for
+    // all overlay positioning so our draw-list text aligns with what
+    // input_text_multiline renders.
+    let lh = ui.text_line_height();
+
+    let base_layout = build_layout(hunks, Pane::Base, lh);
+    let local_layout = build_layout(hunks, Pane::Local, lh);
+    let remote_layout = build_layout(hunks, Pane::Remote, lh);
 
     let panes_top_left = ui.cursor_screen_pos();
     let base_pos = panes_top_left;
@@ -198,7 +204,7 @@ pub fn render(
 
     let (_base_rect, base_scroll, base_origin) = render_pane(
         ui, state, base_pos, pane_w, pane_h, Pane::Base, session_id,
-        pending_edits, &base_layout, &hover_panes[0], &focus_event,
+        pending_edits, &base_layout, &hover_panes[0], &focus_event, lh,
     );
 
     // Connector BASE↔LOCAL: empty area for the bezier ribbons.
@@ -207,7 +213,7 @@ pub fn render(
 
     let (_local_rect, local_scroll, local_origin) = render_pane(
         ui, state, local_pos, pane_w, pane_h, Pane::Local, session_id,
-        pending_edits, &local_layout, &hover_panes[1], &focus_event,
+        pending_edits, &local_layout, &hover_panes[1], &focus_event, lh,
     );
 
     ui.set_cursor_screen_pos(connector_lr_pos);
@@ -215,7 +221,7 @@ pub fn render(
 
     let (_remote_rect, remote_scroll, remote_origin) = render_pane(
         ui, state, remote_pos, pane_w, pane_h, Pane::Remote, session_id,
-        pending_edits, &remote_layout, &hover_panes[2], &focus_event,
+        pending_edits, &remote_layout, &hover_panes[2], &focus_event, lh,
     );
 
     if let Some(p) = focus_event.get() {
@@ -249,6 +255,7 @@ pub fn render(
         &local_layout.line_ys,
         anchors.iter().map(|a| (a.base, a.local)).collect::<Vec<_>>().as_slice(),
         hunks,
+        lh,
     );
     draw_connector(
         ui,
@@ -263,13 +270,14 @@ pub fn render(
         &remote_layout.line_ys,
         anchors.iter().map(|a| (a.local, a.remote)).collect::<Vec<_>>().as_slice(),
         hunks,
+        lh,
     );
 
     // Hover overlay panels. Drawn last so they sit above panes + connectors.
     for (i, cell) in hover_panes.iter().enumerate() {
         if let Some((hunk_id, kind, pos)) = cell.get() {
             let _ = i;
-            draw_control_overlay(ui, store, session_id, hunk_id, kind, status, pos);
+            draw_control_overlay(ui, store, session_id, hunk_id, kind, status, pos, lh);
         }
     }
 
@@ -291,6 +299,7 @@ fn render_pane(
     layout: &PaneLayout,
     hover_out: &Cell<Option<(u32, HunkKind, [f32; 2])>>,
     focus_event: &Cell<Option<crate::app::FocusedPane>>,
+    lh: f32,
 ) -> ([f32; 4], f32, [f32; 2]) {
     let g_w = gutter_w();
     let widget_pos = [pane_pos[0] + g_w, pane_pos[1]];
@@ -315,7 +324,6 @@ fn render_pane(
     let trailing = buf_ref.is_empty() || buf_ref.ends_with('\n');
     let buf_line_count = n + if trailing { 1 } else { 0 };
 
-    let lh = row_h();
     let content_h = (buf_line_count as f32 * lh).max(pane_h);
 
     let widget_id = format!("##merge_pane_{:?}_e{}", pane, state.input_epoch);
@@ -397,6 +405,7 @@ fn render_pane(
                 buf_for_paint,
                 layout,
                 scroll_y_out,
+                lh,
                 caret_byte.get(),
                 widget_active.get(),
                 hover_out,
@@ -404,7 +413,7 @@ fn render_pane(
         });
 
     // Gutter on the left of this pane (line numbers).
-    paint_gutter(ui, pane_pos, g_w, pane_h, scroll_y_out, buf_line_count as u32);
+    paint_gutter(ui, pane_pos, g_w, pane_h, scroll_y_out, lh, buf_line_count as u32);
 
     (widget_rect, scroll_y_out, origin_out)
 }
@@ -415,10 +424,10 @@ fn paint_gutter(
     g_w: f32,
     pane_h: f32,
     scroll_y: f32,
+    lh: f32,
     line_count: u32,
 ) {
     let dl = ui.get_window_draw_list();
-    let lh = row_h();
     if lh <= 0.0 {
         return;
     }
@@ -448,11 +457,11 @@ fn paint_pane_text(
     buf: &str,
     layout: &PaneLayout,
     scroll_y: f32,
+    lh: f32,
     caret_byte: i32,
     widget_active: bool,
     hover_out: &Cell<Option<(u32, HunkKind, [f32; 2])>>,
 ) {
-    let lh = row_h();
     let widget_top = widget_rect[1];
     let widget_bottom = widget_rect[3];
     let widget_left = widget_rect[0];
@@ -583,6 +592,7 @@ fn draw_control_overlay(
     kind: HunkKind,
     status: &mut String,
     pos: [f32; 2],
+    lh: f32,
 ) {
     let _pad = ui.push_style_var(StyleVar::FramePadding([6.0, 2.0]));
     let _spacing = ui.push_style_var(StyleVar::ItemSpacing([4.0, 0.0]));
@@ -590,7 +600,7 @@ fn draw_control_overlay(
     let panel_x = pos[0] + 4.0;
     let panel_y = pos[1] + 2.0;
     let panel_w = 260.0;
-    let panel_h = row_h() - 4.0;
+    let panel_h = lh - 4.0;
 
     let dl = ui.get_window_draw_list();
     dl.add_rect(
@@ -809,6 +819,7 @@ fn draw_connector(
     right_line_ys: &HashMap<u32, f32>,
     anchor_lines: &[(u32, u32)],
     hunks: &[MergeHunk],
+    lh: f32,
 ) {
     let dl = ui.get_window_draw_list();
     dl.with_clip_rect_intersect(origin, [origin[0] + w, origin[1] + h], || {
@@ -842,8 +853,8 @@ fn draw_connector(
             let Some(ry_content) = right_line_ys.get(r_line) else {
                 continue;
             };
-            let ly = left_origin_y + ly_content + row_h() * 0.5;
-            let ry = right_origin_y + ry_content + row_h() * 0.5;
+            let ly = left_origin_y + ly_content + lh * 0.5;
+            let ry = right_origin_y + ry_content + lh * 0.5;
             if (ly < band_top && ry < band_top) || (ly > band_bot && ry > band_bot) {
                 continue;
             }
