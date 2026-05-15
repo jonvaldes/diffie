@@ -1,10 +1,11 @@
-//! Per-tab toolbar for choosing the diff engine and `DiffOptions`
-//! (whitespace handling, sub-line granularity, move detection).
+//! Per-tab toolbar for tweaking the live `DiffOptions` that affect what
+//! lines actually compare equal (whitespace handling, sub-line
+//! granularity). Engine selection and move-detection live in the
+//! Preferences modal as defaults for new tabs — they're tab-stable
+//! settings, not per-frame knobs.
 
-use crate::diff::{
-    available_engines, DiffOptions, EngineCapabilities, SubLineGranularity, Whitespace,
-};
-use crate::session::{engine_capabilities, SessionId, SessionStore};
+use crate::diff::{DiffOptions, SubLineGranularity, Whitespace};
+use crate::session::{SessionId, SessionStore};
 
 const WHITESPACE_OPTIONS: &[(&str, Whitespace)] = &[
     ("Significant", Whitespace::None),
@@ -24,32 +25,10 @@ pub fn render(
     ui: &imgui::Ui,
     store: &SessionStore,
     session_id: SessionId,
-    current_engine: &str,
+    _current_engine: &str,
     current_options: DiffOptions,
     status: &mut String,
 ) {
-    let engines: Vec<(String, EngineCapabilities)> = available_engines();
-    let engine_names: Vec<String> = engines.iter().map(|(n, _)| n.clone()).collect();
-    let mut engine_idx = engines
-        .iter()
-        .position(|(n, _)| n == current_engine)
-        .unwrap_or(0);
-
-    ui.text("Engine:");
-    ui.same_line();
-    ui.set_next_item_width(120.0);
-    if ui.combo_simple_string("##engine", &mut engine_idx, &engine_names) {
-        if let Some((new_name, _)) = engines.get(engine_idx) {
-            if new_name != current_engine {
-                match store.set_engine(session_id, new_name.clone()) {
-                    Ok(()) => *status = format!("engine: {new_name}"),
-                    Err(e) => *status = format!("engine error: {e}"),
-                }
-            }
-        }
-    }
-
-    ui.same_line();
     ui.text("Whitespace:");
     ui.same_line();
     ui.set_next_item_width(150.0);
@@ -82,29 +61,6 @@ pub fn render(
             let mut opts = current_options;
             opts.sub_line = new_g;
             apply_options(store, session_id, opts, status);
-        }
-    }
-
-    ui.same_line();
-    let caps = engine_capabilities(current_engine).unwrap_or_default();
-    let mut moves = current_options.detect_moves;
-    let _enabled = caps.supports_moves;
-    // imgui's checkbox doesn't have a disabled style in this binding; we
-    // gate the toggle by ignoring user clicks when the engine can't do
-    // moves, and grey the label.
-    if caps.supports_moves {
-        if ui.checkbox("Detect moves", &mut moves) {
-            let mut opts = current_options;
-            opts.detect_moves = moves;
-            apply_options(store, session_id, opts, status);
-        }
-    } else {
-        let mut dummy = false;
-        let token = ui.begin_disabled(true);
-        ui.checkbox("Detect moves", &mut dummy);
-        drop(token);
-        if ui.is_item_hovered() {
-            ui.tooltip_text("This engine does not support move detection.");
         }
     }
 }

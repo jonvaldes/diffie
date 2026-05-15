@@ -120,7 +120,7 @@ impl Default for DiffOptions {
         Self {
             whitespace: Whitespace::None,
             sub_line: SubLineGranularity::None,
-            detect_moves: false,
+            detect_moves: true,
             move_min_lines: 3,
         }
     }

@@ -16,11 +16,11 @@ pub struct AppPreferences {
 impl Default for AppPreferences {
     fn default() -> Self {
         Self {
-            default_engine: crate::diff::available_engines()
-                .into_iter()
-                .next()
-                .map(|(n, _)| n)
-                .unwrap_or_else(|| "myers".to_string()),
+            // Histogram is the only registered engine that supports move
+            // detection, and detect_moves is on by default. Pick it
+            // regardless of registry order so the default experience
+            // surfaces moves out of the box.
+            default_engine: "histogram".to_string(),
             default_options: DiffOptions::default(),
         }
     }
