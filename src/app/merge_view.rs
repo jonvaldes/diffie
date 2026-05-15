@@ -506,14 +506,14 @@ fn paint_pane_text(
         None
     };
 
-    let dl = ui.get_foreground_draw_list();
+    let dl = ui.get_window_draw_list();
     dl.with_clip_rect([widget_left, widget_top], [widget_right, widget_bottom], || {
         for (line_idx, line_text) in buf.lines().enumerate() {
             let ln = (line_idx as u32) + 1;
             if ln < first_line || ln > last_line {
                 continue;
             }
-            let y = widget_top + (ln as f32 - 1.0) * lh - scroll_y;
+            let y = widget_top + padding_y + (ln as f32 - 1.0) * lh - scroll_y;
             if y + lh < widget_top || y > widget_bottom {
                 continue;
             }
@@ -530,7 +530,7 @@ fn paint_pane_text(
 
             if !line_text.is_empty() {
                 dl.add_text(
-                    [widget_left + padding_x, y + padding_y],
+                    [widget_left + padding_x, y],
                     theme::TEXT,
                     line_text,
                 );
@@ -553,7 +553,7 @@ fn paint_pane_text(
                             snap -= 1;
                         }
                         let x = widget_left + padding_x + ui.calc_text_size(&line_text[..snap])[0];
-                        let y = widget_top + (line_idx as f32) * lh - scroll_y;
+                        let y = widget_top + padding_y + (line_idx as f32) * lh - scroll_y;
                         if y + lh >= widget_top && y <= widget_bottom {
                             dl.add_line([x, y + 1.0], [x, y + lh - 1.0], theme::TEXT)
                                 .thickness(1.0)
@@ -567,7 +567,7 @@ fn paint_pane_text(
                 if !painted && target >= byte_acc {
                     let line_idx = buf.lines().count();
                     let x = widget_left + padding_x;
-                    let y = widget_top + (line_idx as f32) * lh - scroll_y;
+                    let y = widget_top + padding_y + (line_idx as f32) * lh - scroll_y;
                     if y + lh >= widget_top && y <= widget_bottom {
                         dl.add_line([x, y + 1.0], [x, y + lh - 1.0], theme::TEXT)
                             .thickness(1.0)

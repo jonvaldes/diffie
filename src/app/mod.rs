@@ -257,8 +257,15 @@ impl ApplicationHandler for App {
             return;
         }
 
+        let icon = winit::window::Icon::from_rgba(
+            include_bytes!("../../assets/diffie_icon_64.rgba").to_vec(),
+            64,
+            64,
+        )
+        .ok();
         let attrs = Window::default_attributes()
             .with_title("Diffie")
+            .with_window_icon(icon)
             .with_inner_size(winit::dpi::LogicalSize::new(
                 INITIAL_WIDTH as f64,
                 INITIAL_HEIGHT as f64,
@@ -796,10 +803,11 @@ fn load_fonts(imgui: &mut Context, ui_font_size: f32) -> FontId {
 /// as missing-glyph boxes. Each pair is an inclusive [start, end]; the slice
 /// is zero-terminated as imgui requires.
 ///
-/// Note: Roboto Regular does not cover every codepoint in these ranges (e.g.
-/// U+2715 ✕ is missing even though Dingbats is requested). Imgui shows `?`
-/// for unmapped codepoints, so prefer characters Roboto actually ships
-/// (e.g. × U+00D7) for UI labels.
+/// Note: Roboto Regular does not cover every codepoint in these ranges
+/// (e.g. U+2192 →, U+2194 ↔, U+2715 ✕ are all missing even though their
+/// blocks are requested). Imgui shows `?` for unmapped codepoints, so
+/// prefer characters Roboto actually ships (e.g. × U+00D7, — U+2014, …
+/// U+2026) for UI labels — or fall back to ASCII like `->`.
 #[rustfmt::skip]
 static EXTRA_GLYPH_RANGES: &[u32] = &[
     0x0020, 0x00FF, // Basic Latin + Latin-1 Supplement
@@ -1406,7 +1414,7 @@ fn open_two_way_paths(state: &mut AppState, a: PathBuf, b: PathBuf) {
         opts,
     ) {
         Ok(id) => {
-            let label = format!("{} → {}", basename(&a), basename(&b));
+            let label = format!("{} -> {}", basename(&a), basename(&b));
             let recent = recents::RecentEntry::TwoWay {
                 a: a.clone(),
                 b: b.clone(),

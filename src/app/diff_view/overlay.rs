@@ -150,7 +150,7 @@ pub(super) fn paint_pane_text(
         None
     };
 
-    let dl = ui.get_foreground_draw_list();
+    let dl = ui.get_window_draw_list();
     dl.with_clip_rect(
         [widget_left, widget_top],
         [widget_right, widget_bottom],
@@ -161,7 +161,7 @@ pub(super) fn paint_pane_text(
                 if ln < first_line || ln > last_line {
                     continue;
                 }
-                let y = line_screen_y(widget_top, ln, scroll_y, lh);
+                let y = line_screen_y(widget_top, ln, scroll_y, lh) + padding_y;
                 if y + lh < widget_top || y > widget_bottom {
                     continue;
                 }
@@ -223,7 +223,7 @@ pub(super) fn paint_pane_text(
                 // walk the line and emit a chunk per span boundary in default
                 // color + each span in its color. Otherwise emit the whole
                 // line in default color.
-                let text_y = y + padding_y;
+                let text_y = y;
                 let line_spans_opt = highlights.get(line_idx);
                 if let Some(line_spans) = line_spans_opt.filter(|v| !v.is_empty()) {
                     // Walk char-indexed positions.
@@ -306,7 +306,7 @@ pub(super) fn paint_pane_text(
                             let local = target - byte_acc;
                             let x = widget_left
                                 + text_x_at_byte(ui, line_text, local, padding_x);
-                            let y = widget_top + (line_idx as f32) * lh - scroll_y;
+                            let y = widget_top + padding_y + (line_idx as f32) * lh - scroll_y;
                             if y + lh >= widget_top && y <= widget_bottom {
                                 dl.add_line(
                                     [x, y + 1.0],
@@ -325,7 +325,7 @@ pub(super) fn paint_pane_text(
                     if !painted && target >= byte_acc {
                         let line_idx = buf.lines().count();
                         let x = widget_left + padding_x;
-                        let y = widget_top + (line_idx as f32) * lh - scroll_y;
+                        let y = widget_top + padding_y + (line_idx as f32) * lh - scroll_y;
                         if y + lh >= widget_top && y <= widget_bottom {
                             dl.add_line([x, y + 1.0], [x, y + lh - 1.0], theme::TEXT)
                                 .thickness(1.0)
