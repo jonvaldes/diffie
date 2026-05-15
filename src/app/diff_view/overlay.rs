@@ -3,7 +3,7 @@
 
 use std::cell::Cell;
 
-use imgui::{StyleVar, Ui};
+use imgui::{Condition, StyleVar, Ui, WindowFlags};
 
 use crate::app::theme;
 use crate::app::undo_stack::DiffEdit;
@@ -597,74 +597,92 @@ pub(super) fn draw_control_overlay(
     side: Side,
     pending_jump_out: &Cell<Option<PendingJump>>,
 ) {
-    let _pad = ui.push_style_var(StyleVar::FramePadding([6.0, 2.0]));
-    let _spacing = ui.push_style_var(StyleVar::ItemSpacing([4.0, 0.0]));
-
     let hunk = hunks.iter().find(|h| h.id == hunk_id);
     let move_id = hunk.and_then(hunk_move_id);
     let paired = move_id.and_then(|id| find_paired_hunk(hunks, id, side));
     let is_moved_with_pair = paired.is_some();
 
+    // Render the panel as its own top-level imgui window so its buttons
+    // sit above the input_text_multiline panes in the window stack and
+    // actually receive clicks. (Widgets in the parent window can't win
+    // hover/click against the multiline's child window via
+    // SetItemAllowOverlap — cross-window overlap needs its own window.)
     let panel_x = pos[0] + 4.0;
     let panel_y = pos[1] + 2.0;
-    let panel_w: f32 = if is_moved_with_pair { 240.0 } else { 200.0 };
-    let panel_h = lh - 4.0;
 
-    let dl = ui.get_window_draw_list();
-    dl.add_rect(
-        [panel_x, panel_y],
-        [panel_x + panel_w, panel_y + panel_h],
-        theme::with_alpha(theme::MANTLE, 0.95),
-    )
-    .filled(true)
-    .rounding(4.0)
-    .build();
-    dl.add_rect(
-        [panel_x, panel_y],
-        [panel_x + panel_w, panel_y + panel_h],
-        theme::BLUE,
-    )
-    .rounding(4.0)
-    .thickness(1.0)
-    .build();
+    let _pad = ui.push_style_var(StyleVar::FramePadding([6.0, 2.0]));
+    let _spacing = ui.push_style_var(StyleVar::ItemSpacing([4.0, 0.0]));
+    let _win_pad = ui.push_style_var(StyleVar::WindowPadding([4.0, 3.0]));
+    let _win_round = ui.push_style_var(StyleVar::WindowRounding(4.0));
+    let _win_border = ui.push_style_var(StyleVar::WindowBorderSize(1.0));
+    let _border_col = ui.push_style_color(imgui::StyleColor::Border, theme::BLUE);
+    let _bg_col =
+        ui.push_style_color(imgui::StyleColor::WindowBg, theme::with_alpha(theme::MANTLE, 0.95));
 
-    ui.set_cursor_screen_pos([panel_x + 6.0, panel_y + 3.0]);
-    if ui.small_button(format!("Apply A -> B##ov{hunk_id}_atob")) {
-        pending_edits.push(DiffEdit::ReplaceHunkSide {
-            session_id,
-            hunk_id,
-            target: TwoWaySide::B,
-            old_target_text: None,
-        });
-    }
-    ui.same_line();
-    if ui.small_button(format!("B -> A##ov{hunk_id}_btoa")) {
-        pending_edits.push(DiffEdit::ReplaceHunkSide {
-            session_id,
-            hunk_id,
-            target: TwoWaySide::A,
-            old_target_text: None,
-        });
-    }
-    if is_moved_with_pair {
-        ui.same_line();
-        if ui.small_button(format!("v^##ov{hunk_id}_jump")) {
-            if let Some(p) = paired {
-                let target_line = match side {
-                    Side::Left => p.b_range.0,
-                    Side::Right => p.a_range.0,
-                };
-                let target_pane = match side {
-                    Side::Left => Side::Right,
-                    Side::Right => Side::Left,
-                };
-                pending_jump_out.set(Some(PendingJump {
+    let _ = lh;
+    let win_name = format!("##diff_overlay_{}_{}_{}", session_id, hunk_id, side_tag(side));
+    let flags = WindowFlags::NO_TITLE_BAR
+        | WindowFlags::NO_RESIZE
+        | WindowFlags::NO_MOVE
+        | WindowFlags::NO_SCROLLBAR
+        | WindowFlags::NO_COLLAPSE
+        | WindowFlags::ALWAYS_AUTO_RESIZE
+        | WindowFlags::NO_SAVED_SETTINGS
+        | WindowFlags::NO_FOCUS_ON_APPEARING
+        | WindowFlags::NO_NAV;
+    ui.window(&win_name)
+        .position([panel_x, panel_y], Condition::Always)
+        .flags(flags)
+        .build(|| {
+            // Icon-only button: an arrow pointing in the direction the
+            // hunk will travel (left pane → right pane, or right → left).
+            // nf-fa-long-arrow-right / -left read more clearly at small
+            // button sizes than the basic arrows.
+            let (label, target) = match side {
+                Side::Left => (
+                    format!("\u{f178}##ov{hunk_id}_atob"),
+                    TwoWaySide::B,
+                ),
+                Side::Right => (
+                    format!("\u{f177}##ov{hunk_id}_btoa"),
+                    TwoWaySide::A,
+                ),
+            };
+            if ui.small_button(label) {
+                pending_edits.push(DiffEdit::ReplaceHunkSide {
                     session_id,
-                    pane: target_pane,
-                    target_line,
-                }));
+                    hunk_id,
+                    target,
+                    old_target_text: None,
+                });
             }
-        }
+            if is_moved_with_pair {
+                ui.same_line();
+                if ui.small_button(format!("v^##ov{hunk_id}_jump")) {
+                    if let Some(p) = paired {
+                        let target_line = match side {
+                            Side::Left => p.b_range.0,
+                            Side::Right => p.a_range.0,
+                        };
+                        let target_pane = match side {
+                            Side::Left => Side::Right,
+                            Side::Right => Side::Left,
+                        };
+                        pending_jump_out.set(Some(PendingJump {
+                            session_id,
+                            pane: target_pane,
+                            target_line,
+                        }));
+                    }
+                }
+            }
+        });
+}
+
+fn side_tag(side: Side) -> &'static str {
+    match side {
+        Side::Left => "L",
+        Side::Right => "R",
     }
 }
 

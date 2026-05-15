@@ -140,6 +140,10 @@ struct Tab {
     /// user picks a path via "Save Result As…" or supplies one via the CLI.
     /// When `Some`, plain Save (Ctrl+S) writes here without prompting.
     result_path: Option<PathBuf>,
+    /// Live string buffers backing the per-pane filename input boxes in
+    /// the header strip. Parallel to `paths`; rewritten whenever `paths`
+    /// changes (browse dialog, CLI open).
+    path_inputs: Vec<String>,
 }
 
 struct AppState {
@@ -1354,6 +1358,331 @@ fn write_result_to(state: &mut AppState, id: SessionId, path: &std::path::Path) 
     }
 }
 
+/// One pending action emitted by `pane_header_bar`, deferred so it can run
+/// after the active snapshot/borrow falls out of scope and free state can
+/// be mutated.
+#[derive(Clone)]
+enum HeaderAction {
+    /// Open a file picker for pane `usize`.
+    Browse(usize),
+    /// Save pane `usize` to its bound path.
+    Save(usize),
+    /// Load the file at the typed path into pane `usize` (Enter pressed
+    /// in the filename input).
+    LoadTyped(usize, String),
+}
+
+/// Header strip above the diff/merge view: per-pane filename input with
+/// an inline browse button, plus a save button. Returns the user's last
+/// action this frame, if any, for deferred handling.
+fn pane_header_bar(ui: &imgui::Ui, state: &mut AppState, id: SessionId) -> Option<HeaderAction> {
+    let tab_idx = state.tabs.iter().position(|t| t.session_id == id)?;
+    let mode = state.tabs[tab_idx].mode;
+    let (segments, role_labels): (usize, &[&str]) = match mode {
+        TabMode::TwoWay => (2, &["A", "B"]),
+        TabMode::ThreeWay => (3, &["BASE", "LOCAL", "REMOTE"]),
+    };
+    if state.tabs[tab_idx].path_inputs.len() < segments {
+        state.tabs[tab_idx]
+            .path_inputs
+            .resize(segments, String::new());
+    }
+
+    // nf-fa-ellipsis-h (\u{f141}) = browse "…", nf-fa-floppy_o (\u{f0c7}) = save.
+    let browse_glyph = "\u{f141}";
+    let save_glyph = "\u{f0c7}";
+
+    let avail_w = ui.content_region_avail()[0];
+    let seg_gap = 8.0;
+    let seg_w = ((avail_w - seg_gap * (segments as f32 - 1.0)) / segments as f32).max(160.0);
+    let role_w = role_labels
+        .iter()
+        .map(|r| ui.calc_text_size(&format!("[{r}]"))[0])
+        .fold(0.0_f32, f32::max);
+    let save_btn_w = ui.calc_text_size(save_glyph)[0] + 14.0;
+    let browse_btn_w = ui.calc_text_size(browse_glyph)[0] + 12.0;
+    let inline_gap = 4.0;
+
+    let start = ui.cursor_screen_pos();
+    let mut action: Option<HeaderAction> = None;
+
+    for i in 0..segments {
+        let seg_left = start[0] + i as f32 * (seg_w + seg_gap);
+        ui.set_cursor_screen_pos([seg_left, start[1]]);
+
+        ui.align_text_to_frame_padding();
+        ui.text_disabled(format!("[{}]", role_labels[i]));
+        ui.same_line();
+        ui.set_cursor_screen_pos([seg_left + role_w + 8.0, start[1]]);
+
+        // The visual field stretches across `field_w`; the input widget
+        // itself only owns the left portion. The browse button gets its
+        // own hit area on the right. To make the two read as a single
+        // field, we paint a frame-bg rectangle behind the button (same
+        // color as the input's bg) before drawing the button, and we
+        // null the button's own bg so only its glyph + hover/active
+        // highlight show.
+        let field_w = seg_w - role_w - 8.0 - save_btn_w - inline_gap;
+        let input_w = (field_w - browse_btn_w - 2.0).max(40.0);
+        let input_origin_x = ui.cursor_screen_pos()[0];
+        let input_origin_y = ui.cursor_screen_pos()[1];
+
+        let _w = ui.push_item_width(input_w);
+        let buf = &mut state.tabs[tab_idx].path_inputs[i];
+        let input_id = format!("##path_{i}_{}", id);
+        let activated = ui
+            .input_text(&input_id, buf)
+            .enter_returns_true(true)
+            .build();
+        if activated {
+            action = Some(HeaderAction::LoadTyped(i, buf.clone()));
+        }
+        drop(_w);
+        let input_rect_min = ui.item_rect_min();
+        let input_rect_max = ui.item_rect_max();
+        let field_rect_max_x = input_origin_x + field_w;
+
+        // Visually extend the input's background to cover the button
+        // strip. Drawn on the *window* draw list (above the input's bg
+        // but below the button) so the field reads as one continuous
+        // rounded frame.
+        let style = ui.clone_style();
+        let frame_bg = style.colors[imgui::StyleColor::FrameBg as usize];
+        let frame_bg_active = style.colors[imgui::StyleColor::FrameBgHovered as usize];
+        let dl = ui.get_window_draw_list();
+        let frame_rounding = style.frame_rounding;
+        let extension_color: imgui::ImColor32 =
+            if ui.is_item_active() || ui.is_item_focused() {
+                frame_bg_active
+            } else {
+                frame_bg
+            }
+            .into();
+        dl.add_rect(
+            [input_rect_max[0], input_rect_min[1]],
+            [field_rect_max_x, input_rect_max[1]],
+            extension_color,
+        )
+        .filled(true)
+        .rounding(frame_rounding)
+        .round_top_left(false)
+        .round_bot_left(false)
+        .build();
+
+        // Browse button placed in the extension strip with transparent
+        // bg so it visually fuses with the field.
+        let btn_h = input_rect_max[1] - input_rect_min[1];
+        let btn_x = field_rect_max_x - browse_btn_w;
+        ui.set_cursor_screen_pos([btn_x, input_origin_y]);
+        let _button_bg = ui.push_style_color(imgui::StyleColor::Button, [0.0, 0.0, 0.0, 0.0]);
+        if ui.button_with_size(
+            format!("{browse_glyph}##browse_{i}_{}", id),
+            [browse_btn_w, btn_h],
+        ) {
+            action = Some(HeaderAction::Browse(i));
+        }
+        drop(_button_bg);
+
+        // Save button to the right of the field.
+        ui.set_cursor_screen_pos([field_rect_max_x + inline_gap, input_origin_y]);
+        if ui.button_with_size(
+            format!("{save_glyph}##save_{i}_{}", id),
+            [save_btn_w, btn_h],
+        ) {
+            action = Some(HeaderAction::Save(i));
+        }
+    }
+    // Push cursor down past the row.
+    ui.set_cursor_screen_pos([start[0], start[1] + ui.frame_height() + 2.0]);
+    action
+}
+
+/// Map a 0-based pane index to the per-mode SideRef, then read the file
+/// and rewrite the session's side text.
+fn browse_replace_side_at(state: &mut AppState, id: SessionId, idx: usize) {
+    let Some(tab_idx) = state.tabs.iter().position(|t| t.session_id == id) else {
+        return;
+    };
+    let mode = state.tabs[tab_idx].mode;
+    let side = match (mode, idx) {
+        (TabMode::TwoWay, 0) => crate::session::SideRef::TwoWay(crate::session::TwoWaySide::A),
+        (TabMode::TwoWay, 1) => crate::session::SideRef::TwoWay(crate::session::TwoWaySide::B),
+        (TabMode::ThreeWay, 0) => crate::session::SideRef::ThreeWay(crate::session::ThreeWaySide::Base),
+        (TabMode::ThreeWay, 1) => crate::session::SideRef::ThreeWay(crate::session::ThreeWaySide::Local),
+        (TabMode::ThreeWay, 2) => crate::session::SideRef::ThreeWay(crate::session::ThreeWaySide::Remote),
+        _ => return,
+    };
+    let Some(path) = pick_file("Open file") else {
+        return;
+    };
+    let read = match fileio::read_text(&path) {
+        Ok(r) => r,
+        Err(e) => {
+            state.status = format!("Read error: {e}");
+            return;
+        }
+    };
+    if let Err(e) = state.sessions.set_side_text(id, side, read.text) {
+        state.status = format!("Set side error: {e}");
+        return;
+    }
+    // Update the tab's stored path, mirror it into the header input
+    // buffer, and refresh the tab label.
+    if let Some(t) = state.tabs.get_mut(tab_idx) {
+        if let Some(slot) = t.paths.get_mut(idx) {
+            *slot = path.clone();
+        }
+        if t.path_inputs.len() < t.paths.len() {
+            t.path_inputs.resize(t.paths.len(), String::new());
+        }
+        if let Some(buf) = t.path_inputs.get_mut(idx) {
+            *buf = path.display().to_string();
+        }
+        t.label = match t.mode {
+            TabMode::TwoWay => format!(
+                "{} \u{f0ec} {}",
+                t.paths.first().map(basename).unwrap_or_default(),
+                t.paths.get(1).map(basename).unwrap_or_default()
+            ),
+            TabMode::ThreeWay => t.paths.first().map(basename).unwrap_or_default(),
+        };
+    }
+    // Bump the input epoch so imgui re-initialises the multiline text edit
+    // state from the new buffer (mirrors what undo/redo does).
+    match mode {
+        TabMode::TwoWay => {
+            if let Some(v) = state.diff_views.get_mut(&id) {
+                v.input_epoch = v.input_epoch.wrapping_add(1);
+            }
+        }
+        TabMode::ThreeWay => {
+            if let Some(v) = state.merge_views.get_mut(&id) {
+                v.input_epoch = v.input_epoch.wrapping_add(1);
+            }
+        }
+    }
+    state.status = format!("loaded: {}", path.display());
+}
+
+/// Save the side at pane index `idx` for the active tab to its stored path.
+fn save_side_at_idx(state: &mut AppState, id: SessionId, idx: usize) {
+    let Some(tab) = state.tabs.iter().find(|t| t.session_id == id) else {
+        return;
+    };
+    match (tab.mode, idx) {
+        (TabMode::TwoWay, 0) => save_two_way_side(state, crate::session::TwoWaySide::A),
+        (TabMode::TwoWay, 1) => save_two_way_side(state, crate::session::TwoWaySide::B),
+        (TabMode::ThreeWay, i) => save_three_way_side(state, id, i),
+        _ => {}
+    }
+}
+
+/// Load whatever path the user typed into pane `idx`'s filename input
+/// (triggered by Enter). Mirrors `browse_replace_side_at` but starts from
+/// a typed string rather than a file dialog.
+fn load_typed_path_into_side(state: &mut AppState, id: SessionId, idx: usize, path: String) {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        state.status = "empty path".into();
+        return;
+    }
+    let path = PathBuf::from(trimmed);
+    let Some(tab_idx) = state.tabs.iter().position(|t| t.session_id == id) else {
+        return;
+    };
+    let mode = state.tabs[tab_idx].mode;
+    let side = match (mode, idx) {
+        (TabMode::TwoWay, 0) => crate::session::SideRef::TwoWay(crate::session::TwoWaySide::A),
+        (TabMode::TwoWay, 1) => crate::session::SideRef::TwoWay(crate::session::TwoWaySide::B),
+        (TabMode::ThreeWay, 0) => crate::session::SideRef::ThreeWay(crate::session::ThreeWaySide::Base),
+        (TabMode::ThreeWay, 1) => crate::session::SideRef::ThreeWay(crate::session::ThreeWaySide::Local),
+        (TabMode::ThreeWay, 2) => crate::session::SideRef::ThreeWay(crate::session::ThreeWaySide::Remote),
+        _ => return,
+    };
+    let read = match fileio::read_text(&path) {
+        Ok(r) => r,
+        Err(e) => {
+            state.status = format!("Read error: {e}");
+            return;
+        }
+    };
+    if let Err(e) = state.sessions.set_side_text(id, side, read.text) {
+        state.status = format!("Set side error: {e}");
+        return;
+    }
+    if let Some(t) = state.tabs.get_mut(tab_idx) {
+        if let Some(slot) = t.paths.get_mut(idx) {
+            *slot = path.clone();
+        }
+        if let Some(buf) = t.path_inputs.get_mut(idx) {
+            *buf = path.display().to_string();
+        }
+        t.label = match t.mode {
+            TabMode::TwoWay => format!(
+                "{} \u{f0ec} {}",
+                t.paths.first().map(basename).unwrap_or_default(),
+                t.paths.get(1).map(basename).unwrap_or_default()
+            ),
+            TabMode::ThreeWay => t.paths.first().map(basename).unwrap_or_default(),
+        };
+    }
+    match mode {
+        TabMode::TwoWay => {
+            if let Some(v) = state.diff_views.get_mut(&id) {
+                v.input_epoch = v.input_epoch.wrapping_add(1);
+            }
+        }
+        TabMode::ThreeWay => {
+            if let Some(v) = state.merge_views.get_mut(&id) {
+                v.input_epoch = v.input_epoch.wrapping_add(1);
+            }
+        }
+    }
+    state.status = format!("loaded: {}", path.display());
+}
+
+fn save_three_way_side(state: &mut AppState, id: SessionId, idx: usize) {
+    let Some(tab) = state.tabs.iter().find(|t| t.session_id == id) else {
+        return;
+    };
+    let Some(path) = tab.paths.get(idx).cloned() else {
+        state.status = "no file path stored for this side".into();
+        return;
+    };
+    let snap = match state.sessions.snapshot(id) {
+        Ok(s) => s,
+        Err(e) => {
+            state.status = format!("snapshot error: {e}");
+            return;
+        }
+    };
+    let crate::session::SessionMode::ThreeWay {
+        base_text,
+        local_text,
+        remote_text,
+        base_trailing_newline,
+        local_trailing_newline,
+        remote_trailing_newline,
+        ..
+    } = &snap.mode
+    else {
+        state.status = "active session is not 3-way".into();
+        return;
+    };
+    let (text, trailing, role) = match idx {
+        0 => (base_text, *base_trailing_newline, "BASE"),
+        1 => (local_text, *local_trailing_newline, "LOCAL"),
+        2 => (remote_text, *remote_trailing_newline, "REMOTE"),
+        _ => return,
+    };
+    match fileio::write_text(&path, text, trailing) {
+        Ok(()) => {
+            state.status = format!("saved {role}: {}", path.display());
+        }
+        Err(e) => state.status = format!("save error: {e}"),
+    }
+}
+
 fn current_session_summary(ui: &imgui::Ui, state: &mut AppState) {
     let Some(id) = state.active else {
         ui.text_disabled("No session open. Open two files (2-way) or three files (3-way) to begin.");
@@ -1366,9 +1695,18 @@ fn current_session_summary(ui: &imgui::Ui, state: &mut AppState) {
             return;
         }
     };
-    let tab = state.tabs.iter().find(|t| t.session_id == id);
-    if let Some(t) = tab {
-        ui.text(format!("Tab: {} (id={})", t.label, t.session_id));
+    // Snapshot the bits of the tab we need later as owned values, since
+    // pane_header_bar borrows `state` mutably for the input buffers.
+    let (tab_label_line, tab_paths_snap): (Option<String>, Option<Vec<PathBuf>>) =
+        match state.tabs.iter().find(|t| t.session_id == id) {
+            Some(t) => (
+                Some(format!("Tab: {} (id={})", t.label, t.session_id)),
+                Some(t.paths.clone()),
+            ),
+            None => (None, None),
+        };
+    if let Some(line) = &tab_label_line {
+        ui.text(line);
     }
     engine_bar::render(
         ui,
@@ -1378,6 +1716,11 @@ fn current_session_summary(ui: &imgui::Ui, state: &mut AppState) {
         snap.options,
         &mut state.status,
     );
+    ui.separator();
+    // Per-pane header strip: filename + browse + save, one segment per pane.
+    // Actions are deferred (the dialog/save happens after the snapshot
+    // borrow ends) so we can mutate state freely.
+    let header_action = pane_header_bar(ui, state, id);
     ui.separator();
     match &snap.mode {
         SessionMode::TwoWay { hunks, anchors, a_text, b_text, .. } => {
@@ -1391,10 +1734,10 @@ fn current_session_summary(ui: &imgui::Ui, state: &mut AppState) {
             // Resolve per-side language from the tab's stored file paths,
             // then compute (or reuse) per-line highlight spans via the
             // tree-sitter cache.
-            let (a_lang, b_lang) = match tab {
-                Some(t) => (
-                    t.paths.first().and_then(|p| syntax::lang_for_path(p)),
-                    t.paths.get(1).and_then(|p| syntax::lang_for_path(p)),
+            let (a_lang, b_lang) = match &tab_paths_snap {
+                Some(paths) => (
+                    paths.first().and_then(|p| syntax::lang_for_path(p)),
+                    paths.get(1).and_then(|p| syntax::lang_for_path(p)),
                 ),
                 None => (None, None),
             };
@@ -1517,6 +1860,16 @@ fn current_session_summary(ui: &imgui::Ui, state: &mut AppState) {
             }
         }
     }
+
+    // Snapshot/borrow is out of scope here — safe to mutate state via the
+    // dialog/save helpers based on the header action gathered earlier.
+    drop(snap);
+    match header_action {
+        Some(HeaderAction::Browse(idx)) => browse_replace_side_at(state, id, idx),
+        Some(HeaderAction::Save(idx)) => save_side_at_idx(state, id, idx),
+        Some(HeaderAction::LoadTyped(idx, path)) => load_typed_path_into_side(state, id, idx, path),
+        None => {}
+    }
 }
 
 fn anchor_bar_three_way(
@@ -1600,12 +1953,15 @@ fn open_two_way_paths(state: &mut AppState, a: PathBuf, b: PathBuf) {
                 a: a.clone(),
                 b: b.clone(),
             };
+            let paths = vec![a, b];
+            let path_inputs = paths.iter().map(|p| p.display().to_string()).collect();
             state.tabs.push(Tab {
                 session_id: id,
                 label: label.clone(),
                 mode: TabMode::TwoWay,
-                paths: vec![a, b],
+                paths,
                 result_path: None,
+                path_inputs,
             });
             state.active = Some(id);
             state.status = format!("Opened 2-way: {label}");
@@ -1704,12 +2060,15 @@ fn open_three_way_paths_with_result(
                     }
                 }
             }
+            let paths = vec![base, local, remote];
+            let path_inputs = paths.iter().map(|p| p.display().to_string()).collect();
             state.tabs.push(Tab {
                 session_id: id,
                 label: label.clone(),
                 mode: TabMode::ThreeWay,
-                paths: vec![base, local, remote],
+                paths,
                 result_path: result,
+                path_inputs,
             });
             state.active = Some(id);
             state.status = format!("Opened 3-way: {label}");

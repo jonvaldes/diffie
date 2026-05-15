@@ -208,21 +208,35 @@ fn recompute_two_way(
     Ok(group_into_hunks(&ops))
 }
 
-/// Reject Myers matches on whitespace-only lines. Such "matches" between
-/// distant blanks (or coincidental `}` / `{` sections) produce tiny equal
-/// hunks that drag the connector ribbons across huge vertical distances and
-/// leave blank rows on each side that look out of place. Treating them as
-/// independent delete+insert keeps the diff visually local and gives each
-/// blank its own insert/delete background.
+/// Reject Myers matches on whitespace-only lines *only* when they sit at
+/// a change boundary. Distant blank matches dragging ribbons across the
+/// whole pane are the failure mode the original split was guarding
+/// against; those matches always show up sandwiched between Delete /
+/// Insert ops. A blank with Equal neighbors on both sides is a genuine
+/// local match (e.g. when the two buffers really are identical) and
+/// must stay Equal — otherwise pasting one pane into the other still
+/// reports every blank line as changed.
 fn split_trivial_equals(ops: Vec<DiffOp>) -> Vec<DiffOp> {
+    let is_equal = |o: &DiffOp| matches!(o, DiffOp::Equal { .. });
     let mut out: Vec<DiffOp> = Vec::with_capacity(ops.len());
-    for op in ops {
-        match op {
-            DiffOp::Equal { a, b, text } if text.trim().is_empty() => {
-                out.push(DiffOp::delete(a, text.clone()));
-                out.push(DiffOp::insert(b, text));
-            }
-            other => out.push(other),
+    for i in 0..ops.len() {
+        let op = ops[i].clone();
+        let DiffOp::Equal { a, b, ref text } = op else {
+            out.push(op);
+            continue;
+        };
+        if !text.trim().is_empty() {
+            out.push(op);
+            continue;
+        }
+        let prev_anchored = i == 0 || is_equal(&ops[i - 1]);
+        let next_anchored = i + 1 >= ops.len() || is_equal(&ops[i + 1]);
+        if prev_anchored && next_anchored {
+            out.push(op);
+        } else {
+            let text = text.clone();
+            out.push(DiffOp::delete(a, text.clone()));
+            out.push(DiffOp::insert(b, text));
         }
     }
     out

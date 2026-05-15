@@ -391,6 +391,10 @@ fn render_pane(
                 CaretCapture { cursor: &caret_byte },
             )
             .build();
+        // Allow widgets submitted later this frame (the hover-control
+        // overlay panel) to win hover/click over this input_text_multiline
+        // even though they're drawn on top of it.
+        ui.set_item_allow_overlap();
         let widget_active = ui.is_item_active();
         let clone = if changed { Some(buf.clone()) } else { None };
         (changed, (clone, widget_active))

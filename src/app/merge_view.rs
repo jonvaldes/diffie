@@ -415,6 +415,9 @@ fn render_pane(
                 CaretCapture { cursor: &caret_byte },
             )
             .build();
+        // Let overlay widgets (resolution control panel) submitted later
+        // this frame claim hover/click over this input_text_multiline.
+        ui.set_item_allow_overlap();
         let active = ui.is_item_active();
         let new_text = if changed { Some(buf.clone()) } else { None };
         (changed, new_text, active)
@@ -638,71 +641,80 @@ fn draw_control_overlay(
     pos: [f32; 2],
     lh: f32,
 ) {
-    let _pad = ui.push_style_var(StyleVar::FramePadding([6.0, 2.0]));
-    let _spacing = ui.push_style_var(StyleVar::ItemSpacing([4.0, 0.0]));
-
+    let _ = lh;
     let panel_x = pos[0] + 4.0;
     let panel_y = pos[1] + 2.0;
-    let panel_w = 260.0;
-    let panel_h = lh - 4.0;
-
-    let dl = ui.get_window_draw_list();
-    dl.add_rect(
-        [panel_x, panel_y],
-        [panel_x + panel_w, panel_y + panel_h],
-        theme::with_alpha(theme::MANTLE, 0.95),
-    )
-    .filled(true)
-    .rounding(4.0)
-    .build();
     let border_color = match kind {
         HunkKind::LocalOnly => theme::BLUE,
         HunkKind::RemoteOnly => theme::MAUVE,
         HunkKind::Conflict => theme::PEACH,
     };
-    dl.add_rect(
-        [panel_x, panel_y],
-        [panel_x + panel_w, panel_y + panel_h],
-        border_color,
-    )
-    .rounding(4.0)
-    .thickness(1.0)
-    .build();
 
-    ui.set_cursor_screen_pos([panel_x + 6.0, panel_y + 3.0]);
-    match kind {
-        HunkKind::LocalOnly => {
-            if ui.small_button(format!("Use Local##ovL{hunk_id}")) {
-                apply_res(store, session_id, hunk_id, Resolution::Local, status);
+    // See diff_view::overlay::draw_control_overlay: the panel needs to be
+    // its own top-level imgui window so its buttons can receive clicks
+    // over the input_text_multiline pane's child window.
+    let _pad = ui.push_style_var(StyleVar::FramePadding([6.0, 2.0]));
+    let _spacing = ui.push_style_var(StyleVar::ItemSpacing([4.0, 0.0]));
+    let _win_pad = ui.push_style_var(StyleVar::WindowPadding([4.0, 3.0]));
+    let _win_round = ui.push_style_var(StyleVar::WindowRounding(4.0));
+    let _win_border = ui.push_style_var(StyleVar::WindowBorderSize(1.0));
+    let _border_col = ui.push_style_color(imgui::StyleColor::Border, border_color);
+    let _bg_col = ui.push_style_color(
+        imgui::StyleColor::WindowBg,
+        theme::with_alpha(theme::MANTLE, 0.95),
+    );
+
+    let kind_tag = match kind {
+        HunkKind::LocalOnly => "L",
+        HunkKind::RemoteOnly => "R",
+        HunkKind::Conflict => "C",
+    };
+    let win_name = format!("##merge_overlay_{}_{}_{}", session_id, hunk_id, kind_tag);
+    let flags = imgui::WindowFlags::NO_TITLE_BAR
+        | imgui::WindowFlags::NO_RESIZE
+        | imgui::WindowFlags::NO_MOVE
+        | imgui::WindowFlags::NO_SCROLLBAR
+        | imgui::WindowFlags::NO_COLLAPSE
+        | imgui::WindowFlags::ALWAYS_AUTO_RESIZE
+        | imgui::WindowFlags::NO_SAVED_SETTINGS
+        | imgui::WindowFlags::NO_FOCUS_ON_APPEARING
+        | imgui::WindowFlags::NO_NAV;
+    ui.window(&win_name)
+        .position([panel_x, panel_y], imgui::Condition::Always)
+        .flags(flags)
+        .build(|| match kind {
+            HunkKind::LocalOnly => {
+                if ui.small_button(format!("Use Local##ovL{hunk_id}")) {
+                    apply_res(store, session_id, hunk_id, Resolution::Local, status);
+                }
+                ui.same_line();
+                if ui.small_button(format!("Use Base##ovB{hunk_id}")) {
+                    apply_res(store, session_id, hunk_id, Resolution::Base, status);
+                }
             }
-            ui.same_line();
-            if ui.small_button(format!("Use Base##ovB{hunk_id}")) {
-                apply_res(store, session_id, hunk_id, Resolution::Base, status);
+            HunkKind::RemoteOnly => {
+                if ui.small_button(format!("Use Remote##ovR{hunk_id}")) {
+                    apply_res(store, session_id, hunk_id, Resolution::Remote, status);
+                }
+                ui.same_line();
+                if ui.small_button(format!("Use Base##ovB{hunk_id}")) {
+                    apply_res(store, session_id, hunk_id, Resolution::Base, status);
+                }
             }
-        }
-        HunkKind::RemoteOnly => {
-            if ui.small_button(format!("Use Remote##ovR{hunk_id}")) {
-                apply_res(store, session_id, hunk_id, Resolution::Remote, status);
+            HunkKind::Conflict => {
+                if ui.small_button(format!("Use Local##ovL{hunk_id}")) {
+                    apply_res(store, session_id, hunk_id, Resolution::Local, status);
+                }
+                ui.same_line();
+                if ui.small_button(format!("Use Base##ovB{hunk_id}")) {
+                    apply_res(store, session_id, hunk_id, Resolution::Base, status);
+                }
+                ui.same_line();
+                if ui.small_button(format!("Use Remote##ovR{hunk_id}")) {
+                    apply_res(store, session_id, hunk_id, Resolution::Remote, status);
+                }
             }
-            ui.same_line();
-            if ui.small_button(format!("Use Base##ovB{hunk_id}")) {
-                apply_res(store, session_id, hunk_id, Resolution::Base, status);
-            }
-        }
-        HunkKind::Conflict => {
-            if ui.small_button(format!("Use Local##ovL{hunk_id}")) {
-                apply_res(store, session_id, hunk_id, Resolution::Local, status);
-            }
-            ui.same_line();
-            if ui.small_button(format!("Use Base##ovB{hunk_id}")) {
-                apply_res(store, session_id, hunk_id, Resolution::Base, status);
-            }
-            ui.same_line();
-            if ui.small_button(format!("Use Remote##ovR{hunk_id}")) {
-                apply_res(store, session_id, hunk_id, Resolution::Remote, status);
-            }
-        }
-    }
+        });
 }
 
 fn apply_res(
