@@ -19,7 +19,10 @@ mod overlay;
 mod tests;
 
 pub use common::{DiffViewState, Side};
-use common::{build_pane_ranges, gutter_w, target_scroll, PendingJump, CONNECTOR_W};
+use common::{
+    build_pane_ranges, gutter_w, next_anchor_pick, rail_w, target_scroll, AnchorPick,
+    PendingJump, RailAction, RailClick, RailEvent, CONNECTOR_W,
+};
 
 /// Minimum scroll change (px) to treat as intentional user input.
 /// Dampens single-pixel echo oscillation when we push a new scroll value.
@@ -174,18 +177,33 @@ pub fn render(
 
     let (left_widget_rect, left_scroll_y) = render_pane(
         ui, state, left_pos, pane_w, pane_h, Side::Left, session_id,
-        pending_edits, hunks, anchors, &hover_left, status, store,
+        pending_edits, hunks, anchors, &hover_left,
         a_highlights, lh,
     );
 
-    // Connector strip: reserve the area; ribbons painted after both panes
-    // have rendered so we have their final widget rects + scroll_ys.
-    ui.set_cursor_screen_pos(connector_pos);
-    ui.invisible_button("connector_strip", [CONNECTOR_W, pane_h]);
+    // Connector strip: split into left rail / middle / right rail.
+    // Invisible buttons capture hover/click; ribbons painted after both panes.
+    let rail_w_now = rail_w();
+    let left_rail_pos = connector_pos;
+    let middle_pos = [connector_pos[0] + rail_w_now, connector_pos[1]];
+    let middle_w = (CONNECTOR_W - 2.0 * rail_w_now).max(0.0);
+    let right_rail_pos = [connector_pos[0] + CONNECTOR_W - rail_w_now, connector_pos[1]];
+
+    ui.set_cursor_screen_pos(left_rail_pos);
+    let left_rail_clicked = ui.invisible_button("anchor_rail_L", [rail_w_now, pane_h]);
+    let left_rail_hovered = ui.is_item_hovered();
+
+    ui.set_cursor_screen_pos(middle_pos);
+    let middle_clicked = ui.invisible_button("connector_middle", [middle_w, pane_h]);
+    let _ = middle_clicked;
+
+    ui.set_cursor_screen_pos(right_rail_pos);
+    let right_rail_clicked = ui.invisible_button("anchor_rail_R", [rail_w_now, pane_h]);
+    let right_rail_hovered = ui.is_item_hovered();
 
     let (right_widget_rect, right_scroll_y) = render_pane(
         ui, state, right_pos, pane_w, pane_h, Side::Right, session_id,
-        pending_edits, hunks, anchors, &hover_right, status, store,
+        pending_edits, hunks, anchors, &hover_right,
         b_highlights, lh,
     );
 
@@ -193,8 +211,74 @@ pub fn render(
     let prev_right_target = prev_right_target_for_sync;
     state.last_left_scroll_y = left_scroll_y;
     state.last_right_scroll_y = right_scroll_y;
-    let _ = left_widget_rect;
-    let _ = right_widget_rect;
+
+    // Translate rail hover/click + Esc into a RailEvent, then step the
+    // anchor-pick state machine. Done after both panes render so we have
+    // the current frame's eased scroll values for line-mapping.
+    let mouse_y = ui.io().mouse_pos[1];
+    let left_hover_line = if left_rail_hovered {
+        Some(overlay::mouse_y_to_line(mouse_y, left_pos[1], state.last_left_scroll_y, lh))
+    } else {
+        None
+    };
+    let right_hover_line = if right_rail_hovered {
+        Some(overlay::mouse_y_to_line(mouse_y, right_pos[1], state.last_right_scroll_y, lh))
+    } else {
+        None
+    };
+
+    fn anchor_idx_for(anchors: &[crate::diff::Anchor], side: Side, line: u32) -> Option<usize> {
+        anchors.iter().position(|a| match side {
+            Side::Left => a.a == line,
+            Side::Right => a.b == line,
+        })
+    }
+
+    let escape_pressed = ui.is_key_pressed(imgui::Key::Escape);
+    let rail_event: RailEvent = if escape_pressed {
+        RailEvent::Escape
+    } else if left_rail_clicked {
+        let line = left_hover_line.unwrap_or(1);
+        let idx = anchor_idx_for(anchors, Side::Left, line);
+        RailEvent::Click(RailClick {
+            side: Side::Left,
+            line,
+            anchor_idx: idx,
+        })
+    } else if right_rail_clicked {
+        let line = right_hover_line.unwrap_or(1);
+        let idx = anchor_idx_for(anchors, Side::Right, line);
+        RailEvent::Click(RailClick {
+            side: Side::Right,
+            line,
+            anchor_idx: idx,
+        })
+    } else if matches!(state.anchor_pick, AnchorPick::Picking { .. })
+        && ui.is_mouse_clicked(imgui::MouseButton::Left)
+    {
+        // While picking, any left-click outside the rails cancels.
+        RailEvent::ClickedElsewhere
+    } else {
+        RailEvent::None
+    };
+
+    let (next_pick, action) = next_anchor_pick(state.anchor_pick, rail_event);
+    state.anchor_pick = next_pick;
+    match action {
+        RailAction::None => {}
+        RailAction::RemoveAnchor { idx } => {
+            match store.remove_anchor(session_id, idx) {
+                Ok(()) => *status = "anchor removed".to_string(),
+                Err(e) => *status = format!("anchor error: {e}"),
+            }
+        }
+        RailAction::AddAnchor { a, b } => {
+            match store.add_anchor_two_way(session_id, crate::diff::Anchor { a, b }) {
+                Ok(()) => *status = format!("anchor added: A:{a} <-> B:{b}"),
+                Err(e) => *status = format!("anchor error: {e}"),
+            }
+        }
+    }
 
     // Scroll sync: compare *targets*, not eased displayed values, so the
     // sync trigger fires once per user gesture rather than every animation
@@ -233,8 +317,44 @@ pub fn render(
         hunks,
         lh,
         state.anchor_pick,
-        connector_pos[0],                // placeholder; Task 4 supplies real rail centers
-        connector_pos[0] + CONNECTOR_W,  // placeholder
+        left_rail_pos[0] + rail_w_now * 0.5,
+        right_rail_pos[0] + rail_w_now * 0.5,
+    );
+
+    // Paint anchor rail icons on top of the ribbons.
+    let left_rail_rect = [
+        left_rail_pos[0],
+        left_rail_pos[1],
+        left_rail_pos[0] + rail_w_now,
+        left_rail_pos[1] + pane_h,
+    ];
+    let right_rail_rect = [
+        right_rail_pos[0],
+        right_rail_pos[1],
+        right_rail_pos[0] + rail_w_now,
+        right_rail_pos[1] + pane_h,
+    ];
+    overlay::paint_anchor_rail(
+        ui,
+        left_rail_rect,
+        left_pos[1],
+        left_scroll_y,
+        lh,
+        Side::Left,
+        anchors,
+        left_hover_line,
+        state.anchor_pick,
+    );
+    overlay::paint_anchor_rail(
+        ui,
+        right_rail_rect,
+        right_pos[1],
+        right_scroll_y,
+        lh,
+        Side::Right,
+        anchors,
+        right_hover_line,
+        state.anchor_pick,
     );
 
     // Draw the hover panel(s) on top, after both panes have rendered.
@@ -260,16 +380,6 @@ pub fn render(
     let _ = focus_request;
 }
 
-fn handle_anchor_click(
-    _state: &mut DiffViewState,
-    _side: Side,
-    _line: u32,
-    _status: &mut String,
-    _store: &SessionStore,
-    _session_id: SessionId,
-) {
-    // Stub during refactor; rail-based anchor flow replaces this in Task 4.
-}
 
 #[allow(clippy::too_many_arguments)]
 fn render_pane(
@@ -284,8 +394,6 @@ fn render_pane(
     hunks: &[Hunk],
     anchors: &[Anchor],
     hover_out: &Cell<Option<(u32, [f32; 2])>>,
-    status: &mut String,
-    store: &SessionStore,
     highlights: &[crate::app::syntax::LineSpans],
     lh: f32,
 ) -> ([f32; 4], f32) {
@@ -293,18 +401,13 @@ fn render_pane(
     let widget_pos = [pane_pos[0] + g_w, pane_pos[1]];
     let widget_w = pane_w - g_w;
 
-    // Gutter strip — click to pin anchors; paint dots + line numbers.
+    // Gutter strip — display only; clicks handled by rails in the connector.
     ui.set_cursor_screen_pos(pane_pos);
-    let gutter_clicked = ui.invisible_button(format!("gutter_{:?}", side), [g_w, pane_h]);
+    ui.dummy([g_w, pane_h]); // gutter strip — display only, clicks handled by rails
     let scroll_y_for_anchor = match side {
         Side::Left => state.last_left_scroll_y,
         Side::Right => state.last_right_scroll_y,
     };
-    if gutter_clicked {
-        let mouse_y = ui.io().mouse_pos[1];
-        let line = overlay::mouse_y_to_line(mouse_y, pane_pos[1], scroll_y_for_anchor, lh);
-        handle_anchor_click(state, side, line, status, store, session_id);
-    }
     let gutter_rect = [pane_pos[0], pane_pos[1], pane_pos[0] + g_w, pane_pos[1] + pane_h];
     let buf_line_count_for_gutter = {
         let buf_ref: &str = match side {

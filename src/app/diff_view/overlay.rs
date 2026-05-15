@@ -70,7 +70,6 @@ pub(super) fn line_screen_y(widget_top: f32, line: u32, scroll_y: f32, lh: f32) 
 
 /// Screen-space center of the anchor icon for a given rail row.
 /// `rail_left` + `rail_right` are the rail's x-extents on screen.
-#[allow(dead_code)]
 pub(super) fn anchor_icon_center(
     rail_left: f32,
     rail_right: f32,
@@ -733,7 +732,6 @@ fn side_tag(side: Side) -> &'static str {
 /// and unanchored), filled icon for every row that is part of an anchor.
 /// `pane_top` is the top of the *pane*, used together with `scroll_y` to map
 /// content lines onto screen y.
-#[allow(dead_code)]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn paint_anchor_rail(
     ui: &Ui,
