@@ -255,8 +255,14 @@ pub fn render(
         })
     } else if matches!(state.anchor_pick, AnchorPick::Picking { .. })
         && ui.is_mouse_clicked(imgui::MouseButton::Left)
+        && !left_rail_hovered
+        && !right_rail_hovered
     {
-        // While picking, any left-click outside the rails cancels.
+        // While picking, a left-click that is NOT on either rail cancels.
+        // `is_mouse_clicked` fires on press while the rails' `invisible_button`
+        // fires on release; suppressing this branch when a rail is hovered
+        // keeps the press from cancelling the pick a frame before the release
+        // completes the anchor.
         RailEvent::ClickedElsewhere
     } else {
         RailEvent::None
