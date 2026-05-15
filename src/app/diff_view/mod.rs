@@ -280,7 +280,14 @@ pub fn render(
         }
         RailAction::AddAnchor { a, b } => {
             match store.add_anchor_two_way(session_id, crate::diff::Anchor { a, b }) {
-                Ok(()) => *status = format!("anchor added: A:{a} <-> B:{b}"),
+                Ok(()) => {
+                    *status = format!("anchor added: A:{a} <-> B:{b}");
+                    let center = |line: u32| {
+                        ((line as f32 - 1.0) * lh - pane_h * 0.5 + lh * 0.5).max(0.0)
+                    };
+                    state.pending_left_scroll = Some(center(a));
+                    state.pending_right_scroll = Some(center(b));
+                }
                 Err(e) => *status = format!("anchor error: {e}"),
             }
         }
