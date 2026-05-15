@@ -25,6 +25,9 @@ use common::{build_pane_ranges, gutter_w, target_scroll, PendingJump, CONNECTOR_
 /// Dampens single-pixel echo oscillation when we push a new scroll value.
 const ECHO_TOLERANCE: f32 = 1.0;
 
+/// Lines of scroll per mouse-wheel tick. Matches typical text-editor feel.
+const SCROLL_LINES_PER_WHEEL_TICK: f32 = 3.0;
+
 use super::undo_stack::DiffEdit;
 
 #[allow(clippy::too_many_arguments)]
@@ -251,25 +254,6 @@ fn render_pane(
         buf_line_count_for_gutter,
     );
 
-    // Apply any pending scroll set last frame. `igSetNextWindowScroll`
-    // targets the multiline's internal child (the widget IS the next
-    // window). We also pass the value into the ALWAYS callback as a
-    // fallback (the callback is only invoked while the widget is active,
-    // but `igSetNextWindowScroll` works regardless).
-    let pending_scroll = match side {
-        Side::Left => state.pending_left_scroll.take(),
-        Side::Right => state.pending_right_scroll.take(),
-    };
-    if let Some(y) = pending_scroll {
-        unsafe {
-            imgui::sys::igSetNextWindowScroll(imgui::sys::ImVec2 { x: -1.0, y });
-        }
-    }
-
-    ui.set_cursor_screen_pos(widget_pos);
-
-    let widget_id = format!("##diffie_pane_{:?}_e{}", side, state.input_epoch);
-
     // Screen-space coordinates valid for the foreground draw list.
     let widget_rect = [
         widget_pos[0],
@@ -278,16 +262,69 @@ fn render_pane(
         widget_pos[1] + pane_h,
     ];
 
-    let caret_byte: Cell<i32> = Cell::new(-1);
-    // Seed with last-known scroll for this side so when the ALWAYS
-    // callback doesn't fire (widget not active), we still report a
-    // sensible value. If we set a pending scroll this frame, prefer that.
-    let last_scroll = match side {
+    // Own the scroll: imgui's CallbackAlways only fires while the widget
+    // is active (focused), and imgui's child-window wheel handler scrolls
+    // the internal child regardless. Reading scroll back after build is
+    // unreliable, so we take it over instead.
+    //
+    // - Wheel over the pane → adjust our scroll.
+    // - Pending sync scroll (from sister pane or ↕ jump) overrides.
+    // - Push our scroll into the widget via igSetNextWindowScroll every
+    //   frame so imgui's internal child stays pinned to our value.
+    // Tradeoff: dragging imgui's scrollbar doesn't work in this approach;
+    // mouse wheel (and our own sync path) are the supported gestures.
+    let buf_for_paint_lines: u32 = {
+        let buf_ref: &str = match side {
+            Side::Left => &state.a_buf,
+            Side::Right => &state.b_buf,
+        };
+        buf_ref.lines().count().max(1) as u32
+    };
+    let content_h = (buf_for_paint_lines as f32) * lh;
+    let max_scroll = (content_h - pane_h).max(0.0);
+
+    let pending_scroll = match side {
+        Side::Left => state.pending_left_scroll.take(),
+        Side::Right => state.pending_right_scroll.take(),
+    };
+    let prev_own_scroll = match side {
         Side::Left => state.last_left_scroll_y,
         Side::Right => state.last_right_scroll_y,
     };
-    let scroll_y_cell: Cell<f32> = Cell::new(pending_scroll.unwrap_or(last_scroll));
-    let pending_scroll_cell: Cell<Option<f32>> = Cell::new(pending_scroll);
+    let wheel = if pending_scroll.is_none()
+        && ui.is_mouse_hovering_rect(
+            [widget_pos[0], widget_pos[1]],
+            [widget_pos[0] + widget_w, widget_pos[1] + pane_h],
+        )
+    {
+        ui.io().mouse_wheel
+    } else {
+        0.0
+    };
+    let mut own_scroll = pending_scroll
+        .unwrap_or_else(|| prev_own_scroll - wheel * lh * SCROLL_LINES_PER_WHEEL_TICK);
+    if own_scroll < 0.0 {
+        own_scroll = 0.0;
+    }
+    if own_scroll > max_scroll {
+        own_scroll = max_scroll;
+    }
+
+    // Pin the widget's internal child scroll to our value every frame so
+    // the rendered text aligns with our overlay. The widget IS the next
+    // window for purposes of igSetNextWindowScroll.
+    unsafe {
+        imgui::sys::igSetNextWindowScroll(imgui::sys::ImVec2 {
+            x: -1.0,
+            y: own_scroll,
+        });
+    }
+
+    ui.set_cursor_screen_pos(widget_pos);
+
+    let widget_id = format!("##diffie_pane_{:?}_e{}", side, state.input_epoch);
+
+    let caret_byte: Cell<i32> = Cell::new(-1);
     let (changed, buf_clone) = {
         let buf = match side {
             Side::Left => &mut state.a_buf,
@@ -302,23 +339,14 @@ fn render_pane(
         let _frame_bg_act = ui.push_style_color(imgui::StyleColor::FrameBgActive, [0.0, 0.0, 0.0, 0.0]);
         let _text_color = ui.push_style_color(imgui::StyleColor::Text, [0.0, 0.0, 0.0, 0.0]);
 
+        // Callback only captures the caret while the widget is active.
+        // (CallbackAlways only fires when ActiveId matches the widget id.)
         struct CaretCapture<'a> {
             cursor: &'a Cell<i32>,
-            scroll_y: &'a Cell<f32>,
-            pending: &'a Cell<Option<f32>>,
         }
         impl<'a> imgui::InputTextCallbackHandler for CaretCapture<'a> {
             fn on_always(&mut self, data: imgui::TextCallbackData) {
                 self.cursor.set(data.cursor_pos() as i32);
-                // Runs inside the multiline's internal child window scope,
-                // so igGetScrollY/igSetScrollY target the multiline's
-                // own scroll.
-                unsafe {
-                    if let Some(target) = self.pending.take() {
-                        imgui::sys::igSetScrollY(target);
-                    }
-                    self.scroll_y.set(imgui::sys::igGetScrollY());
-                }
             }
         }
 
@@ -327,11 +355,7 @@ fn render_pane(
             .no_undo_redo(true)
             .callback(
                 imgui::InputTextMultilineCallback::ALWAYS,
-                CaretCapture {
-                    cursor: &caret_byte,
-                    scroll_y: &scroll_y_cell,
-                    pending: &pending_scroll_cell,
-                },
+                CaretCapture { cursor: &caret_byte },
             )
             .build();
         let widget_active = ui.is_item_active();
@@ -339,7 +363,7 @@ fn render_pane(
         (changed, (clone, widget_active))
     };
     let (buf_clone, widget_active) = buf_clone;
-    let scroll_y_out = scroll_y_cell.get();
+    let scroll_y_out = own_scroll;
     if let Some(new_text) = buf_clone {
         let side_ref = SideRef::TwoWay(match side {
             Side::Left => TwoWaySide::A,
