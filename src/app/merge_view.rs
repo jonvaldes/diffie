@@ -305,7 +305,9 @@ fn render_pane(
     let widget_pos = [pane_pos[0] + g_w, pane_pos[1]];
     let widget_w = (pane_w - g_w).max(20.0);
 
-    // Apply any pending scroll set last frame.
+    // Apply any pending scroll set last frame. `igSetNextWindowScroll`
+    // targets the multiline's internal child; the ALWAYS callback below
+    // also applies it as a fallback when the widget is active.
     let pending_scroll = state.pending[pane as usize].take();
     if let Some(y) = pending_scroll {
         unsafe {
@@ -324,10 +326,7 @@ fn render_pane(
     let trailing = buf_ref.is_empty() || buf_ref.ends_with('\n');
     let buf_line_count = n + if trailing { 1 } else { 0 };
 
-    let content_h = (buf_line_count as f32 * lh).max(pane_h);
-
     let widget_id = format!("##merge_pane_{:?}_e{}", pane, state.input_epoch);
-    let child_id = format!("##merge_pane_child_{:?}_e{}", pane, state.input_epoch);
 
     let widget_rect = [
         widget_pos[0],
@@ -336,81 +335,95 @@ fn render_pane(
         widget_pos[1] + pane_h,
     ];
 
-    let mut scroll_y_out: f32 = 0.0;
-    let mut origin_out: [f32; 2] = widget_pos;
     let caret_byte: Cell<i32> = Cell::new(-1);
-    let widget_active: Cell<bool> = Cell::new(false);
+    let last_scroll = state.last[pane as usize];
+    let scroll_y_cell: Cell<f32> = Cell::new(pending_scroll.unwrap_or(last_scroll));
+    let pending_scroll_cell: Cell<Option<f32>> = Cell::new(pending_scroll);
+    let origin_out: [f32; 2] = widget_pos;
 
-    ui.child_window(&child_id)
-        .size([widget_w, pane_h])
-        .scroll_bar(true)
-        .build(|| {
-            origin_out = ui.cursor_screen_pos();
-            let buf = match pane {
-                Pane::Base => &mut state.base_buf,
-                Pane::Local => &mut state.local_buf,
-                Pane::Remote => &mut state.remote_buf,
-            };
-            // ItemSpacing zero so the input_text grows exactly content_h
-            // (the multiline widget uses Item* style vars internally).
-            let _spacing = ui.push_style_var(StyleVar::ItemSpacing([0.0, 0.0]));
+    let (changed, new_text_opt, widget_active) = {
+        let buf = match pane {
+            Pane::Base => &mut state.base_buf,
+            Pane::Local => &mut state.local_buf,
+            Pane::Remote => &mut state.remote_buf,
+        };
+        let _spacing = ui.push_style_var(StyleVar::ItemSpacing([0.0, 0.0]));
 
-            // Suppress imgui's own FrameBg + Text rendering — we paint
-            // everything (row tints, text, caret) on the foreground draw list.
-            let _frame_bg = ui.push_style_color(imgui::StyleColor::FrameBg, [0.0, 0.0, 0.0, 0.0]);
-            let _frame_bg_hov = ui.push_style_color(imgui::StyleColor::FrameBgHovered, [0.0, 0.0, 0.0, 0.0]);
-            let _frame_bg_act = ui.push_style_color(imgui::StyleColor::FrameBgActive, [0.0, 0.0, 0.0, 0.0]);
-            let _text_color = ui.push_style_color(imgui::StyleColor::Text, [0.0, 0.0, 0.0, 0.0]);
+        // Suppress imgui's own FrameBg + Text rendering — we paint
+        // everything (row tints, text, caret) on the foreground draw list.
+        let _frame_bg = ui.push_style_color(imgui::StyleColor::FrameBg, [0.0, 0.0, 0.0, 0.0]);
+        let _frame_bg_hov = ui.push_style_color(imgui::StyleColor::FrameBgHovered, [0.0, 0.0, 0.0, 0.0]);
+        let _frame_bg_act = ui.push_style_color(imgui::StyleColor::FrameBgActive, [0.0, 0.0, 0.0, 0.0]);
+        let _text_color = ui.push_style_color(imgui::StyleColor::Text, [0.0, 0.0, 0.0, 0.0]);
 
-            struct CaretCapture<'a> { out: &'a Cell<i32> }
-            impl<'a> imgui::InputTextCallbackHandler for CaretCapture<'a> {
-                fn on_always(&mut self, data: imgui::TextCallbackData) {
-                    self.out.set(data.cursor_pos() as i32);
+        struct CaretCapture<'a> {
+            cursor: &'a Cell<i32>,
+            scroll_y: &'a Cell<f32>,
+            pending: &'a Cell<Option<f32>>,
+        }
+        impl<'a> imgui::InputTextCallbackHandler for CaretCapture<'a> {
+            fn on_always(&mut self, data: imgui::TextCallbackData) {
+                self.cursor.set(data.cursor_pos() as i32);
+                unsafe {
+                    if let Some(target) = self.pending.take() {
+                        imgui::sys::igSetScrollY(target);
+                    }
+                    self.scroll_y.set(imgui::sys::igGetScrollY());
                 }
             }
+        }
 
-            let changed = ui
-                .input_text_multiline(&widget_id, buf, [widget_w, content_h])
-                .no_undo_redo(true)
-                .callback(imgui::InputTextMultilineCallback::ALWAYS, CaretCapture { out: &caret_byte })
-                .build();
-            widget_active.set(ui.is_item_active());
-            if ui.is_item_active() {
-                focus_event.set(Some(pane.as_focused_pane()));
-            }
-            drop(_spacing);
-            scroll_y_out = ui.scroll_y();
-            if changed {
-                let side_ref = SideRef::ThreeWay(match pane {
-                    Pane::Base => ThreeWaySide::Base,
-                    Pane::Local => ThreeWaySide::Local,
-                    Pane::Remote => ThreeWaySide::Remote,
-                });
-                pending_edits.push(DiffEdit::SetSide {
-                    session_id,
-                    side: side_ref,
-                    new_text: buf.clone(),
-                    old_text: None,
-                });
-            }
-
-            let buf_for_paint: &str = match pane {
-                Pane::Base => &state.base_buf,
-                Pane::Local => &state.local_buf,
-                Pane::Remote => &state.remote_buf,
-            };
-            paint_pane_text(
-                ui,
-                widget_rect,
-                buf_for_paint,
-                layout,
-                scroll_y_out,
-                lh,
-                caret_byte.get(),
-                widget_active.get(),
-                hover_out,
-            );
+        let changed = ui
+            .input_text_multiline(&widget_id, buf, [widget_w, pane_h])
+            .no_undo_redo(true)
+            .callback(
+                imgui::InputTextMultilineCallback::ALWAYS,
+                CaretCapture {
+                    cursor: &caret_byte,
+                    scroll_y: &scroll_y_cell,
+                    pending: &pending_scroll_cell,
+                },
+            )
+            .build();
+        let active = ui.is_item_active();
+        let new_text = if changed { Some(buf.clone()) } else { None };
+        (changed, new_text, active)
+    };
+    let scroll_y_out = scroll_y_cell.get();
+    if widget_active {
+        focus_event.set(Some(pane.as_focused_pane()));
+    }
+    if let Some(new_text) = new_text_opt {
+        let side_ref = SideRef::ThreeWay(match pane {
+            Pane::Base => ThreeWaySide::Base,
+            Pane::Local => ThreeWaySide::Local,
+            Pane::Remote => ThreeWaySide::Remote,
         });
+        pending_edits.push(DiffEdit::SetSide {
+            session_id,
+            side: side_ref,
+            new_text,
+            old_text: None,
+        });
+    }
+    let _ = changed;
+
+    let buf_for_paint: &str = match pane {
+        Pane::Base => &state.base_buf,
+        Pane::Local => &state.local_buf,
+        Pane::Remote => &state.remote_buf,
+    };
+    paint_pane_text(
+        ui,
+        widget_rect,
+        buf_for_paint,
+        layout,
+        scroll_y_out,
+        lh,
+        caret_byte.get(),
+        widget_active,
+        hover_out,
+    );
 
     // Gutter on the left of this pane (line numbers).
     paint_gutter(ui, pane_pos, g_w, pane_h, scroll_y_out, lh, buf_line_count as u32);

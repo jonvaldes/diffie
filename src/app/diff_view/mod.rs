@@ -251,7 +251,11 @@ fn render_pane(
         buf_line_count_for_gutter,
     );
 
-    // Apply any pending scroll set last frame.
+    // Apply any pending scroll set last frame. `igSetNextWindowScroll`
+    // targets the multiline's internal child (the widget IS the next
+    // window). We also pass the value into the ALWAYS callback as a
+    // fallback (the callback is only invoked while the widget is active,
+    // but `igSetNextWindowScroll` works regardless).
     let pending_scroll = match side {
         Side::Left => state.pending_left_scroll.take(),
         Side::Right => state.pending_right_scroll.take(),
@@ -264,27 +268,9 @@ fn render_pane(
 
     ui.set_cursor_screen_pos(widget_pos);
 
-    // Pre-compute line count from the buffer (need it before the closure
-    // takes a mutable borrow). `lines()` doesn't count a trailing empty
-    // line, so add 1 if the buffer ends with '\n' (or is empty).
-    let (buf_line_count, _) = {
-        let buf_ref: &str = match side {
-            Side::Left => &state.a_buf,
-            Side::Right => &state.b_buf,
-        };
-        let n = buf_ref.lines().count().max(1);
-        let trailing = buf_ref.is_empty() || buf_ref.ends_with('\n');
-        (n + if trailing { 1 } else { 0 }, ())
-    };
-
-    let content_h = (buf_line_count as f32 * lh).max(pane_h);
-
     let widget_id = format!("##diffie_pane_{:?}_e{}", side, state.input_epoch);
-    let child_id = format!("##diffie_pane_child_{:?}_e{}", side, state.input_epoch);
 
-    let mut scroll_y_out: f32 = 0.0;
-    // Screen-space coordinates valid for the child window's draw list
-    // (imgui draw list positions are always in screen space).
+    // Screen-space coordinates valid for the foreground draw list.
     let widget_rect = [
         widget_pos[0],
         widget_pos[1],
@@ -293,79 +279,100 @@ fn render_pane(
     ];
 
     let caret_byte: Cell<i32> = Cell::new(-1);
-    let widget_active: Cell<bool> = Cell::new(false);
+    // Seed with last-known scroll for this side so when the ALWAYS
+    // callback doesn't fire (widget not active), we still report a
+    // sensible value. If we set a pending scroll this frame, prefer that.
+    let last_scroll = match side {
+        Side::Left => state.last_left_scroll_y,
+        Side::Right => state.last_right_scroll_y,
+    };
+    let scroll_y_cell: Cell<f32> = Cell::new(pending_scroll.unwrap_or(last_scroll));
+    let pending_scroll_cell: Cell<Option<f32>> = Cell::new(pending_scroll);
+    let (changed, buf_clone) = {
+        let buf = match side {
+            Side::Left => &mut state.a_buf,
+            Side::Right => &mut state.b_buf,
+        };
 
-    ui.child_window(&child_id)
-        .size([widget_w, pane_h])
-        .scroll_bar(true)
-        .build(|| {
-            let (changed, buf_clone) = {
-                let buf = match side {
-                    Side::Left => &mut state.a_buf,
-                    Side::Right => &mut state.b_buf,
-                };
+        // Suppress imgui's own FrameBg + Text rendering. We paint
+        // everything ourselves on the foreground draw list. Keep
+        // TextSelectedBg visible (selection rect still useful).
+        let _frame_bg = ui.push_style_color(imgui::StyleColor::FrameBg, [0.0, 0.0, 0.0, 0.0]);
+        let _frame_bg_hov = ui.push_style_color(imgui::StyleColor::FrameBgHovered, [0.0, 0.0, 0.0, 0.0]);
+        let _frame_bg_act = ui.push_style_color(imgui::StyleColor::FrameBgActive, [0.0, 0.0, 0.0, 0.0]);
+        let _text_color = ui.push_style_color(imgui::StyleColor::Text, [0.0, 0.0, 0.0, 0.0]);
 
-                // Suppress imgui's own FrameBg + Text rendering. We paint
-                // everything ourselves on the foreground draw list. Keep
-                // TextSelectedBg visible (selection rect still useful).
-                let _frame_bg = ui.push_style_color(imgui::StyleColor::FrameBg, [0.0, 0.0, 0.0, 0.0]);
-                let _frame_bg_hov = ui.push_style_color(imgui::StyleColor::FrameBgHovered, [0.0, 0.0, 0.0, 0.0]);
-                let _frame_bg_act = ui.push_style_color(imgui::StyleColor::FrameBgActive, [0.0, 0.0, 0.0, 0.0]);
-                let _text_color = ui.push_style_color(imgui::StyleColor::Text, [0.0, 0.0, 0.0, 0.0]);
-
-                struct CaretCapture<'a> { out: &'a Cell<i32> }
-                impl<'a> imgui::InputTextCallbackHandler for CaretCapture<'a> {
-                    fn on_always(&mut self, data: imgui::TextCallbackData) {
-                        self.out.set(data.cursor_pos() as i32);
+        struct CaretCapture<'a> {
+            cursor: &'a Cell<i32>,
+            scroll_y: &'a Cell<f32>,
+            pending: &'a Cell<Option<f32>>,
+        }
+        impl<'a> imgui::InputTextCallbackHandler for CaretCapture<'a> {
+            fn on_always(&mut self, data: imgui::TextCallbackData) {
+                self.cursor.set(data.cursor_pos() as i32);
+                // Runs inside the multiline's internal child window scope,
+                // so igGetScrollY/igSetScrollY target the multiline's
+                // own scroll.
+                unsafe {
+                    if let Some(target) = self.pending.take() {
+                        imgui::sys::igSetScrollY(target);
                     }
+                    self.scroll_y.set(imgui::sys::igGetScrollY());
                 }
-
-                let changed = ui
-                    .input_text_multiline(&widget_id, buf, [widget_w, content_h])
-                    .no_undo_redo(true)
-                    .callback(imgui::InputTextMultilineCallback::ALWAYS, CaretCapture { out: &caret_byte })
-                    .build();
-                widget_active.set(ui.is_item_active());
-                // Read scroll AFTER build() so input events (including scroll)
-                // have been processed.
-                scroll_y_out = ui.scroll_y();
-                let clone = if changed { Some(buf.clone()) } else { None };
-                (changed, clone)
-            };
-            if let Some(new_text) = buf_clone {
-                let side_ref = SideRef::TwoWay(match side {
-                    Side::Left => TwoWaySide::A,
-                    Side::Right => TwoWaySide::B,
-                });
-                pending_edits.push(DiffEdit::SetSide {
-                    session_id,
-                    side: side_ref,
-                    new_text,
-                    old_text: None,
-                });
             }
-            let _ = changed;
+        }
 
-            // Paint everything (row bg, sub-line spans, syntax text, caret)
-            // on the foreground draw list ourselves.
-            let buf_for_paint: &str = match side {
-                Side::Left => &state.a_buf,
-                Side::Right => &state.b_buf,
-            };
-            overlay::paint_pane_text(
-                ui,
-                widget_rect,
-                buf_for_paint,
-                highlights,
-                hunks,
-                side,
-                scroll_y_out,
-                lh,
-                caret_byte.get(),
-                widget_active.get(),
-                hover_out,
-            );
+        let changed = ui
+            .input_text_multiline(&widget_id, buf, [widget_w, pane_h])
+            .no_undo_redo(true)
+            .callback(
+                imgui::InputTextMultilineCallback::ALWAYS,
+                CaretCapture {
+                    cursor: &caret_byte,
+                    scroll_y: &scroll_y_cell,
+                    pending: &pending_scroll_cell,
+                },
+            )
+            .build();
+        let widget_active = ui.is_item_active();
+        let clone = if changed { Some(buf.clone()) } else { None };
+        (changed, (clone, widget_active))
+    };
+    let (buf_clone, widget_active) = buf_clone;
+    let scroll_y_out = scroll_y_cell.get();
+    if let Some(new_text) = buf_clone {
+        let side_ref = SideRef::TwoWay(match side {
+            Side::Left => TwoWaySide::A,
+            Side::Right => TwoWaySide::B,
         });
+        pending_edits.push(DiffEdit::SetSide {
+            session_id,
+            side: side_ref,
+            new_text,
+            old_text: None,
+        });
+    }
+    let _ = changed;
+
+    // Paint everything (row bg, sub-line spans, syntax text, caret)
+    // on the foreground draw list ourselves.
+    let buf_for_paint: &str = match side {
+        Side::Left => &state.a_buf,
+        Side::Right => &state.b_buf,
+    };
+    overlay::paint_pane_text(
+        ui,
+        widget_rect,
+        buf_for_paint,
+        highlights,
+        hunks,
+        side,
+        scroll_y_out,
+        lh,
+        caret_byte.get(),
+        widget_active,
+        hover_out,
+    );
 
     (widget_rect, scroll_y_out)
 }
