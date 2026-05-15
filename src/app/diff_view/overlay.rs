@@ -68,91 +68,299 @@ pub(super) fn line_screen_y(widget_top: f32, line: u32, scroll_y: f32, lh: f32) 
     widget_top + (line as f32 - 1.0) * lh - scroll_y
 }
 
-/// Paint syntax-highlighted text on top of the input_text_multiline widget.
-/// imgui's widget paints monochrome text underneath; we overpaint the
-/// colored spans on top so the colored characters cover the monochrome
-/// ones. Plain (uncolored) text is left as-is so the caret stays visible.
-///
-/// `IMGUI_TEXT_PADDING_X` is imgui's frame-padding; ~4px empirically.
-const IMGUI_TEXT_PADDING_X: f32 = 4.0;
+/// Compute the x offset of a byte position within `line`, clamped to a
+/// char boundary, using imgui's font metrics (matches the multiline widget's
+/// own hit-testing).
+pub(super) fn text_x_at_byte(ui: &Ui, line: &str, byte_offset: usize, padding_x: f32) -> f32 {
+    let clamped = byte_offset.min(line.len());
+    let mut snap = clamped;
+    while snap > 0 && !line.is_char_boundary(snap) {
+        snap -= 1;
+    }
+    padding_x + ui.calc_text_size(&line[..snap])[0]
+}
 
-pub(super) fn paint_syntax_text(
+/// Paint EVERYTHING for one pane on the foreground draw list:
+/// row backgrounds (change/move), sub-line span highlights,
+/// syntax-colored text, and the caret. Also detects hover for the
+/// resolution overlay panel.
+///
+/// Callers must suppress imgui's own text + FrameBg rendering on the
+/// `input_text_multiline` widget (via transparent style colors) so this
+/// is the only visible layer.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn paint_pane_text(
     ui: &Ui,
     widget_rect: [f32; 4],
     buf: &str,
     highlights: &[LineSpans],
+    hunks: &[Hunk],
+    side: Side,
     scroll_y: f32,
+    caret_byte: i32,
+    widget_active: bool,
+    hover_out: &Cell<Option<(u32, [f32; 2])>>,
 ) {
-    if highlights.is_empty() {
-        return;
-    }
-    // Use the foreground draw list so our colored text paints on top of
-    // imgui's monochrome text. The multiline widget renders its text into
-    // its own internal child-window draw list, which composites on top of
-    // the parent window's draw list — so painting on the window draw list
-    // puts colored text *under* the widget's text and it becomes invisible.
-    // The foreground draw list is composited last, after all widgets.
-    let dl = ui.get_foreground_draw_list();
     let lh = line_h();
     let widget_top = widget_rect[1];
     let widget_bottom = widget_rect[3];
+    let widget_left = widget_rect[0];
+    let widget_right = widget_rect[2];
     let widget_h = widget_bottom - widget_top;
     if widget_h <= 0.0 || lh <= 0.0 {
         return;
     }
-    let char_w = ui.calc_text_size("m")[0].max(1.0);
-    let text_x0 = widget_rect[0] + IMGUI_TEXT_PADDING_X;
 
-    let first_line = (scroll_y / lh).floor() as u32 + 1;
+    let style = ui.clone_style();
+    let padding_x = style.frame_padding[0];
+    let padding_y = style.frame_padding[1];
+
+    let first_line = ((scroll_y / lh).floor() as i64).max(0) as u32 + 1;
     let last_line = ((scroll_y + widget_h) / lh).ceil() as u32 + 1;
 
-    // Clip to the widget rect so colored text doesn't bleed outside the
-    // scrollable area when content is scrolled.
-    dl.with_clip_rect(
-        [widget_rect[0], widget_rect[1]],
-        [widget_rect[2], widget_rect[3]],
-        || {
-            for (line_idx, line_text) in buf.lines().enumerate() {
-                let ln = line_idx as u32 + 1;
-                if ln < first_line || ln > last_line {
-                    continue;
+    // Map line_no (1-based) on this side -> (OpKind, Option<&Vec<SubSpan>>, move_id).
+    // Walk hunks once.
+    let row_info = |ln: u32| -> Option<(OpKind, Option<&Vec<SubSpan>>, Option<u32>)> {
+        for h in hunks {
+            let range = match side {
+                Side::Left => h.a_range,
+                Side::Right => h.b_range,
+            };
+            if range == (0, 0) || ln < range.0 || ln > range.1 {
+                continue;
+            }
+            for op in &h.ops {
+                match (side, op) {
+                    (Side::Left, DiffOp::Equal { a, .. }) if *a == ln => {
+                        return Some((OpKind::Equal, None, None));
+                    }
+                    (Side::Left, DiffOp::Delete { a, move_id, spans, .. }) if *a == ln => {
+                        return Some((OpKind::Delete, spans.as_ref(), *move_id));
+                    }
+                    (Side::Right, DiffOp::Equal { b, .. }) if *b == ln => {
+                        return Some((OpKind::Equal, None, None));
+                    }
+                    (Side::Right, DiffOp::Insert { b, move_id, spans, .. }) if *b == ln => {
+                        return Some((OpKind::Insert, spans.as_ref(), *move_id));
+                    }
+                    _ => continue,
                 }
-                let Some(line_spans) = highlights.get(line_idx) else {
-                    continue;
-                };
-                if line_spans.is_empty() {
+            }
+        }
+        None
+    };
+
+    let dl = ui.get_foreground_draw_list();
+    dl.with_clip_rect(
+        [widget_left, widget_top],
+        [widget_right, widget_bottom],
+        || {
+            // Walk lines once; paint bg, sub-line spans, then colored text.
+            for (line_idx, line_text) in buf.lines().enumerate() {
+                let ln = (line_idx as u32) + 1;
+                if ln < first_line || ln > last_line {
                     continue;
                 }
                 let y = line_screen_y(widget_top, ln, scroll_y, lh);
                 if y + lh < widget_top || y > widget_bottom {
                     continue;
                 }
-                // Walk chars and pick each span's slice. start_col/end_col are
-                // CHAR indices; convert to byte ranges by walking char indices.
-                let chars: Vec<(usize, char)> = line_text.char_indices().collect();
-                for span in line_spans {
-                    if span.end_col <= span.start_col {
-                        continue;
-                    }
-                    if span.start_col >= chars.len() {
-                        continue;
-                    }
-                    let start_byte = chars[span.start_col].0;
-                    let end_byte = if span.end_col >= chars.len() {
-                        line_text.len()
+                let y0 = y.max(widget_top);
+                let y1 = (y + lh).min(widget_bottom);
+
+                // Per-row background.
+                let info = row_info(ln);
+                if let Some((op_kind, spans_opt, move_id)) = info {
+                    let bg = if move_id.is_some() {
+                        Some(theme::with_alpha(theme::PEACH, 0.30))
                     } else {
-                        chars[span.end_col].0
+                        match op_kind {
+                            OpKind::Equal => None,
+                            OpKind::Delete => Some([0.55, 0.18, 0.18, 0.30]),
+                            OpKind::Insert => Some([0.18, 0.50, 0.22, 0.30]),
+                        }
                     };
-                    if end_byte <= start_byte {
-                        continue;
+                    if let Some(color) = bg {
+                        if y1 > y0 {
+                            dl.add_rect([widget_left, y0], [widget_right, y1], color)
+                                .filled(true)
+                                .build();
+                        }
                     }
-                    let slice = &line_text[start_byte..end_byte];
-                    let x = text_x0 + (span.start_col as f32) * char_w;
-                    dl.add_text([x, y + 2.0], span.kind.color(), slice);
+
+                    // Sub-line spans (Changed ranges only).
+                    if let Some(spans) = spans_opt {
+                        let span_color = match op_kind {
+                            OpKind::Delete => [0.75, 0.20, 0.20, 0.45],
+                            OpKind::Insert => [0.20, 0.65, 0.25, 0.45],
+                            OpKind::Equal => [0.0, 0.0, 0.0, 0.0],
+                        };
+                        if !matches!(op_kind, OpKind::Equal) && y1 > y0 {
+                            for sp in spans {
+                                if !matches!(sp.kind, SubSpanKind::Changed) {
+                                    continue;
+                                }
+                                if sp.end <= sp.start {
+                                    continue;
+                                }
+                                let x0 = widget_left
+                                    + text_x_at_byte(ui, line_text, sp.start as usize, padding_x);
+                                let x1 = widget_left
+                                    + text_x_at_byte(ui, line_text, sp.end as usize, padding_x);
+                                let x0c = x0.max(widget_left).min(widget_right);
+                                let x1c = x1.max(widget_left).min(widget_right);
+                                if x1c > x0c {
+                                    dl.add_rect([x0c, y0], [x1c, y1], span_color)
+                                        .filled(true)
+                                        .build();
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Paint text. If there are highlight spans for this line,
+                // walk the line and emit a chunk per span boundary in default
+                // color + each span in its color. Otherwise emit the whole
+                // line in default color.
+                let text_y = y + padding_y;
+                let line_spans_opt = highlights.get(line_idx);
+                if let Some(line_spans) = line_spans_opt.filter(|v| !v.is_empty()) {
+                    // Walk char-indexed positions.
+                    let chars: Vec<(usize, char)> = line_text.char_indices().collect();
+                    let mut cursor_col: usize = 0;
+                    for span in line_spans {
+                        let s = span.start_col;
+                        let e = span.end_col.min(chars.len());
+                        if e <= s {
+                            continue;
+                        }
+                        // Default-colored gap before this span.
+                        if s > cursor_col {
+                            let gap_start_byte = chars[cursor_col].0;
+                            let gap_end_byte = if s >= chars.len() {
+                                line_text.len()
+                            } else {
+                                chars[s].0
+                            };
+                            if gap_end_byte > gap_start_byte {
+                                let x = widget_left
+                                    + text_x_at_byte(ui, line_text, gap_start_byte, padding_x);
+                                dl.add_text(
+                                    [x, text_y],
+                                    theme::TEXT,
+                                    &line_text[gap_start_byte..gap_end_byte],
+                                );
+                            }
+                        }
+                        // Colored span.
+                        if s >= chars.len() {
+                            cursor_col = s;
+                            continue;
+                        }
+                        let span_start_byte = chars[s].0;
+                        let span_end_byte = if e >= chars.len() {
+                            line_text.len()
+                        } else {
+                            chars[e].0
+                        };
+                        if span_end_byte > span_start_byte {
+                            let x = widget_left
+                                + text_x_at_byte(ui, line_text, span_start_byte, padding_x);
+                            dl.add_text(
+                                [x, text_y],
+                                span.kind.color(),
+                                &line_text[span_start_byte..span_end_byte],
+                            );
+                        }
+                        cursor_col = e;
+                    }
+                    // Tail after the last span.
+                    if cursor_col < chars.len() {
+                        let tail_byte = chars[cursor_col].0;
+                        if tail_byte < line_text.len() {
+                            let x = widget_left
+                                + text_x_at_byte(ui, line_text, tail_byte, padding_x);
+                            dl.add_text([x, text_y], theme::TEXT, &line_text[tail_byte..]);
+                        }
+                    }
+                } else if !line_text.is_empty() {
+                    dl.add_text(
+                        [widget_left + padding_x, text_y],
+                        theme::TEXT,
+                        line_text,
+                    );
+                }
+            }
+
+            // Caret. Blink: ~1s period, on for first half. Only when active.
+            if widget_active && caret_byte >= 0 {
+                let blink_on = (ui.time() * 2.0).rem_euclid(2.0) < 1.0;
+                if blink_on {
+                    let target = caret_byte as usize;
+                    let mut byte_acc: usize = 0;
+                    let mut painted = false;
+                    for (line_idx, line_text) in buf.lines().enumerate() {
+                        let line_end = byte_acc + line_text.len();
+                        if target >= byte_acc && target <= line_end {
+                            let local = target - byte_acc;
+                            let x = widget_left
+                                + text_x_at_byte(ui, line_text, local, padding_x);
+                            let y = widget_top + (line_idx as f32) * lh - scroll_y;
+                            if y + lh >= widget_top && y <= widget_bottom {
+                                dl.add_line(
+                                    [x, y + 1.0],
+                                    [x, y + lh - 1.0],
+                                    theme::TEXT,
+                                )
+                                .thickness(1.0)
+                                .build();
+                            }
+                            painted = true;
+                            break;
+                        }
+                        byte_acc = line_end + 1; // +1 for '\n'
+                    }
+                    // Caret past the last newline (trailing empty line).
+                    if !painted && target >= byte_acc {
+                        let line_idx = buf.lines().count();
+                        let x = widget_left + padding_x;
+                        let y = widget_top + (line_idx as f32) * lh - scroll_y;
+                        if y + lh >= widget_top && y <= widget_bottom {
+                            dl.add_line([x, y + 1.0], [x, y + lh - 1.0], theme::TEXT)
+                                .thickness(1.0)
+                                .build();
+                        }
+                    }
                 }
             }
         },
     );
+
+    // Hover detection (outside the clip block — just sets the out cell).
+    let mouse_pos = ui.io().mouse_pos;
+    let mx = mouse_pos[0];
+    let my = mouse_pos[1];
+    if mx >= widget_left && mx <= widget_right && my >= widget_top && my <= widget_bottom {
+        let line = mouse_y_to_line(my, widget_top, scroll_y, lh);
+        for h in hunks {
+            if !is_change_hunk(h) {
+                continue;
+            }
+            let range = match side {
+                Side::Left => h.a_range,
+                Side::Right => h.b_range,
+            };
+            if range == (0, 0) {
+                continue;
+            }
+            if line >= range.0 && line <= range.1 {
+                let anchor_y = line_screen_y(widget_top, range.0, scroll_y, lh).max(widget_top);
+                hover_out.set(Some((h.id, [widget_left, anchor_y])));
+                break;
+            }
+        }
+    }
 }
 
 // ---------------------------- bezier connector ------------------------------
@@ -376,155 +584,6 @@ enum OpKind {
     Insert,
 }
 
-/// Paint per-row backgrounds (Equal / Delete / Insert / Moved) and
-/// sub-line span highlights for one pane.
-///
-/// `widget_rect = [x0, y0, x1, y1]` is the screen-space rect of the
-/// pane's text content (just the input_text_multiline, not including
-/// the gutter). `scroll_y` is the pane's vertical scroll.
-pub(super) fn paint_row_overlays(
-    ui: &Ui,
-    widget_rect: [f32; 4],
-    hunks: &[Hunk],
-    side: Side,
-    scroll_y: f32,
-    hover_out: &Cell<Option<(u32, [f32; 2])>>,
-) {
-    let dl = ui.get_window_draw_list();
-    let lh = line_h();
-    let widget_top = widget_rect[1];
-    let widget_bottom = widget_rect[3];
-    let widget_h = widget_bottom - widget_top;
-    if widget_h <= 0.0 || lh <= 0.0 {
-        return;
-    }
-
-    let first_line = (scroll_y / lh).floor() as u32 + 1;
-    let last_line = ((scroll_y + widget_h) / lh).ceil() as u32 + 1;
-
-    // Approximate monospace char width for sub-line span x-offsets.
-    let char_w = ui.calc_text_size("m")[0].max(1.0);
-
-    for h in hunks {
-        let range = match side {
-            Side::Left => h.a_range,
-            Side::Right => h.b_range,
-        };
-        if range == (0, 0) {
-            continue;
-        }
-        if range.1 < first_line || range.0 > last_line {
-            continue;
-        }
-
-        for op in &h.ops {
-            let (ln, op_kind, move_id, spans): (u32, OpKind, Option<u32>, Option<&Vec<SubSpan>>) =
-                match (side, op) {
-                    (Side::Left, DiffOp::Equal { a, .. }) => (*a, OpKind::Equal, None, None),
-                    (Side::Left, DiffOp::Delete { a, move_id, spans, .. }) => {
-                        (*a, OpKind::Delete, *move_id, spans.as_ref())
-                    }
-                    (Side::Right, DiffOp::Equal { b, .. }) => (*b, OpKind::Equal, None, None),
-                    (Side::Right, DiffOp::Insert { b, move_id, spans, .. }) => {
-                        (*b, OpKind::Insert, *move_id, spans.as_ref())
-                    }
-                    _ => continue,
-                };
-            if ln < first_line || ln > last_line {
-                continue;
-            }
-            let y = line_screen_y(widget_top, ln, scroll_y, lh);
-
-            // Background
-            let bg = if move_id.is_some() {
-                Some(theme::with_alpha(theme::PEACH, 0.30))
-            } else {
-                match op_kind {
-                    OpKind::Equal => None,
-                    OpKind::Delete => Some([0.55, 0.18, 0.18, 0.30]),
-                    OpKind::Insert => Some([0.18, 0.50, 0.22, 0.30]),
-                }
-            };
-            if let Some(color) = bg {
-                let y0 = y.max(widget_top);
-                let y1 = (y + lh).min(widget_bottom);
-                if y1 > y0 {
-                    dl.add_rect(
-                        [widget_rect[0], y0],
-                        [widget_rect[2], y1],
-                        color,
-                    )
-                    .filled(true)
-                    .build();
-                }
-            }
-
-            // Sub-line spans — paint Changed spans with a stronger tint.
-            if let Some(spans) = spans {
-                let span_color = match op_kind {
-                    OpKind::Delete => [0.75, 0.20, 0.20, 0.45],
-                    OpKind::Insert => [0.20, 0.65, 0.25, 0.45],
-                    OpKind::Equal => continue,
-                };
-                let y0 = y.max(widget_top);
-                let y1 = (y + lh).min(widget_bottom);
-                if y1 <= y0 {
-                    continue;
-                }
-                for sp in spans {
-                    if !matches!(sp.kind, SubSpanKind::Changed) {
-                        continue;
-                    }
-                    if sp.end <= sp.start {
-                        continue;
-                    }
-                    // Approximate: monospace byte→pixel. Good enough for
-                    // ASCII-heavy code; multi-byte UTF-8 will be slightly off.
-                    let x0 = widget_rect[0] + char_w * sp.start as f32;
-                    let x1 = widget_rect[0] + char_w * sp.end as f32;
-                    let x0c = x0.max(widget_rect[0]).min(widget_rect[2]);
-                    let x1c = x1.max(widget_rect[0]).min(widget_rect[2]);
-                    if x1c > x0c {
-                        dl.add_rect([x0c, y0], [x1c, y1], span_color)
-                            .filled(true)
-                            .build();
-                    }
-                }
-            }
-        }
-    }
-
-    // Hover detection: is the mouse over a row inside this widget that
-    // belongs to a change hunk on this side?
-    let mouse_pos = ui.io().mouse_pos;
-    let mx = mouse_pos[0];
-    let my = mouse_pos[1];
-    if mx >= widget_rect[0]
-        && mx <= widget_rect[2]
-        && my >= widget_top
-        && my <= widget_bottom
-    {
-        let line = mouse_y_to_line(my, widget_top, scroll_y, lh);
-        for h in hunks {
-            if !is_change_hunk(h) {
-                continue;
-            }
-            let range = match side {
-                Side::Left => h.a_range,
-                Side::Right => h.b_range,
-            };
-            if range == (0, 0) {
-                continue;
-            }
-            if line >= range.0 && line <= range.1 {
-                let anchor_y = line_screen_y(widget_top, range.0, scroll_y, lh)
-                    .max(widget_top);
-                hover_out.set(Some((h.id, [widget_rect[0], anchor_y])));
-                break;
-            }
-        }
-    }
-}
 
 /// Hover control panel anchored to the top-left of the hovered hunk.
 pub(super) fn draw_control_overlay(

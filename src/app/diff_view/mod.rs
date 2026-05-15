@@ -287,6 +287,9 @@ fn render_pane(
         widget_pos[1] + pane_h,
     ];
 
+    let caret_byte: Cell<i32> = Cell::new(-1);
+    let widget_active: Cell<bool> = Cell::new(false);
+
     ui.child_window(&child_id)
         .size([widget_w, pane_h])
         .scroll_bar(true)
@@ -296,10 +299,28 @@ fn render_pane(
                     Side::Left => &mut state.a_buf,
                     Side::Right => &mut state.b_buf,
                 };
+
+                // Suppress imgui's own FrameBg + Text rendering. We paint
+                // everything ourselves on the foreground draw list. Keep
+                // TextSelectedBg visible (selection rect still useful).
+                let _frame_bg = ui.push_style_color(imgui::StyleColor::FrameBg, [0.0, 0.0, 0.0, 0.0]);
+                let _frame_bg_hov = ui.push_style_color(imgui::StyleColor::FrameBgHovered, [0.0, 0.0, 0.0, 0.0]);
+                let _frame_bg_act = ui.push_style_color(imgui::StyleColor::FrameBgActive, [0.0, 0.0, 0.0, 0.0]);
+                let _text_color = ui.push_style_color(imgui::StyleColor::Text, [0.0, 0.0, 0.0, 0.0]);
+
+                struct CaretCapture<'a> { out: &'a Cell<i32> }
+                impl<'a> imgui::InputTextCallbackHandler for CaretCapture<'a> {
+                    fn on_always(&mut self, data: imgui::TextCallbackData) {
+                        self.out.set(data.cursor_pos() as i32);
+                    }
+                }
+
                 let changed = ui
                     .input_text_multiline(&widget_id, buf, [widget_w, content_h])
                     .no_undo_redo(true)
+                    .callback(imgui::InputTextMultilineCallback::ALWAYS, CaretCapture { out: &caret_byte })
                     .build();
+                widget_active.set(ui.is_item_active());
                 // Read scroll AFTER build() so input events (including scroll)
                 // have been processed.
                 scroll_y_out = ui.scroll_y();
@@ -320,15 +341,24 @@ fn render_pane(
             }
             let _ = changed;
 
-            // Paint overlays on top of the widget.
-            overlay::paint_row_overlays(ui, widget_rect, hunks, side, scroll_y_out, hover_out);
-
-            // Paint syntax-highlighted text over imgui's monochrome text.
+            // Paint everything (row bg, sub-line spans, syntax text, caret)
+            // on the foreground draw list ourselves.
             let buf_for_paint: &str = match side {
                 Side::Left => &state.a_buf,
                 Side::Right => &state.b_buf,
             };
-            overlay::paint_syntax_text(ui, widget_rect, buf_for_paint, highlights, scroll_y_out);
+            overlay::paint_pane_text(
+                ui,
+                widget_rect,
+                buf_for_paint,
+                highlights,
+                hunks,
+                side,
+                scroll_y_out,
+                caret_byte.get(),
+                widget_active.get(),
+                hover_out,
+            );
         });
 
     (widget_rect, scroll_y_out)

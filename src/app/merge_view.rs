@@ -330,6 +330,8 @@ fn render_pane(
 
     let mut scroll_y_out: f32 = 0.0;
     let mut origin_out: [f32; 2] = widget_pos;
+    let caret_byte: Cell<i32> = Cell::new(-1);
+    let widget_active: Cell<bool> = Cell::new(false);
 
     ui.child_window(&child_id)
         .size([widget_w, pane_h])
@@ -344,10 +346,27 @@ fn render_pane(
             // ItemSpacing zero so the input_text grows exactly content_h
             // (the multiline widget uses Item* style vars internally).
             let _spacing = ui.push_style_var(StyleVar::ItemSpacing([0.0, 0.0]));
+
+            // Suppress imgui's own FrameBg + Text rendering — we paint
+            // everything (row tints, text, caret) on the foreground draw list.
+            let _frame_bg = ui.push_style_color(imgui::StyleColor::FrameBg, [0.0, 0.0, 0.0, 0.0]);
+            let _frame_bg_hov = ui.push_style_color(imgui::StyleColor::FrameBgHovered, [0.0, 0.0, 0.0, 0.0]);
+            let _frame_bg_act = ui.push_style_color(imgui::StyleColor::FrameBgActive, [0.0, 0.0, 0.0, 0.0]);
+            let _text_color = ui.push_style_color(imgui::StyleColor::Text, [0.0, 0.0, 0.0, 0.0]);
+
+            struct CaretCapture<'a> { out: &'a Cell<i32> }
+            impl<'a> imgui::InputTextCallbackHandler for CaretCapture<'a> {
+                fn on_always(&mut self, data: imgui::TextCallbackData) {
+                    self.out.set(data.cursor_pos() as i32);
+                }
+            }
+
             let changed = ui
                 .input_text_multiline(&widget_id, buf, [widget_w, content_h])
                 .no_undo_redo(true)
+                .callback(imgui::InputTextMultilineCallback::ALWAYS, CaretCapture { out: &caret_byte })
                 .build();
+            widget_active.set(ui.is_item_active());
             if ui.is_item_active() {
                 focus_event.set(Some(pane.as_focused_pane()));
             }
@@ -367,7 +386,21 @@ fn render_pane(
                 });
             }
 
-            paint_row_overlays(ui, widget_rect, layout, pane, scroll_y_out, hover_out);
+            let buf_for_paint: &str = match pane {
+                Pane::Base => &state.base_buf,
+                Pane::Local => &state.local_buf,
+                Pane::Remote => &state.remote_buf,
+            };
+            paint_pane_text(
+                ui,
+                widget_rect,
+                buf_for_paint,
+                layout,
+                scroll_y_out,
+                caret_byte.get(),
+                widget_active.get(),
+                hover_out,
+            );
         });
 
     // Gutter on the left of this pane (line numbers).
@@ -405,69 +438,137 @@ fn paint_gutter(
     }
 }
 
-/// Paint per-row hunk backgrounds and detect hover for the resolution
-/// overlay. Mirrors `diff_view::overlay::paint_row_overlays` adapted to
-/// MergeHunk's pane-specific row ranges.
-fn paint_row_overlays(
+/// Paint everything for one merge pane on the foreground draw list:
+/// row tints (LocalOnly/RemoteOnly/Conflict), text, caret. Also detects
+/// hover for the resolution overlay panel.
+#[allow(clippy::too_many_arguments)]
+fn paint_pane_text(
     ui: &Ui,
     widget_rect: [f32; 4],
+    buf: &str,
     layout: &PaneLayout,
-    _pane: Pane,
     scroll_y: f32,
+    caret_byte: i32,
+    widget_active: bool,
     hover_out: &Cell<Option<(u32, HunkKind, [f32; 2])>>,
 ) {
-    let dl = ui.get_window_draw_list();
     let lh = row_h();
     let widget_top = widget_rect[1];
     let widget_bottom = widget_rect[3];
+    let widget_left = widget_rect[0];
+    let widget_right = widget_rect[2];
     let widget_h = widget_bottom - widget_top;
     if widget_h <= 0.0 || lh <= 0.0 {
         return;
     }
+
+    let style = ui.clone_style();
+    let padding_x = style.frame_padding[0];
+    let padding_y = style.frame_padding[1];
+
     let first_line = (scroll_y / lh).floor() as u32 + 1;
     let last_line = ((scroll_y + widget_h) / lh).ceil() as u32 + 1;
 
-    for (_id, kind, lo, hi) in &layout.hunks {
-        let Some(kind_v) = *kind else { continue };
-        if *hi < first_line || *lo > last_line {
-            continue;
-        }
-        let bg = match kind_v {
-            HunkKind::LocalOnly => theme::with_alpha(theme::BLUE, 0.22),
-            HunkKind::RemoteOnly => theme::with_alpha(theme::MAUVE, 0.22),
-            HunkKind::Conflict => theme::with_alpha(theme::PEACH, 0.30),
-        };
-        for ln in *lo..=*hi {
-            let y = widget_top + (ln as f32 - 1.0) * lh - scroll_y;
-            let y0 = y.max(widget_top);
-            let y1 = (y + lh).min(widget_bottom);
-            if y1 > y0 {
-                dl.add_rect([widget_rect[0], y0], [widget_rect[2], y1], bg)
-                    .filled(true)
-                    .build();
+    // Build a fast line-no -> tint lookup for visible lines.
+    let tint_for_line = |ln: u32| -> Option<[f32; 4]> {
+        for (_id, kind, lo, hi) in &layout.hunks {
+            let Some(kind_v) = *kind else { continue };
+            if ln >= *lo && ln <= *hi {
+                return Some(match kind_v {
+                    HunkKind::LocalOnly => theme::with_alpha(theme::BLUE, 0.22),
+                    HunkKind::RemoteOnly => theme::with_alpha(theme::MAUVE, 0.22),
+                    HunkKind::Conflict => theme::with_alpha(theme::PEACH, 0.30),
+                });
             }
         }
-    }
+        None
+    };
 
-    // Hover → set overlay anchor at the top-left of the hunk's first
-    // visible row, clamped to the widget top.
+    let dl = ui.get_foreground_draw_list();
+    dl.with_clip_rect([widget_left, widget_top], [widget_right, widget_bottom], || {
+        for (line_idx, line_text) in buf.lines().enumerate() {
+            let ln = (line_idx as u32) + 1;
+            if ln < first_line || ln > last_line {
+                continue;
+            }
+            let y = widget_top + (ln as f32 - 1.0) * lh - scroll_y;
+            if y + lh < widget_top || y > widget_bottom {
+                continue;
+            }
+            let y0 = y.max(widget_top);
+            let y1 = (y + lh).min(widget_bottom);
+
+            if let Some(bg) = tint_for_line(ln) {
+                if y1 > y0 {
+                    dl.add_rect([widget_left, y0], [widget_right, y1], bg)
+                        .filled(true)
+                        .build();
+                }
+            }
+
+            if !line_text.is_empty() {
+                dl.add_text(
+                    [widget_left + padding_x, y + padding_y],
+                    theme::TEXT,
+                    line_text,
+                );
+            }
+        }
+
+        if widget_active && caret_byte >= 0 {
+            let blink_on = (ui.time() * 2.0).rem_euclid(2.0) < 1.0;
+            if blink_on {
+                let target = caret_byte as usize;
+                let mut byte_acc: usize = 0;
+                let mut painted = false;
+                for (line_idx, line_text) in buf.lines().enumerate() {
+                    let line_end = byte_acc + line_text.len();
+                    if target >= byte_acc && target <= line_end {
+                        let local = target - byte_acc;
+                        let clamped = local.min(line_text.len());
+                        let mut snap = clamped;
+                        while snap > 0 && !line_text.is_char_boundary(snap) {
+                            snap -= 1;
+                        }
+                        let x = widget_left + padding_x + ui.calc_text_size(&line_text[..snap])[0];
+                        let y = widget_top + (line_idx as f32) * lh - scroll_y;
+                        if y + lh >= widget_top && y <= widget_bottom {
+                            dl.add_line([x, y + 1.0], [x, y + lh - 1.0], theme::TEXT)
+                                .thickness(1.0)
+                                .build();
+                        }
+                        painted = true;
+                        break;
+                    }
+                    byte_acc = line_end + 1;
+                }
+                if !painted && target >= byte_acc {
+                    let line_idx = buf.lines().count();
+                    let x = widget_left + padding_x;
+                    let y = widget_top + (line_idx as f32) * lh - scroll_y;
+                    if y + lh >= widget_top && y <= widget_bottom {
+                        dl.add_line([x, y + 1.0], [x, y + lh - 1.0], theme::TEXT)
+                            .thickness(1.0)
+                            .build();
+                    }
+                }
+            }
+        }
+    });
+
+    // Hover detection.
     let mouse_pos = ui.io().mouse_pos;
     let mx = mouse_pos[0];
     let my = mouse_pos[1];
-    if mx >= widget_rect[0]
-        && mx <= widget_rect[2]
-        && my >= widget_top
-        && my <= widget_bottom
-    {
+    if mx >= widget_left && mx <= widget_right && my >= widget_top && my <= widget_bottom {
         let content_y = (my - widget_top) + scroll_y;
         let line = (content_y / lh).floor() as i64;
         let line = line.max(0) as u32 + 1;
         for (hid, kind, lo, hi) in &layout.hunks {
             let Some(kind_v) = *kind else { continue };
             if line >= *lo && line <= *hi {
-                let anchor_y = (widget_top + (*lo as f32 - 1.0) * lh - scroll_y)
-                    .max(widget_top);
-                hover_out.set(Some((*hid, kind_v, [widget_rect[0], anchor_y])));
+                let anchor_y = (widget_top + (*lo as f32 - 1.0) * lh - scroll_y).max(widget_top);
+                hover_out.set(Some((*hid, kind_v, [widget_left, anchor_y])));
                 break;
             }
         }
