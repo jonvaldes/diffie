@@ -86,7 +86,13 @@ pub(super) fn paint_syntax_text(
     if highlights.is_empty() {
         return;
     }
-    let dl = ui.get_window_draw_list();
+    // Use the foreground draw list so our colored text paints on top of
+    // imgui's monochrome text. The multiline widget renders its text into
+    // its own internal child-window draw list, which composites on top of
+    // the parent window's draw list — so painting on the window draw list
+    // puts colored text *under* the widget's text and it becomes invisible.
+    // The foreground draw list is composited last, after all widgets.
+    let dl = ui.get_foreground_draw_list();
     let lh = line_h();
     let widget_top = widget_rect[1];
     let widget_bottom = widget_rect[3];
@@ -100,45 +106,53 @@ pub(super) fn paint_syntax_text(
     let first_line = (scroll_y / lh).floor() as u32 + 1;
     let last_line = ((scroll_y + widget_h) / lh).ceil() as u32 + 1;
 
-    for (line_idx, line_text) in buf.lines().enumerate() {
-        let ln = line_idx as u32 + 1;
-        if ln < first_line || ln > last_line {
-            continue;
-        }
-        let Some(line_spans) = highlights.get(line_idx) else {
-            continue;
-        };
-        if line_spans.is_empty() {
-            continue;
-        }
-        let y = line_screen_y(widget_top, ln, scroll_y, lh);
-        if y + lh < widget_top || y > widget_bottom {
-            continue;
-        }
-        // Walk chars and pick each span's slice. start_col/end_col are
-        // CHAR indices; convert to byte ranges by walking char indices.
-        let chars: Vec<(usize, char)> = line_text.char_indices().collect();
-        for span in line_spans {
-            if span.end_col <= span.start_col {
-                continue;
+    // Clip to the widget rect so colored text doesn't bleed outside the
+    // scrollable area when content is scrolled.
+    dl.with_clip_rect(
+        [widget_rect[0], widget_rect[1]],
+        [widget_rect[2], widget_rect[3]],
+        || {
+            for (line_idx, line_text) in buf.lines().enumerate() {
+                let ln = line_idx as u32 + 1;
+                if ln < first_line || ln > last_line {
+                    continue;
+                }
+                let Some(line_spans) = highlights.get(line_idx) else {
+                    continue;
+                };
+                if line_spans.is_empty() {
+                    continue;
+                }
+                let y = line_screen_y(widget_top, ln, scroll_y, lh);
+                if y + lh < widget_top || y > widget_bottom {
+                    continue;
+                }
+                // Walk chars and pick each span's slice. start_col/end_col are
+                // CHAR indices; convert to byte ranges by walking char indices.
+                let chars: Vec<(usize, char)> = line_text.char_indices().collect();
+                for span in line_spans {
+                    if span.end_col <= span.start_col {
+                        continue;
+                    }
+                    if span.start_col >= chars.len() {
+                        continue;
+                    }
+                    let start_byte = chars[span.start_col].0;
+                    let end_byte = if span.end_col >= chars.len() {
+                        line_text.len()
+                    } else {
+                        chars[span.end_col].0
+                    };
+                    if end_byte <= start_byte {
+                        continue;
+                    }
+                    let slice = &line_text[start_byte..end_byte];
+                    let x = text_x0 + (span.start_col as f32) * char_w;
+                    dl.add_text([x, y + 2.0], span.kind.color(), slice);
+                }
             }
-            if span.start_col >= chars.len() {
-                continue;
-            }
-            let start_byte = chars[span.start_col].0;
-            let end_byte = if span.end_col >= chars.len() {
-                line_text.len()
-            } else {
-                chars[span.end_col].0
-            };
-            if end_byte <= start_byte {
-                continue;
-            }
-            let slice = &line_text[start_byte..end_byte];
-            let x = text_x0 + (span.start_col as f32) * char_w;
-            dl.add_text([x, y + 2.0], span.kind.color(), slice);
-        }
-    }
+        },
+    );
 }
 
 // ---------------------------- bezier connector ------------------------------
