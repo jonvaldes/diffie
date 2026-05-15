@@ -25,7 +25,21 @@ pub enum SyntaxKind {
     Function,
     Preproc,
     Constant,
+    /// Matched bracket pair colored by nesting depth (`d % BRACKET_PALETTE.len()`).
+    Bracket(u8),
 }
+
+/// Rainbow palette for nested brackets. Walks the hue wheel so adjacent
+/// depths are easy to tell apart.
+const BRACKET_PALETTE: [[f32; 4]; 7] = [
+    theme::YELLOW,
+    theme::MAUVE,
+    theme::SKY,
+    theme::PEACH,
+    theme::GREEN,
+    theme::PINK,
+    theme::TEAL,
+];
 
 impl SyntaxKind {
     pub fn color(self) -> [f32; 4] {
@@ -38,6 +52,10 @@ impl SyntaxKind {
             SyntaxKind::Function => theme::BLUE,
             SyntaxKind::Preproc => theme::PINK,
             SyntaxKind::Constant => theme::PEACH,
+            SyntaxKind::Bracket(d) => {
+                let c = BRACKET_PALETTE[(d as usize) % BRACKET_PALETTE.len()];
+                boost_saturation(c, 1.25)
+            }
         }
     }
 }
@@ -81,9 +99,22 @@ impl ColorTable {
             Some(SyntaxKind::Function) => self.function,
             Some(SyntaxKind::Preproc) => self.preproc,
             Some(SyntaxKind::Constant) => self.constant,
+            Some(SyntaxKind::Bracket(d)) => SyntaxKind::Bracket(d).color(),
             None => self.default,
         }
     }
+}
+
+/// Scale a color's distance from its luma (Rec. 601 weights) by `factor` —
+/// `>1.0` boosts saturation, `<1.0` desaturates. Channels clamp to [0, 1].
+fn boost_saturation(c: [f32; 4], factor: f32) -> [f32; 4] {
+    let luma = 0.299 * c[0] + 0.587 * c[1] + 0.114 * c[2];
+    [
+        (luma + (c[0] - luma) * factor).clamp(0.0, 1.0),
+        (luma + (c[1] - luma) * factor).clamp(0.0, 1.0),
+        (luma + (c[2] - luma) * factor).clamp(0.0, 1.0),
+        c[3],
+    ]
 }
 
 /// sRGB → linear conversion (per-channel gamma decode).
@@ -487,8 +518,11 @@ impl HighlightCache {
         let bytes = source.as_bytes();
         let line_starts = compute_line_starts(bytes);
         let mut out: Vec<LineSpans> = (0..lines.len()).map(|_| Vec::new()).collect();
+        let mut masked: Vec<(usize, usize)> = Vec::new();
         let mut cursor = tree.walk();
-        walk(&mut cursor, &mut out, &line_starts, bytes);
+        walk(&mut cursor, &mut out, &mut masked, &line_starts, bytes);
+        masked.sort_by_key(|r| r.0);
+        augment_with_brackets(bytes, &masked, &line_starts, &mut out);
         // Sort each line's spans by start_col so painters can scan left-right.
         for l in &mut out {
             l.sort_by_key(|s| s.start_col);
@@ -520,6 +554,7 @@ fn compute_line_starts(bytes: &[u8]) -> Vec<usize> {
 fn walk(
     cursor: &mut tree_sitter::TreeCursor<'_>,
     out: &mut [LineSpans],
+    masked: &mut Vec<(usize, usize)>,
     line_starts: &[usize],
     bytes: &[u8],
 ) {
@@ -533,18 +568,72 @@ fn walk(
             line_starts,
             bytes,
         );
+        if matches!(kind, SyntaxKind::String | SyntaxKind::Comment) {
+            masked.push((node.start_byte(), node.end_byte()));
+        }
         if atomic {
             return;
         }
     }
     if cursor.goto_first_child() {
         loop {
-            walk(cursor, out, line_starts, bytes);
+            walk(cursor, out, masked, line_starts, bytes);
             if !cursor.goto_next_sibling() {
                 break;
             }
         }
         cursor.goto_parent();
+    }
+}
+
+/// Scan source bytes for `()`/`[]`/`{}` outside string/comment ranges and
+/// emit one `Bracket(depth)` span per bracket. Depth is shared across all
+/// bracket flavors. Closers decrement first so the closer paints the same
+/// color as its opener.
+fn augment_with_brackets(
+    bytes: &[u8],
+    masked: &[(usize, usize)],
+    line_starts: &[usize],
+    out: &mut [LineSpans],
+) {
+    let palette_len = BRACKET_PALETTE.len();
+    let mut depth: i32 = 0;
+    let mut mi = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        while mi < masked.len() && masked[mi].1 <= i {
+            mi += 1;
+        }
+        if mi < masked.len() && i >= masked[mi].0 && i < masked[mi].1 {
+            i = masked[mi].1;
+            continue;
+        }
+        let b = bytes[i];
+        match b {
+            b'(' | b'[' | b'{' => {
+                let d = (depth.max(0) as usize) % palette_len;
+                emit_bracket(i, d as u8, line_starts, bytes, out);
+                depth += 1;
+            }
+            b')' | b']' | b'}' => {
+                depth -= 1;
+                let d = (depth.max(0) as usize) % palette_len;
+                emit_bracket(i, d as u8, line_starts, bytes, out);
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+}
+
+fn emit_bracket(byte: usize, d: u8, line_starts: &[usize], bytes: &[u8], out: &mut [LineSpans]) {
+    let (line, col) = byte_to_line_col(byte, line_starts, bytes);
+    if line < out.len() {
+        out[line].push(LineSpan {
+            start_col: col,
+            end_col: col + 1,
+            kind: SyntaxKind::Bracket(d),
+        });
     }
 }
 
