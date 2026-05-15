@@ -3,6 +3,8 @@
 // The GUI feature pulls in winit + wgpu + imgui. Without it the binary still
 // builds (useful for CI / quick syntax checks) but just prints a notice.
 
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 #[cfg(feature = "gui")]
 fn main() {
     use std::path::PathBuf;
