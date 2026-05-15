@@ -38,6 +38,55 @@ const SCROLL_SNAP_EPSILON: f32 = 0.5;
 
 use super::undo_stack::DiffEdit;
 
+/// Max line pixel width across `buf` under the active imgui font.
+/// Used to size the inner multiline wide enough that no internal
+/// horizontal caret-tracking kicks in.
+fn compute_max_line_w(ui: &Ui, buf: &str) -> f32 {
+    let mut max = 0.0_f32;
+    for line in buf.lines() {
+        let w = ui.calc_text_size(line)[0];
+        if w > max {
+            max = w;
+        }
+    }
+    max
+}
+
+/// Pixel x of the caret inside the inner multiline (= padding_x +
+/// width-of-prefix on the caret's line). Walks the buffer by lines to
+/// locate the caret; returns `padding_x` if the byte offset is out of
+/// range.
+pub(crate) fn caret_x_in_inner(buf: &str, caret_byte: usize, ui: &Ui, padding_x: f32) -> f32 {
+    let mut byte_acc: usize = 0;
+    for line_text in buf.lines() {
+        let line_end = byte_acc + line_text.len();
+        if caret_byte >= byte_acc && caret_byte <= line_end {
+            let local = caret_byte - byte_acc;
+            let mut snap = local.min(line_text.len());
+            while snap > 0 && !line_text.is_char_boundary(snap) {
+                snap -= 1;
+            }
+            return padding_x + ui.calc_text_size(&line_text[..snap])[0];
+        }
+        byte_acc = line_end + 1; // +1 for '\n'
+    }
+    padding_x
+}
+
+/// Given the caret's pixel-x and the visible viewport `[scroll_x, scroll_x + view_w]`,
+/// return the scroll_x that keeps the caret inside the viewport with `margin`
+/// pixels of slack on each side. Returns `scroll_x` unchanged if the caret is
+/// already comfortably inside.
+pub(crate) fn track_caret_scroll_x(caret_x: f32, scroll_x: f32, view_w: f32, margin: f32) -> f32 {
+    if caret_x < scroll_x + margin {
+        (caret_x - margin).max(0.0)
+    } else if caret_x > scroll_x + view_w - margin {
+        caret_x - view_w + margin
+    } else {
+        scroll_x
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn render(
     ui: &Ui,
@@ -61,10 +110,12 @@ pub fn render(
     let SessionMode::TwoWay { a_text, b_text, .. } = &snap.mode else {
         return;
     };
-    if state.a_buf != *a_text {
+    let a_changed = state.a_buf != *a_text;
+    if a_changed {
         state.a_buf = a_text.clone();
     }
-    if state.b_buf != *b_text {
+    let b_changed = state.b_buf != *b_text;
+    if b_changed {
         state.b_buf = b_text.clone();
     }
 
@@ -83,6 +134,17 @@ pub fn render(
     // all overlay positioning so our draw-list text aligns with what
     // input_text_multiline renders.
     let lh = ui.text_line_height();
+
+    // Recompute max line widths under the active mono font when the
+    // buffer changes. Used to size the inner multiline wide enough that
+    // imgui's own horizontal caret-tracking never triggers — the outer
+    // scroll wrapper handles user-facing horizontal scrolling.
+    if a_changed {
+        state.a_max_line_w = compute_max_line_w(ui, &state.a_buf);
+    }
+    if b_changed {
+        state.b_max_line_w = compute_max_line_w(ui, &state.b_buf);
+    }
 
     // Consume any pending jump set by last frame's hover overlay (↕ button).
     // Translates `pending_jump` into a centered scroll on the target pane.
@@ -310,13 +372,26 @@ fn render_pane(
         Side::Left => state.last_left_scroll_y,
         Side::Right => state.last_right_scroll_y,
     };
-    let wheel = if ui.is_mouse_hovering_rect(
+    // Split wheel into vertical (smooth, smooth-eased into the inner
+    // multiline) and horizontal (pinned onto the outer scroll child).
+    // Imgui's own UpdateMouseWheel only operates on the topmost hovered
+    // window — that's usually the inner multiline's child, which can't
+    // scroll horizontally — so we have to drive the outer scroll
+    // ourselves rather than relying on imgui to bubble the wheel.
+    let hovered = ui.is_mouse_hovering_rect(
         [widget_pos[0], widget_pos[1]],
         [widget_pos[0] + widget_w, widget_pos[1] + pane_h],
-    ) {
-        ui.io().mouse_wheel
+    );
+    let (wheel, h_wheel) = if hovered {
+        let raw_v = ui.io().mouse_wheel;
+        let raw_h = ui.io().mouse_wheel_h;
+        if ui.io().key_shift && raw_v != 0.0 {
+            (0.0, raw_h + raw_v)
+        } else {
+            (raw_v, raw_h)
+        }
     } else {
-        0.0
+        (0.0, 0.0)
     };
     // Compute this frame's *target*. Pending (sync / jump) overrides; otherwise
     // mouse wheel deflects from the previous target so multiple wheel ticks
@@ -343,64 +418,155 @@ fn render_pane(
     }
     let own_scroll = displayed;
 
-    // Pin the widget's internal child scroll to our value every frame so
-    // the rendered text aligns with our overlay. The widget IS the next
-    // window for purposes of igSetNextWindowScroll.
-    unsafe {
-        imgui::sys::igSetNextWindowScroll(imgui::sys::ImVec2 {
-            x: -1.0,
-            y: own_scroll,
-        });
-    }
+    // Wrap the input_text_multiline in our own outer child window with
+    // HORIZONTAL_SCROLLBAR enabled. The inner multiline is sized to
+    // the content's max line width so its own internal caret-tracking
+    // scroll never kicks in; the outer child is what the user actually
+    // scrolls horizontally (shift+wheel, scrollbar drag). Imgui handles
+    // it natively — we just read scroll_x back for overlay alignment.
+    let max_line_w = match side {
+        Side::Left => state.a_max_line_w,
+        Side::Right => state.b_max_line_w,
+    };
+    let style = ui.clone_style();
+    let inner_w = (max_line_w + style.frame_padding[0] * 2.0 + 8.0).max(widget_w);
 
     ui.set_cursor_screen_pos(widget_pos);
 
     let widget_id = format!("##diffie_pane_{:?}_e{}", side, state.input_epoch);
+    let outer_id = format!("##diffie_pane_outer_{:?}_e{}", side, state.input_epoch);
 
     let caret_byte: Cell<i32> = Cell::new(-1);
-    let (changed, buf_clone) = {
-        let buf = match side {
+    let scroll_x_cell: Cell<f32> = Cell::new(match side {
+        Side::Left => state.last_left_scroll_x,
+        Side::Right => state.last_right_scroll_x,
+    });
+    let widget_active_cell: Cell<bool> = Cell::new(false);
+    let new_buf_cell: Cell<Option<String>> = Cell::new(None);
+
+    // Outer child uses zero window padding so the inner multiline's own
+    // frame_padding is the only inset we have to account for in the
+    // overlay painter.
+    // Compute next horizontal scroll for the OUTER child and pin it.
+    // Imgui clamps to [0, ScrollMax.x] internally; the post-clamp value
+    // is read back via igGetScrollX inside the closure.
+    let char_step_x = ui.calc_text_size("m")[0].max(1.0);
+    let prev_scroll_x = match side {
+        Side::Left => state.last_left_scroll_x,
+        Side::Right => state.last_right_scroll_x,
+    };
+    let target_scroll_x =
+        (prev_scroll_x - h_wheel * char_step_x * SCROLL_LINES_PER_WHEEL_TICK).max(0.0);
+    unsafe {
+        imgui::sys::igSetNextWindowScroll(imgui::sys::ImVec2 {
+            x: target_scroll_x,
+            y: -1.0,
+        });
+    }
+
+    let _wp = ui.push_style_var(imgui::StyleVar::WindowPadding([0.0, 0.0]));
+    {
+        let buf: &mut String = match side {
             Side::Left => &mut state.a_buf,
             Side::Right => &mut state.b_buf,
         };
+        ui.child_window(&outer_id)
+            .size([widget_w, pane_h])
+            .horizontal_scrollbar(true)
+            .build(|| {
+                // Pin the inner multiline's vertical scroll to our eased
+                // value. `-1` for x means "leave alone" — the inner's
+                // scroll_x stays at 0 because the inner is sized to the
+                // full content width.
+                unsafe {
+                    imgui::sys::igSetNextWindowScroll(imgui::sys::ImVec2 {
+                        x: -1.0,
+                        y: own_scroll,
+                    });
+                }
 
-        // Suppress imgui's own FrameBg + Text rendering. We paint
-        // everything ourselves on the foreground draw list. Keep
-        // TextSelectedBg visible (selection rect still useful).
-        let _frame_bg = ui.push_style_color(imgui::StyleColor::FrameBg, [0.0, 0.0, 0.0, 0.0]);
-        let _frame_bg_hov = ui.push_style_color(imgui::StyleColor::FrameBgHovered, [0.0, 0.0, 0.0, 0.0]);
-        let _frame_bg_act = ui.push_style_color(imgui::StyleColor::FrameBgActive, [0.0, 0.0, 0.0, 0.0]);
-        let _text_color = ui.push_style_color(imgui::StyleColor::Text, [0.0, 0.0, 0.0, 0.0]);
+                // Suppress imgui's own FrameBg + Text rendering. We paint
+                // everything ourselves on the foreground draw list.
+                let _frame_bg = ui.push_style_color(imgui::StyleColor::FrameBg, [0.0, 0.0, 0.0, 0.0]);
+                let _frame_bg_hov = ui.push_style_color(imgui::StyleColor::FrameBgHovered, [0.0, 0.0, 0.0, 0.0]);
+                let _frame_bg_act = ui.push_style_color(imgui::StyleColor::FrameBgActive, [0.0, 0.0, 0.0, 0.0]);
+                let _text_color = ui.push_style_color(imgui::StyleColor::Text, [0.0, 0.0, 0.0, 0.0]);
 
-        // Callback only captures the caret while the widget is active.
-        // (CallbackAlways only fires when ActiveId matches the widget id.)
-        struct CaretCapture<'a> {
-            cursor: &'a Cell<i32>,
-        }
-        impl<'a> imgui::InputTextCallbackHandler for CaretCapture<'a> {
-            fn on_always(&mut self, data: imgui::TextCallbackData) {
-                self.cursor.set(data.cursor_pos() as i32);
-            }
-        }
+                struct CaretCapture<'a> {
+                    cursor: &'a Cell<i32>,
+                }
+                impl<'a> imgui::InputTextCallbackHandler for CaretCapture<'a> {
+                    fn on_always(&mut self, data: imgui::TextCallbackData) {
+                        self.cursor.set(data.cursor_pos() as i32);
+                    }
+                }
 
-        let changed = ui
-            .input_text_multiline(&widget_id, buf, [widget_w, pane_h])
-            .no_undo_redo(true)
-            .callback(
-                imgui::InputTextMultilineCallback::ALWAYS,
-                CaretCapture { cursor: &caret_byte },
-            )
-            .build();
-        // Allow widgets submitted later this frame (the hover-control
-        // overlay panel) to win hover/click over this input_text_multiline
-        // even though they're drawn on top of it.
-        ui.set_item_allow_overlap();
-        let widget_active = ui.is_item_active();
-        let clone = if changed { Some(buf.clone()) } else { None };
-        (changed, (clone, widget_active))
-    };
-    let (buf_clone, widget_active) = buf_clone;
+                let changed = ui
+                    .input_text_multiline(&widget_id, buf, [inner_w, pane_h])
+                    .no_undo_redo(true)
+                    .callback(
+                        imgui::InputTextMultilineCallback::ALWAYS,
+                        CaretCapture { cursor: &caret_byte },
+                    )
+                    .build();
+                ui.set_item_allow_overlap();
+                widget_active_cell.set(ui.is_item_active());
+                if changed {
+                    new_buf_cell.set(Some(buf.clone()));
+                }
+
+                // Read the outer child's horizontal scroll now that the
+                // multiline's internal BeginChildFrame/EndChildFrame have
+                // run — the current window is the outer child again.
+                unsafe {
+                    scroll_x_cell.set(imgui::sys::igGetScrollX());
+                }
+            });
+    }
+    drop(_wp);
+
+    let widget_active = widget_active_cell.get();
+    let buf_clone = new_buf_cell.take();
     let scroll_y_out = own_scroll;
+    let scroll_x_out = scroll_x_cell.get();
+
+    // Caret-tracking horizontal scroll: only fire when the caret
+    // actually moved this frame (typing, arrows, paste, …). If the
+    // user wheel-scrolled away while the caret sat still, we'd
+    // otherwise pull the view straight back to it every frame.
+    let cur_caret = caret_byte.get();
+    let prev_caret = match side {
+        Side::Left => state.a_last_caret,
+        Side::Right => state.b_last_caret,
+    };
+    let caret_moved = widget_active && cur_caret >= 0 && prev_caret != Some(cur_caret);
+    let next_scroll_x = if caret_moved {
+        let buf_ref: &str = match side {
+            Side::Left => &state.a_buf,
+            Side::Right => &state.b_buf,
+        };
+        let caret_x =
+            caret_x_in_inner(buf_ref, cur_caret as usize, ui, style.frame_padding[0]);
+        let char_step = ui.calc_text_size("m")[0].max(1.0);
+        track_caret_scroll_x(caret_x, scroll_x_out, widget_w, char_step * 2.0)
+    } else {
+        scroll_x_out
+    };
+    let new_last_caret = if widget_active && cur_caret >= 0 {
+        Some(cur_caret)
+    } else {
+        None
+    };
+    match side {
+        Side::Left => {
+            state.last_left_scroll_x = next_scroll_x;
+            state.a_last_caret = new_last_caret;
+        }
+        Side::Right => {
+            state.last_right_scroll_x = next_scroll_x;
+            state.b_last_caret = new_last_caret;
+        }
+    }
     if let Some(new_text) = buf_clone {
         let side_ref = SideRef::TwoWay(match side {
             Side::Left => TwoWaySide::A,
@@ -413,7 +579,6 @@ fn render_pane(
             old_text: None,
         });
     }
-    let _ = changed;
 
     // Paint everything (row bg, sub-line spans, syntax text, caret)
     // on the foreground draw list ourselves.
@@ -429,6 +594,7 @@ fn render_pane(
         hunks,
         side,
         scroll_y_out,
+        scroll_x_out,
         lh,
         caret_byte.get(),
         widget_active,

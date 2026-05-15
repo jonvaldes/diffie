@@ -191,6 +191,11 @@ struct AppState {
     preferences_open: bool,
     /// Working copy of preferences while the dialog is open.
     preferences_draft: preferences::AppPreferences,
+    /// Set when the user changes the theme flavor; the next render call
+    /// re-applies the palette to the imgui style table (which the
+    /// modal scope itself can't reach, since it only has access to the
+    /// frame `Ui`).
+    theme_apply_pending: bool,
     /// CLI-supplied session to open on the first frame. Drained inside
     /// `frame_ui` once the GPU / imgui context is up.
     pending_initial: Option<InitialOpen>,
@@ -230,6 +235,7 @@ impl Default for AppState {
             preferences: preferences::load(),
             preferences_open: false,
             preferences_draft: preferences::AppPreferences::default(),
+            theme_apply_pending: false,
             pending_initial: None,
         }
     }
@@ -335,6 +341,9 @@ impl ApplicationHandler for App {
         // --- imgui ----------------------------------------------------------
         let mut imgui = Context::create();
         imgui.set_ini_filename(None);
+        // Apply the user's saved theme flavor before priming the style
+        // table so the first frame already paints in the chosen palette.
+        theme::set_flavor(self.state.preferences.theme);
         theme::apply(&mut imgui);
         syntax::prime_tables();
         // Cross-platform clipboard via arboard so set/get_clipboard_text on
@@ -456,6 +465,11 @@ fn render(gpu: &mut Gpu, state: &mut AppState) {
         state.mono_font = Some(new_mono);
         gpu.renderer
             .reload_font_texture(&mut gpu.imgui, &gpu.device, &gpu.queue);
+    }
+
+    if state.theme_apply_pending {
+        state.theme_apply_pending = false;
+        theme::apply(&mut gpu.imgui);
     }
 
     gpu.platform
@@ -992,12 +1006,12 @@ fn tab_bar(ui: &imgui::Ui, state: &mut AppState) {
     // Active tab is a grey one step brighter than inactive; hover preview
     // uses the same brightness so hovering an inactive tab previews how it
     // will look when selected.
-    let active_color = theme::SURFACE1;
-    let inactive_color = theme::SURFACE0;
-    let hover_color = theme::SURFACE1;
-    let label_color = theme::TEXT;
-    let close_idle = theme::OVERLAY1;
-    let close_hover = theme::TEXT;
+    let active_color = theme::SURFACE1();
+    let inactive_color = theme::SURFACE0();
+    let hover_color = theme::SURFACE1();
+    let label_color = theme::TEXT();
+    let close_idle = theme::OVERLAY1();
+    let close_hover = theme::TEXT();
 
     let strip_left = ui.cursor_screen_pos()[0];
     let strip_y = ui.cursor_screen_pos()[1];
@@ -1209,8 +1223,30 @@ fn preferences_modal(ui: &imgui::Ui, state: &mut AppState) {
         );
 
         ui.separator();
+        ui.text("Theme:");
+        ui.same_line();
+        const FLAVORS: &[theme::Flavor] = &[theme::Flavor::Macchiato, theme::Flavor::Latte];
+        let mut theme_idx = FLAVORS
+            .iter()
+            .position(|f| *f == state.preferences_draft.theme)
+            .unwrap_or(0);
+        let theme_labels: Vec<&str> = FLAVORS.iter().map(|f| f.label()).collect();
+        ui.set_next_item_width(260.0);
+        if ui.combo_simple_string("##pref_theme", &mut theme_idx, &theme_labels) {
+            state.preferences_draft.theme = FLAVORS[theme_idx];
+        }
+
+        ui.separator();
         if ui.button("OK") {
+            let theme_changed = state.preferences.theme != state.preferences_draft.theme;
             state.preferences = state.preferences_draft.clone();
+            if theme_changed {
+                // Live-switch the palette accessor (theme::current()).
+                // The App drives the actual imgui style re-application
+                // outside this borrow via `theme_apply_pending`.
+                theme::set_flavor(state.preferences.theme);
+                state.theme_apply_pending = true;
+            }
             if let Err(e) = preferences::save(&state.preferences) {
                 state.status = format!("preferences save error: {e}");
             } else {
@@ -1695,19 +1731,13 @@ fn current_session_summary(ui: &imgui::Ui, state: &mut AppState) {
             return;
         }
     };
-    // Snapshot the bits of the tab we need later as owned values, since
-    // pane_header_bar borrows `state` mutably for the input buffers.
-    let (tab_label_line, tab_paths_snap): (Option<String>, Option<Vec<PathBuf>>) =
-        match state.tabs.iter().find(|t| t.session_id == id) {
-            Some(t) => (
-                Some(format!("Tab: {} (id={})", t.label, t.session_id)),
-                Some(t.paths.clone()),
-            ),
-            None => (None, None),
-        };
-    if let Some(line) = &tab_label_line {
-        ui.text(line);
-    }
+    // Snapshot the tab's paths up front so we can release the immutable
+    // borrow before pane_header_bar takes state mutably.
+    let tab_paths_snap: Option<Vec<PathBuf>> = state
+        .tabs
+        .iter()
+        .find(|t| t.session_id == id)
+        .map(|t| t.paths.clone());
     engine_bar::render(
         ui,
         &state.sessions,

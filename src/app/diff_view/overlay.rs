@@ -97,6 +97,7 @@ pub(super) fn paint_pane_text(
     hunks: &[Hunk],
     side: Side,
     scroll_y: f32,
+    scroll_x: f32,
     lh: f32,
     caret_byte: i32,
     widget_active: bool,
@@ -172,7 +173,7 @@ pub(super) fn paint_pane_text(
                 let info = row_info(ln);
                 if let Some((op_kind, spans_opt, move_id)) = info {
                     let bg = if move_id.is_some() {
-                        Some(theme::with_alpha(theme::PEACH, 0.30))
+                        Some(theme::with_alpha(theme::PEACH(), 0.30))
                     } else {
                         match op_kind {
                             OpKind::Equal => None,
@@ -203,9 +204,9 @@ pub(super) fn paint_pane_text(
                                 if sp.end <= sp.start {
                                     continue;
                                 }
-                                let x0 = widget_left
+                                let x0 = widget_left - scroll_x
                                     + text_x_at_byte(ui, line_text, sp.start as usize, padding_x);
-                                let x1 = widget_left
+                                let x1 = widget_left - scroll_x
                                     + text_x_at_byte(ui, line_text, sp.end as usize, padding_x);
                                 let x0c = x0.max(widget_left).min(widget_right);
                                 let x1c = x1.max(widget_left).min(widget_right);
@@ -244,11 +245,11 @@ pub(super) fn paint_pane_text(
                                 chars[s].0
                             };
                             if gap_end_byte > gap_start_byte {
-                                let x = widget_left
+                                let x = widget_left - scroll_x
                                     + text_x_at_byte(ui, line_text, gap_start_byte, padding_x);
                                 dl.add_text(
                                     [x, text_y],
-                                    theme::TEXT,
+                                    theme::TEXT(),
                                     &line_text[gap_start_byte..gap_end_byte],
                                 );
                             }
@@ -265,7 +266,7 @@ pub(super) fn paint_pane_text(
                             chars[e].0
                         };
                         if span_end_byte > span_start_byte {
-                            let x = widget_left
+                            let x = widget_left - scroll_x
                                 + text_x_at_byte(ui, line_text, span_start_byte, padding_x);
                             dl.add_text(
                                 [x, text_y],
@@ -279,15 +280,15 @@ pub(super) fn paint_pane_text(
                     if cursor_col < chars.len() {
                         let tail_byte = chars[cursor_col].0;
                         if tail_byte < line_text.len() {
-                            let x = widget_left
+                            let x = widget_left - scroll_x
                                 + text_x_at_byte(ui, line_text, tail_byte, padding_x);
-                            dl.add_text([x, text_y], theme::TEXT, &line_text[tail_byte..]);
+                            dl.add_text([x, text_y], theme::TEXT(), &line_text[tail_byte..]);
                         }
                     }
                 } else if !line_text.is_empty() {
                     dl.add_text(
-                        [widget_left + padding_x, text_y],
-                        theme::TEXT,
+                        [widget_left + padding_x - scroll_x, text_y],
+                        theme::TEXT(),
                         line_text,
                     );
                 }
@@ -304,14 +305,14 @@ pub(super) fn paint_pane_text(
                         let line_end = byte_acc + line_text.len();
                         if target >= byte_acc && target <= line_end {
                             let local = target - byte_acc;
-                            let x = widget_left
+                            let x = widget_left - scroll_x
                                 + text_x_at_byte(ui, line_text, local, padding_x);
                             let y = widget_top + padding_y + (line_idx as f32) * lh - scroll_y;
                             if y + lh >= widget_top && y <= widget_bottom {
                                 dl.add_line(
                                     [x, y + 1.0],
                                     [x, y + lh - 1.0],
-                                    theme::TEXT,
+                                    theme::TEXT(),
                                 )
                                 .thickness(1.0)
                                 .build();
@@ -324,10 +325,10 @@ pub(super) fn paint_pane_text(
                     // Caret past the last newline (trailing empty line).
                     if !painted && target >= byte_acc {
                         let line_idx = buf.lines().count();
-                        let x = widget_left + padding_x;
+                        let x = widget_left + padding_x - scroll_x;
                         let y = widget_top + padding_y + (line_idx as f32) * lh - scroll_y;
                         if y + lh >= widget_top && y <= widget_bottom {
-                            dl.add_line([x, y + 1.0], [x, y + lh - 1.0], theme::TEXT)
+                            dl.add_line([x, y + 1.0], [x, y + lh - 1.0], theme::TEXT())
                                 .thickness(1.0)
                                 .build();
                         }
@@ -356,7 +357,7 @@ pub(super) fn paint_pane_text(
             }
             if line >= range.0 && line <= range.1 {
                 let anchor_y = line_screen_y(widget_top, range.0, scroll_y, lh).max(widget_top);
-                hover_out.set(Some((h.id, [widget_left, anchor_y])));
+                hover_out.set(Some((h.id, [widget_right, anchor_y])));
                 break;
             }
         }
@@ -481,9 +482,9 @@ fn stroke_bezier_curve(
 
 fn ribbon_color(is_change: bool) -> [f32; 4] {
     if is_change {
-        theme::with_alpha(theme::BLUE, 0.28)
+        theme::with_alpha(theme::BLUE(), 0.28)
     } else {
-        theme::with_alpha(theme::OVERLAY1, 0.10)
+        theme::with_alpha(theme::OVERLAY1(), 0.10)
     }
 }
 
@@ -560,7 +561,7 @@ pub(super) fn draw_connector(
             let mid_a = (a1 + a2) * 0.5;
             let mid_b = (b1 + b2) * 0.5;
             let alpha = move_ribbon_alpha(mid_a - mid_b);
-            fill_bezier_ribbon(x_l, x_r, a1, a2, b1, b2, theme::with_alpha(theme::PEACH, alpha));
+            fill_bezier_ribbon(x_l, x_r, a1, a2, b1, b2, theme::with_alpha(theme::PEACH(), alpha));
         }
 
         // Anchor curves: thin line from anchor.a row centre on left to
@@ -571,7 +572,7 @@ pub(super) fn draw_connector(
             if (ly < band_top && ry < band_top) || (ly > band_bot && ry > band_bot) {
                 continue;
             }
-            stroke_bezier_curve(x_l, x_r, ly, ry, theme::CRUST, 3.0);
+            stroke_bezier_curve(x_l, x_r, ly, ry, theme::CRUST(), 3.0);
         }
     });
     let _ = dl;
@@ -607,7 +608,11 @@ pub(super) fn draw_control_overlay(
     // actually receive clicks. (Widgets in the parent window can't win
     // hover/click against the multiline's child window via
     // SetItemAllowOverlap — cross-window overlap needs its own window.)
-    let panel_x = pos[0] + 4.0;
+    //
+    // `pos` is the pane's *right* edge for the hovered row; the panel is
+    // anchored there with pivot (1, 0) so it grows leftwards and stays
+    // inside the pane's right edge regardless of its auto-sized width.
+    let panel_x = pos[0] - 4.0;
     let panel_y = pos[1] + 2.0;
 
     let _pad = ui.push_style_var(StyleVar::FramePadding([6.0, 2.0]));
@@ -615,9 +620,9 @@ pub(super) fn draw_control_overlay(
     let _win_pad = ui.push_style_var(StyleVar::WindowPadding([4.0, 3.0]));
     let _win_round = ui.push_style_var(StyleVar::WindowRounding(4.0));
     let _win_border = ui.push_style_var(StyleVar::WindowBorderSize(1.0));
-    let _border_col = ui.push_style_color(imgui::StyleColor::Border, theme::BLUE);
+    let _border_col = ui.push_style_color(imgui::StyleColor::Border, theme::BLUE());
     let _bg_col =
-        ui.push_style_color(imgui::StyleColor::WindowBg, theme::with_alpha(theme::MANTLE, 0.95));
+        ui.push_style_color(imgui::StyleColor::WindowBg, theme::with_alpha(theme::MANTLE(), 0.95));
 
     let _ = lh;
     let win_name = format!("##diff_overlay_{}_{}_{}", session_id, hunk_id, side_tag(side));
@@ -632,6 +637,7 @@ pub(super) fn draw_control_overlay(
         | WindowFlags::NO_NAV;
     ui.window(&win_name)
         .position([panel_x, panel_y], Condition::Always)
+        .position_pivot([1.0, 0.0])
         .flags(flags)
         .build(|| {
             // Icon-only button: an arrow pointing in the direction the
@@ -708,7 +714,7 @@ pub(super) fn paint_gutter(
     let first_line = (scroll_y / lh).floor() as u32 + 1;
     let last_line = ((scroll_y + g_h) / lh).ceil() as u32 + 1;
 
-    let line_no_color = theme::OVERLAY1;
+    let line_no_color = theme::OVERLAY1();
     for line in first_line..=last_line.min(line_count) {
         let y = line_screen_y(g_top, line, scroll_y, lh);
         if y + lh < g_top || y > g_bottom {
@@ -719,7 +725,7 @@ pub(super) fn paint_gutter(
         dl.add_text([g_left + g_w - 4.0 - text_w, y + 2.0], line_no_color, &text);
     }
 
-    let dot_color = theme::LAVENDER;
+    let dot_color = theme::LAVENDER();
     for anc in anchors {
         let line = match side {
             Side::Left => anc.a,

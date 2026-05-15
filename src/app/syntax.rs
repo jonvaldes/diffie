@@ -27,35 +27,39 @@ pub enum SyntaxKind {
     Function,
     Preproc,
     Constant,
-    /// Matched bracket pair colored by nesting depth (`d % BRACKET_PALETTE.len()`).
+    /// Matched bracket pair colored by nesting depth (`d % BRACKET_PALETTE_LEN`).
     Bracket(u8),
 }
 
 /// Rainbow palette for nested brackets. Walks the hue wheel so adjacent
-/// depths are easy to tell apart.
-const BRACKET_PALETTE: [[f32; 4]; 7] = [
-    theme::YELLOW,
-    theme::MAUVE,
-    theme::SKY,
-    theme::PEACH,
-    theme::GREEN,
-    theme::PINK,
-    theme::TEAL,
-];
+/// depths are easy to tell apart. Not const because the theme palette
+/// is selected at runtime.
+const BRACKET_PALETTE_LEN: usize = 7;
+fn bracket_palette() -> [[f32; 4]; BRACKET_PALETTE_LEN] {
+    [
+        theme::YELLOW(),
+        theme::MAUVE(),
+        theme::SKY(),
+        theme::PEACH(),
+        theme::GREEN(),
+        theme::PINK(),
+        theme::TEAL(),
+    ]
+}
 
 impl SyntaxKind {
     pub fn color(self) -> [f32; 4] {
         match self {
-            SyntaxKind::Keyword => theme::MAUVE,
-            SyntaxKind::Type => theme::YELLOW,
-            SyntaxKind::String => theme::GREEN,
-            SyntaxKind::Number => theme::PEACH,
-            SyntaxKind::Comment => theme::OVERLAY1,
-            SyntaxKind::Function => theme::BLUE,
-            SyntaxKind::Preproc => theme::PINK,
-            SyntaxKind::Constant => theme::PEACH,
+            SyntaxKind::Keyword => theme::MAUVE(),
+            SyntaxKind::Type => theme::YELLOW(),
+            SyntaxKind::String => theme::GREEN(),
+            SyntaxKind::Number => theme::PEACH(),
+            SyntaxKind::Comment => theme::OVERLAY1(),
+            SyntaxKind::Function => theme::BLUE(),
+            SyntaxKind::Preproc => theme::PINK(),
+            SyntaxKind::Constant => theme::PEACH(),
             SyntaxKind::Bracket(d) => {
-                let c = BRACKET_PALETTE[(d as usize) % BRACKET_PALETTE.len()];
+                let c = bracket_palette()[(d as usize) % BRACKET_PALETTE_LEN];
                 boost_saturation(c, 1.25)
             }
         }
@@ -305,13 +309,13 @@ const ROW_BG_INSERT: [f32; 4] = [0.18, 0.50, 0.22, 0.30];
 const HL_INSERT: [f32; 4] = [0.18, 0.70, 0.30, 0.20];
 
 fn delete_row_bg() -> [f32; 4] {
-    composite(theme::BASE, ROW_BG_DELETE)
+    composite(theme::BASE(), ROW_BG_DELETE)
 }
 fn delete_hl_bg() -> [f32; 4] {
     composite(delete_row_bg(), HL_DELETE)
 }
 fn insert_row_bg() -> [f32; 4] {
-    composite(theme::BASE, ROW_BG_INSERT)
+    composite(theme::BASE(), ROW_BG_INSERT)
 }
 fn insert_hl_bg() -> [f32; 4] {
     composite(insert_row_bg(), HL_INSERT)
@@ -319,29 +323,29 @@ fn insert_hl_bg() -> [f32; 4] {
 
 fn build_table(bg: [f32; 4]) -> ColorTable {
     ColorTable {
-        keyword: adapt(theme::MAUVE, bg),
-        type_: adapt(theme::YELLOW, bg),
-        string: adapt(theme::GREEN, bg),
-        number: adapt(theme::PEACH, bg),
-        comment: adapt(theme::OVERLAY1, bg),
-        function: adapt(theme::BLUE, bg),
-        preproc: adapt(theme::PINK, bg),
-        constant: adapt(theme::PEACH, bg),
-        default: adapt(theme::TEXT, bg),
+        keyword: adapt(theme::MAUVE(), bg),
+        type_: adapt(theme::YELLOW(), bg),
+        string: adapt(theme::GREEN(), bg),
+        number: adapt(theme::PEACH(), bg),
+        comment: adapt(theme::OVERLAY1(), bg),
+        function: adapt(theme::BLUE(), bg),
+        preproc: adapt(theme::PINK(), bg),
+        constant: adapt(theme::PEACH(), bg),
+        default: adapt(theme::TEXT(), bg),
     }
 }
 
 fn normal_table() -> ColorTable {
     ColorTable {
-        keyword: theme::MAUVE,
-        type_: theme::YELLOW,
-        string: theme::GREEN,
-        number: theme::PEACH,
-        comment: theme::OVERLAY1,
-        function: theme::BLUE,
-        preproc: theme::PINK,
-        constant: theme::PEACH,
-        default: theme::TEXT,
+        keyword: theme::MAUVE(),
+        type_: theme::YELLOW(),
+        string: theme::GREEN(),
+        number: theme::PEACH(),
+        comment: theme::OVERLAY1(),
+        function: theme::BLUE(),
+        preproc: theme::PINK(),
+        constant: theme::PEACH(),
+        default: theme::TEXT(),
     }
 }
 
@@ -572,7 +576,7 @@ fn augment_with_brackets(
     line_starts: &[usize],
     out: &mut [LineSpans],
 ) {
-    let palette_len = BRACKET_PALETTE.len();
+    let palette_len = BRACKET_PALETTE_LEN;
     let mut depth: i32 = 0;
     let mut mi = 0usize;
     let mut i = 0usize;

@@ -23,6 +23,18 @@ use crate::session::{SessionId, SessionMode, SessionStore, SideRef, ThreeWaySide
 
 /// Match diff_view: tall enough for the 1.5x Roboto Mono used in code rows
 /// at zoom=1.0.
+/// Max line pixel width across `buf` under the active imgui font.
+fn compute_max_line_w(ui: &Ui, buf: &str) -> f32 {
+    let mut max = 0.0_f32;
+    for line in buf.lines() {
+        let w = ui.calc_text_size(line)[0];
+        if w > max {
+            max = w;
+        }
+    }
+    max
+}
+
 const ROW_H_BASE: f32 = 24.0;
 const GUTTER_W_BASE: f32 = 60.0;
 const CONNECTOR_W: f32 = 56.0;
@@ -56,6 +68,21 @@ pub struct MergeViewState {
     /// Where each pane is scrolling toward. Wheel, sync, and jump update
     /// this; `last` eases toward it each frame.
     target: [f32; 3],
+    /// Outer-scroll-window horizontal scroll position per pane, captured
+    /// each frame from imgui via igGetScrollX. Each multiline is wrapped
+    /// in an outer child window with HORIZONTAL_SCROLLBAR; imgui handles
+    /// user-driven horizontal scrolling natively and we just mirror the
+    /// value for overlay alignment.
+    scroll_x: [f32; 3],
+    /// Max line pixel width per pane in the active mono font. Cached so
+    /// we only re-measure on buffer change — used to size the inner
+    /// multiline wide enough that no internal horizontal caret-tracking
+    /// scroll ever triggers (the outer wrapper owns horizontal scroll).
+    max_line_w: [f32; 3],
+    /// Last observed caret byte per pane. Caret-tracking horizontal
+    /// scroll only fires when the byte position changes, so the user
+    /// can wheel-scroll away from the caret without it snapping back.
+    last_caret: [Option<i32>; 3],
     /// Pending scroll value to apply next frame on a given pane.
     pending: [Option<f32>; 3],
     /// Bumped on external buffer mutations (undo/redo, Apply Local/Base/Remote);
@@ -173,13 +200,16 @@ pub fn render(
     let SessionMode::ThreeWay { base_text, local_text, remote_text, .. } = &snap.mode else {
         return;
     };
-    if state.base_buf != *base_text {
+    let base_changed = state.base_buf != *base_text;
+    if base_changed {
         state.base_buf = base_text.clone();
     }
-    if state.local_buf != *local_text {
+    let local_changed = state.local_buf != *local_text;
+    if local_changed {
         state.local_buf = local_text.clone();
     }
-    if state.remote_buf != *remote_text {
+    let remote_changed = state.remote_buf != *remote_text;
+    if remote_changed {
         state.remote_buf = remote_text.clone();
     }
 
@@ -193,6 +223,20 @@ pub fn render(
     // all overlay positioning so our draw-list text aligns with what
     // input_text_multiline renders.
     let lh = ui.text_line_height();
+
+    // Recompute max line widths under the active mono font when a
+    // buffer changes; the outer horizontal-scroll wrapper uses these to
+    // size each inner multiline wide enough that its own caret-tracking
+    // horizontal scroll never triggers.
+    if base_changed {
+        state.max_line_w[Pane::Base as usize] = compute_max_line_w(ui, &state.base_buf);
+    }
+    if local_changed {
+        state.max_line_w[Pane::Local as usize] = compute_max_line_w(ui, &state.local_buf);
+    }
+    if remote_changed {
+        state.max_line_w[Pane::Remote as usize] = compute_max_line_w(ui, &state.remote_buf);
+    }
 
     let base_layout = build_layout(hunks, Pane::Base, lh);
     let local_layout = build_layout(hunks, Pane::Local, lh);
@@ -330,17 +374,24 @@ fn render_pane(
     let content_h = (buf_line_count as f32) * lh;
     let max_scroll = (content_h - pane_h).max(0.0);
 
-    // Wheel input: only the hovered pane consumes io.mouse_wheel for its
-    // own target. imgui's child window also sees the wheel internally, but
-    // we pin its scroll via igSetNextWindowScroll below so any internal
-    // movement is overwritten next frame.
-    let wheel = if ui.is_mouse_hovering_rect(
+    // Split wheel into vertical (smooth, fed to inner multiline) and
+    // horizontal (pinned onto the outer scroll child). See diff_view
+    // for the reasoning — imgui's UpdateMouseWheel won't bubble through
+    // the inner multiline's child window to scroll our outer wrapper.
+    let hovered = ui.is_mouse_hovering_rect(
         [widget_pos[0], widget_pos[1]],
         [widget_pos[0] + widget_w, widget_pos[1] + pane_h],
-    ) {
-        ui.io().mouse_wheel
+    );
+    let (wheel, h_wheel) = if hovered {
+        let raw_v = ui.io().mouse_wheel;
+        let raw_h = ui.io().mouse_wheel_h;
+        if ui.io().key_shift && raw_v != 0.0 {
+            (0.0, raw_h + raw_v)
+        } else {
+            (raw_v, raw_h)
+        }
     } else {
-        0.0
+        (0.0, 0.0)
     };
     let prev_target = state.target[pane as usize];
     let mut target = pending_scroll
@@ -361,17 +412,14 @@ fn render_pane(
         displayed = target;
     }
 
-    // Pin the multiline's internal child scroll to our value every frame
-    // so the rendered text aligns with our overlay. The widget IS the next
-    // window for purposes of igSetNextWindowScroll. Imgui may still process
-    // the wheel internally; our override the next frame wins.
-    unsafe {
-        imgui::sys::igSetNextWindowScroll(imgui::sys::ImVec2 { x: -1.0, y: displayed });
-    }
+    let max_line_w = state.max_line_w[pane as usize];
+    let style = ui.clone_style();
+    let inner_w = (max_line_w + style.frame_padding[0] * 2.0 + 8.0).max(widget_w);
 
     ui.set_cursor_screen_pos(widget_pos);
 
     let widget_id = format!("##merge_pane_{:?}_e{}", pane, state.input_epoch);
+    let outer_id = format!("##merge_pane_outer_{:?}_e{}", pane, state.input_epoch);
 
     let widget_rect = [
         widget_pos[0],
@@ -382,52 +430,117 @@ fn render_pane(
 
     let caret_byte: Cell<i32> = Cell::new(-1);
     let origin_out: [f32; 2] = widget_pos;
+    let scroll_x_cell: Cell<f32> = Cell::new(state.scroll_x[pane as usize]);
+    let widget_active_cell: Cell<bool> = Cell::new(false);
+    let new_buf_cell: Cell<Option<String>> = Cell::new(None);
 
-    let (changed, new_text_opt, widget_active) = {
-        let buf = match pane {
+    // Pin the outer child's horizontal scroll. We own it directly since
+    // imgui's wheel routing won't bubble through the inner multiline.
+    let char_step_x = ui.calc_text_size("m")[0].max(1.0);
+    let target_scroll_x = (state.scroll_x[pane as usize]
+        - h_wheel * char_step_x * SCROLL_LINES_PER_WHEEL_TICK)
+        .max(0.0);
+    unsafe {
+        imgui::sys::igSetNextWindowScroll(imgui::sys::ImVec2 {
+            x: target_scroll_x,
+            y: -1.0,
+        });
+    }
+
+    let _wp = ui.push_style_var(StyleVar::WindowPadding([0.0, 0.0]));
+    {
+        let buf: &mut String = match pane {
             Pane::Base => &mut state.base_buf,
             Pane::Local => &mut state.local_buf,
             Pane::Remote => &mut state.remote_buf,
         };
-        let _spacing = ui.push_style_var(StyleVar::ItemSpacing([0.0, 0.0]));
+        ui.child_window(&outer_id)
+            .size([widget_w, pane_h])
+            .horizontal_scrollbar(true)
+            .build(|| {
+                unsafe {
+                    imgui::sys::igSetNextWindowScroll(imgui::sys::ImVec2 {
+                        x: -1.0,
+                        y: displayed,
+                    });
+                }
+                let _spacing = ui.push_style_var(StyleVar::ItemSpacing([0.0, 0.0]));
+                let _frame_bg = ui.push_style_color(imgui::StyleColor::FrameBg, [0.0, 0.0, 0.0, 0.0]);
+                let _frame_bg_hov = ui.push_style_color(imgui::StyleColor::FrameBgHovered, [0.0, 0.0, 0.0, 0.0]);
+                let _frame_bg_act = ui.push_style_color(imgui::StyleColor::FrameBgActive, [0.0, 0.0, 0.0, 0.0]);
+                let _text_color = ui.push_style_color(imgui::StyleColor::Text, [0.0, 0.0, 0.0, 0.0]);
 
-        // Suppress imgui's own FrameBg + Text rendering — we paint
-        // everything (row tints, text, caret) on the foreground draw list.
-        let _frame_bg = ui.push_style_color(imgui::StyleColor::FrameBg, [0.0, 0.0, 0.0, 0.0]);
-        let _frame_bg_hov = ui.push_style_color(imgui::StyleColor::FrameBgHovered, [0.0, 0.0, 0.0, 0.0]);
-        let _frame_bg_act = ui.push_style_color(imgui::StyleColor::FrameBgActive, [0.0, 0.0, 0.0, 0.0]);
-        let _text_color = ui.push_style_color(imgui::StyleColor::Text, [0.0, 0.0, 0.0, 0.0]);
+                struct CaretCapture<'a> {
+                    cursor: &'a Cell<i32>,
+                }
+                impl<'a> imgui::InputTextCallbackHandler for CaretCapture<'a> {
+                    fn on_always(&mut self, data: imgui::TextCallbackData) {
+                        self.cursor.set(data.cursor_pos() as i32);
+                    }
+                }
 
-        struct CaretCapture<'a> {
-            cursor: &'a Cell<i32>,
-        }
-        impl<'a> imgui::InputTextCallbackHandler for CaretCapture<'a> {
-            fn on_always(&mut self, data: imgui::TextCallbackData) {
-                self.cursor.set(data.cursor_pos() as i32);
-            }
-        }
+                let changed = ui
+                    .input_text_multiline(&widget_id, buf, [inner_w, pane_h])
+                    .no_undo_redo(true)
+                    .callback(
+                        imgui::InputTextMultilineCallback::ALWAYS,
+                        CaretCapture { cursor: &caret_byte },
+                    )
+                    .build();
+                ui.set_item_allow_overlap();
+                widget_active_cell.set(ui.is_item_active());
+                if changed {
+                    new_buf_cell.set(Some(buf.clone()));
+                }
+                unsafe {
+                    scroll_x_cell.set(imgui::sys::igGetScrollX());
+                }
+            });
+    }
+    drop(_wp);
 
-        let changed = ui
-            .input_text_multiline(&widget_id, buf, [widget_w, pane_h])
-            .no_undo_redo(true)
-            .callback(
-                imgui::InputTextMultilineCallback::ALWAYS,
-                CaretCapture { cursor: &caret_byte },
-            )
-            .build();
-        // Let overlay widgets (resolution control panel) submitted later
-        // this frame claim hover/click over this input_text_multiline.
-        ui.set_item_allow_overlap();
-        let active = ui.is_item_active();
-        let new_text = if changed { Some(buf.clone()) } else { None };
-        (changed, new_text, active)
-    };
+    let widget_active = widget_active_cell.get();
     let scroll_y_out = displayed;
     state.last[pane as usize] = displayed;
+    let scroll_x_out = scroll_x_cell.get();
+
+    // Caret-tracking horizontal scroll: only fire when the caret
+    // actually moved this frame. Without this gating, wheel-scrolling
+    // away from a stationary caret would snap right back every frame.
+    let cur_caret = caret_byte.get();
+    let prev_caret = state.last_caret[pane as usize];
+    let caret_moved = widget_active && cur_caret >= 0 && prev_caret != Some(cur_caret);
+    let next_scroll_x = if caret_moved {
+        let buf_ref: &str = match pane {
+            Pane::Base => &state.base_buf,
+            Pane::Local => &state.local_buf,
+            Pane::Remote => &state.remote_buf,
+        };
+        let caret_x = crate::app::diff_view::caret_x_in_inner(
+            buf_ref,
+            cur_caret as usize,
+            ui,
+            style.frame_padding[0],
+        );
+        crate::app::diff_view::track_caret_scroll_x(
+            caret_x,
+            scroll_x_out,
+            widget_w,
+            char_step_x * 2.0,
+        )
+    } else {
+        scroll_x_out
+    };
+    state.scroll_x[pane as usize] = next_scroll_x;
+    state.last_caret[pane as usize] = if widget_active && cur_caret >= 0 {
+        Some(cur_caret)
+    } else {
+        None
+    };
     if widget_active {
         focus_event.set(Some(pane.as_focused_pane()));
     }
-    if let Some(new_text) = new_text_opt {
+    if let Some(new_text) = new_buf_cell.take() {
         let side_ref = SideRef::ThreeWay(match pane {
             Pane::Base => ThreeWaySide::Base,
             Pane::Local => ThreeWaySide::Local,
@@ -440,7 +553,6 @@ fn render_pane(
             old_text: None,
         });
     }
-    let _ = changed;
 
     let buf_for_paint: &str = match pane {
         Pane::Base => &state.base_buf,
@@ -453,6 +565,7 @@ fn render_pane(
         buf_for_paint,
         layout,
         scroll_y_out,
+        scroll_x_out,
         lh,
         caret_byte.get(),
         widget_active,
@@ -490,7 +603,7 @@ fn paint_gutter(
         }
         let text = format!("{line}");
         let text_w = ui.calc_text_size(&text)[0];
-        dl.add_text([g_left + g_w - 4.0 - text_w, y + 2.0], theme::OVERLAY1, &text);
+        dl.add_text([g_left + g_w - 4.0 - text_w, y + 2.0], theme::OVERLAY1(), &text);
     }
 }
 
@@ -504,6 +617,7 @@ fn paint_pane_text(
     buf: &str,
     layout: &PaneLayout,
     scroll_y: f32,
+    scroll_x: f32,
     lh: f32,
     caret_byte: i32,
     widget_active: bool,
@@ -531,9 +645,9 @@ fn paint_pane_text(
             let Some(kind_v) = *kind else { continue };
             if ln >= *lo && ln <= *hi {
                 return Some(match kind_v {
-                    HunkKind::LocalOnly => theme::with_alpha(theme::BLUE, 0.22),
-                    HunkKind::RemoteOnly => theme::with_alpha(theme::MAUVE, 0.22),
-                    HunkKind::Conflict => theme::with_alpha(theme::PEACH, 0.30),
+                    HunkKind::LocalOnly => theme::with_alpha(theme::BLUE(), 0.22),
+                    HunkKind::RemoteOnly => theme::with_alpha(theme::MAUVE(), 0.22),
+                    HunkKind::Conflict => theme::with_alpha(theme::PEACH(), 0.30),
                 });
             }
         }
@@ -564,8 +678,8 @@ fn paint_pane_text(
 
             if !line_text.is_empty() {
                 dl.add_text(
-                    [widget_left + padding_x, y],
-                    theme::TEXT,
+                    [widget_left + padding_x - scroll_x, y],
+                    theme::TEXT(),
                     line_text,
                 );
             }
@@ -586,10 +700,11 @@ fn paint_pane_text(
                         while snap > 0 && !line_text.is_char_boundary(snap) {
                             snap -= 1;
                         }
-                        let x = widget_left + padding_x + ui.calc_text_size(&line_text[..snap])[0];
+                        let x = widget_left + padding_x - scroll_x
+                            + ui.calc_text_size(&line_text[..snap])[0];
                         let y = widget_top + padding_y + (line_idx as f32) * lh - scroll_y;
                         if y + lh >= widget_top && y <= widget_bottom {
-                            dl.add_line([x, y + 1.0], [x, y + lh - 1.0], theme::TEXT)
+                            dl.add_line([x, y + 1.0], [x, y + lh - 1.0], theme::TEXT())
                                 .thickness(1.0)
                                 .build();
                         }
@@ -600,10 +715,10 @@ fn paint_pane_text(
                 }
                 if !painted && target >= byte_acc {
                     let line_idx = buf.lines().count();
-                    let x = widget_left + padding_x;
+                    let x = widget_left + padding_x - scroll_x;
                     let y = widget_top + padding_y + (line_idx as f32) * lh - scroll_y;
                     if y + lh >= widget_top && y <= widget_bottom {
-                        dl.add_line([x, y + 1.0], [x, y + lh - 1.0], theme::TEXT)
+                        dl.add_line([x, y + 1.0], [x, y + lh - 1.0], theme::TEXT())
                             .thickness(1.0)
                             .build();
                     }
@@ -645,9 +760,9 @@ fn draw_control_overlay(
     let panel_x = pos[0] + 4.0;
     let panel_y = pos[1] + 2.0;
     let border_color = match kind {
-        HunkKind::LocalOnly => theme::BLUE,
-        HunkKind::RemoteOnly => theme::MAUVE,
-        HunkKind::Conflict => theme::PEACH,
+        HunkKind::LocalOnly => theme::BLUE(),
+        HunkKind::RemoteOnly => theme::MAUVE(),
+        HunkKind::Conflict => theme::PEACH(),
     };
 
     // See diff_view::overlay::draw_control_overlay: the panel needs to be
@@ -661,7 +776,7 @@ fn draw_control_overlay(
     let _border_col = ui.push_style_color(imgui::StyleColor::Border, border_color);
     let _bg_col = ui.push_style_color(
         imgui::StyleColor::WindowBg,
-        theme::with_alpha(theme::MANTLE, 0.95),
+        theme::with_alpha(theme::MANTLE(), 0.95),
     );
 
     let kind_tag = match kind {
@@ -854,10 +969,10 @@ fn stroke_bezier_curve(
 
 fn ribbon_color(h: &MergeHunk) -> [f32; 4] {
     match h {
-        MergeHunk::Stable { .. } => theme::with_alpha(theme::OVERLAY1, 0.10),
-        MergeHunk::LocalOnly { .. } => theme::with_alpha(theme::BLUE, 0.28),
-        MergeHunk::RemoteOnly { .. } => theme::with_alpha(theme::MAUVE, 0.28),
-        MergeHunk::Conflict { .. } => theme::with_alpha(theme::PEACH, 0.32),
+        MergeHunk::Stable { .. } => theme::with_alpha(theme::OVERLAY1(), 0.10),
+        MergeHunk::LocalOnly { .. } => theme::with_alpha(theme::BLUE(), 0.28),
+        MergeHunk::RemoteOnly { .. } => theme::with_alpha(theme::MAUVE(), 0.28),
+        MergeHunk::Conflict { .. } => theme::with_alpha(theme::PEACH(), 0.32),
     }
 }
 
@@ -914,7 +1029,7 @@ fn draw_connector(
             if (ly < band_top && ry < band_top) || (ly > band_bot && ry > band_bot) {
                 continue;
             }
-            stroke_bezier_curve(x_l, x_r, ly, ry, theme::CRUST, 3.0);
+            stroke_bezier_curve(x_l, x_r, ly, ry, theme::CRUST(), 3.0);
         }
     });
     let _ = dl;

@@ -1,24 +1,29 @@
-//! Per-tab toolbar for tweaking the live `DiffOptions` that affect what
-//! lines actually compare equal (whitespace handling, sub-line
-//! granularity). Engine selection and move-detection live in the
-//! Preferences modal as defaults for new tabs — they're tab-stable
-//! settings, not per-frame knobs.
+//! Per-tab toolbar for tweaking the live `DiffOptions`. Currently only
+//! the Whitespace mode is exposed here — engine, move detection, and
+//! sub-line granularity are tab-stable choices that live in the
+//! Preferences modal as defaults for new tabs.
 
-use crate::diff::{DiffOptions, SubLineGranularity, Whitespace};
+use crate::app::theme;
+use crate::diff::{DiffOptions, Whitespace};
 use crate::session::{SessionId, SessionStore};
 
-const WHITESPACE_OPTIONS: &[(&str, Whitespace)] = &[
-    ("Significant", Whitespace::None),
-    ("Ignore all", Whitespace::IgnoreAll),
-    ("Ignore leading", Whitespace::IgnoreLeading),
-    ("Ignore trailing+EOL", Whitespace::IgnoreTrailingEol),
-];
+/// (label, tooltip glyph, mode). The glyph is a Font-Awesome Nerd-Font
+/// codepoint; tooltip text is the human label.
+struct WsMode {
+    label: &'static str,
+    icon: &'static str,
+    mode: Whitespace,
+}
 
-const GRANULARITY_OPTIONS: &[(&str, SubLineGranularity)] = &[
-    ("None", SubLineGranularity::None),
-    ("Word", SubLineGranularity::Word),
-    ("Char", SubLineGranularity::Char),
-    ("Grapheme", SubLineGranularity::Grapheme),
+const WHITESPACE_MODES: &[WsMode] = &[
+    // nf-fa-paragraph — pilcrow, "treat whitespace literally"
+    WsMode { label: "Significant", icon: "\u{f1dd}", mode: Whitespace::None },
+    // nf-fa-eye_slash — "ignore all whitespace"
+    WsMode { label: "Ignore all", icon: "\u{f070}", mode: Whitespace::IgnoreAll },
+    // nf-fa-align_left — left-aligned text, "ignore leading"
+    WsMode { label: "Ignore leading", icon: "\u{f036}", mode: Whitespace::IgnoreLeading },
+    // nf-fa-align_right — right-aligned text, "ignore trailing + EOL"
+    WsMode { label: "Ignore trailing+EOL", icon: "\u{f038}", mode: Whitespace::IgnoreTrailingEol },
 ];
 
 pub fn render(
@@ -31,35 +36,45 @@ pub fn render(
 ) {
     ui.text("Whitespace:");
     ui.same_line();
-    ui.set_next_item_width(150.0);
-    let mut ws_idx = WHITESPACE_OPTIONS
+
+    // Make each whitespace button twice as wide as its natural (icon +
+    // frame-padding) width so the row reads as a clear toggle bar.
+    let style = ui.clone_style();
+    let pad_x = style.frame_padding[0];
+    let frame_h = ui.frame_height();
+    let widest_icon = WHITESPACE_MODES
         .iter()
-        .position(|(_, v)| *v == current_options.whitespace)
-        .unwrap_or(0);
-    let ws_labels: Vec<&str> = WHITESPACE_OPTIONS.iter().map(|(l, _)| *l).collect();
-    if ui.combo_simple_string("##whitespace", &mut ws_idx, &ws_labels) {
-        let new_ws = WHITESPACE_OPTIONS[ws_idx].1;
-        if new_ws != current_options.whitespace {
-            let mut opts = current_options;
-            opts.whitespace = new_ws;
-            apply_options(store, session_id, opts, status);
+        .map(|m| ui.calc_text_size(m.icon)[0])
+        .fold(0.0_f32, f32::max);
+    let btn_w = (widest_icon + pad_x * 2.0) * 2.0;
+
+    let mut clicked: Option<Whitespace> = None;
+    for (i, m) in WHITESPACE_MODES.iter().enumerate() {
+        if i > 0 {
+            ui.same_line_with_spacing(0.0, 4.0);
+        }
+        let active = current_options.whitespace == m.mode;
+        // Tint the button when it's the active mode so the current
+        // selection reads at a glance, matching the active-tab fill.
+        let _tint = active.then(|| {
+            (
+                ui.push_style_color(imgui::StyleColor::Button, theme::SURFACE1()),
+                ui.push_style_color(imgui::StyleColor::ButtonHovered, theme::SURFACE2()),
+                ui.push_style_color(imgui::StyleColor::ButtonActive, theme::OVERLAY0()),
+            )
+        });
+        if ui.button_with_size(format!("{}##ws_{}", m.icon, i), [btn_w, frame_h]) {
+            clicked = Some(m.mode);
+        }
+        if ui.is_item_hovered() {
+            ui.tooltip_text(m.label);
         }
     }
 
-    ui.same_line();
-    ui.text("Sub-line:");
-    ui.same_line();
-    ui.set_next_item_width(110.0);
-    let mut g_idx = GRANULARITY_OPTIONS
-        .iter()
-        .position(|(_, v)| *v == current_options.sub_line)
-        .unwrap_or(0);
-    let g_labels: Vec<&str> = GRANULARITY_OPTIONS.iter().map(|(l, _)| *l).collect();
-    if ui.combo_simple_string("##sub_line", &mut g_idx, &g_labels) {
-        let new_g = GRANULARITY_OPTIONS[g_idx].1;
-        if new_g != current_options.sub_line {
+    if let Some(new_ws) = clicked {
+        if new_ws != current_options.whitespace {
             let mut opts = current_options;
-            opts.sub_line = new_g;
+            opts.whitespace = new_ws;
             apply_options(store, session_id, opts, status);
         }
     }

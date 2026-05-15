@@ -104,7 +104,7 @@ pub enum SubLineGranularity {
 }
 
 impl Default for SubLineGranularity {
-    fn default() -> Self { SubLineGranularity::None }
+    fn default() -> Self { SubLineGranularity::Word }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -119,7 +119,7 @@ impl Default for DiffOptions {
     fn default() -> Self {
         Self {
             whitespace: Whitespace::None,
-            sub_line: SubLineGranularity::None,
+            sub_line: SubLineGranularity::Word,
             detect_moves: true,
             move_min_lines: 3,
         }

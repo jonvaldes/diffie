@@ -50,6 +50,28 @@ pub struct DiffViewState {
     /// scroll feedback.
     pub(super) target_left_scroll: f32,
     pub(super) target_right_scroll: f32,
+    /// Outer-scroll-window horizontal scroll position per pane, captured
+    /// each frame from imgui via `igGetScrollX`. We wrap the
+    /// `input_text_multiline` in our own child window that has the
+    /// horizontal scrollbar enabled; imgui handles user scrolling
+    /// natively, we just mirror the value so the overlay painter can
+    /// subtract it to keep highlights aligned with the rendered text.
+    pub(super) last_left_scroll_x: f32,
+    pub(super) last_right_scroll_x: f32,
+    /// Maximum line pixel width per pane in the active mono font.
+    /// Cached so we only re-measure on buffer change — the outer scroll
+    /// child uses this to size the inner `input_text_multiline` wide
+    /// enough that imgui's own caret-tracking horizontal scroll never
+    /// triggers and the outer scrollbar gets the full content width.
+    pub(super) a_max_line_w: f32,
+    pub(super) b_max_line_w: f32,
+    /// Last observed caret byte position per pane. Used to detect caret
+    /// movement (typing, arrows, paste, click-to-new-position, …) so
+    /// caret-tracking horizontal scroll only fires on actual movement,
+    /// not on every frame the widget is focused — otherwise the user
+    /// can't scroll away from the caret with the wheel.
+    pub(super) a_last_caret: Option<i32>,
+    pub(super) b_last_caret: Option<i32>,
     /// Pending scroll set by sync; consumed on next render via
     /// `igSetNextWindowScroll`.
     pub(super) pending_left_scroll: Option<f32>,

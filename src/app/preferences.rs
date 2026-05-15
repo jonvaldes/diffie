@@ -5,12 +5,15 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::app::theme::Flavor;
 use crate::diff::DiffOptions;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppPreferences {
     pub default_engine: String,
     pub default_options: DiffOptions,
+    #[serde(default)]
+    pub theme: Flavor,
 }
 
 impl Default for AppPreferences {
@@ -22,6 +25,7 @@ impl Default for AppPreferences {
             // surfaces moves out of the box.
             default_engine: "histogram".to_string(),
             default_options: DiffOptions::default(),
+            theme: Flavor::default(),
         }
     }
 }
