@@ -1406,7 +1406,7 @@ fn open_two_way_paths(state: &mut AppState, a: PathBuf, b: PathBuf) {
         opts,
     ) {
         Ok(id) => {
-            let label = format!("{} ↔ {}", basename(&a), basename(&b));
+            let label = format!("{} → {}", basename(&a), basename(&b));
             let recent = recents::RecentEntry::TwoWay {
                 a: a.clone(),
                 b: b.clone(),
