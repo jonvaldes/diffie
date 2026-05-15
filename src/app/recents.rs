@@ -26,12 +26,14 @@ pub enum RecentEntry {
 impl RecentEntry {
     pub fn label(&self) -> String {
         match self {
+            // Nerd-Font glyphs (Font Awesome) between filenames: exchange
+            // for 2-way pairings, code-fork as the three-way marker.
             RecentEntry::TwoWay { a, b } => {
-                format!("{} ↔ {}", basename(a), basename(b))
+                format!("{} \u{f0ec} {}", basename(a), basename(b))
             }
             RecentEntry::ThreeWay { base, local, remote } => {
                 format!(
-                    "{} (3-way: {} ↔ {})",
+                    "\u{f126} {} ({} \u{f0ec} {})",
                     basename(base),
                     basename(local),
                     basename(remote)

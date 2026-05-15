@@ -49,7 +49,7 @@ encoding_rs = "0.8"
 imgui = { version = "0.12", optional = true }
 imgui-winit-support = { version = "0.13", optional = true }
 imgui-wgpu = { version = "0.28", optional = true }
-winit = { version = "0.30", features = ["x11", "wayland", "wayland-dlopen", "rwh_06"], optional = true }
+winit = { version = "0.30", features = ["x11", "wayland", "wayland-csd-adwaita", "wayland-dlopen", "rwh_06"], optional = true }
 wgpu = { version = "29", optional = true }
 pollster = { version = "0.4", optional = true }
 rfd = { version = "0.17", optional = true }

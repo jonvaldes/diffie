@@ -270,6 +270,17 @@ impl ApplicationHandler for App {
                 INITIAL_WIDTH as f64,
                 INITIAL_HEIGHT as f64,
             ));
+
+        // On Wayland the compositor reads the window icon from a
+        // matching `.desktop` file resolved by app_id; the raw RGBA
+        // icon set above is ignored. Set app_id (and the X11 WM_CLASS,
+        // which uses the same code path in winit) to "diffie" so the
+        // packaged `assets/diffie.desktop` is the one consulted.
+        #[cfg(all(unix, not(target_os = "macos"), not(target_os = "android"), not(target_os = "ios")))]
+        let attrs = {
+            use winit::platform::wayland::WindowAttributesExtWayland;
+            attrs.with_name("diffie", "diffie")
+        };
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
 
         // --- wgpu -----------------------------------------------------------
@@ -772,27 +783,46 @@ fn keyboard_shortcuts(ui: &imgui::Ui, state: &mut AppState) {
     }
 }
 
-/// Clear the font atlas and re-add Roboto Regular (UI) + Roboto Mono (code)
-/// at the current `code_font_zoom`. Returns the new mono `FontId`.
+/// Clear the font atlas and re-add Roboto Regular (UI) + Roboto Mono Nerd
+/// Font (code) at the current `code_font_zoom`. Both fonts get the
+/// Nerd-Font icon glyphs merged in on the PUA range so icon codepoints
+/// like \u{f067} (`nf-fa-plus`) render whether they appear in UI labels
+/// or code views. Returns the mono `FontId`.
 fn load_fonts(imgui: &mut Context, ui_font_size: f32) -> FontId {
     let fonts = imgui.fonts();
     fonts.clear();
-    fonts.add_font(&[FontSource::TtfData {
-        data: aetna_fonts_roboto::ROBOTO_REGULAR,
-        size_pixels: ui_font_size,
-        config: Some(imgui::FontConfig {
+    let nerd_font_data: &'static [u8] =
+        include_bytes!("../../assets/RobotoMonoNerdFont-Regular.ttf");
+    fonts.add_font(&[
+        FontSource::TtfData {
+            data: aetna_fonts_roboto::ROBOTO_REGULAR,
             size_pixels: ui_font_size,
-            glyph_ranges: FontGlyphRanges::from_slice(EXTRA_GLYPH_RANGES),
-            ..Default::default()
-        }),
-    }]);
+            config: Some(imgui::FontConfig {
+                size_pixels: ui_font_size,
+                glyph_ranges: FontGlyphRanges::from_slice(EXTRA_GLYPH_RANGES),
+                ..Default::default()
+            }),
+        },
+        // Merge nerd-font icons into the UI font on the private-use range.
+        // imgui-rs sets MergeMode on every source after the first, so the
+        // icon glyphs supplement Roboto Regular without replacing it.
+        FontSource::TtfData {
+            data: nerd_font_data,
+            size_pixels: ui_font_size,
+            config: Some(imgui::FontConfig {
+                size_pixels: ui_font_size,
+                glyph_ranges: FontGlyphRanges::from_slice(NERD_ICON_GLYPH_RANGES),
+                ..Default::default()
+            }),
+        },
+    ]);
     let code_size = ui_font_size * CODE_FONT_BASE_SCALE * code_font_zoom();
     fonts.add_font(&[FontSource::TtfData {
-        data: include_bytes!("../../assets/RobotoMonoNerdFont-Regular.ttf"),
+        data: nerd_font_data,
         size_pixels: code_size,
         config: Some(imgui::FontConfig {
             size_pixels: code_size,
-            glyph_ranges: FontGlyphRanges::from_slice(EXTRA_GLYPH_RANGES),
+            glyph_ranges: FontGlyphRanges::from_slice(MONO_GLYPH_RANGES),
             ..Default::default()
         }),
     }])
@@ -816,6 +846,31 @@ static EXTRA_GLYPH_RANGES: &[u32] = &[
     0x2190, 0x21FF, // Arrows (→ ↔ ⇒)
     0x2200, 0x22FF, // Mathematical Operators (≥)
     0x2700, 0x27BF, // Dingbats (✕)
+    0,
+];
+
+/// Private-use codepoints covered by Nerd Fonts (Powerline, Devicons,
+/// Font Awesome, Octicons, Material Design subset, Codicons, etc). The
+/// Material Design block above U+10000 is excluded — imgui's default
+/// ImWchar is 16-bit, so high-plane glyphs are not loadable.
+#[rustfmt::skip]
+static NERD_ICON_GLYPH_RANGES: &[u32] = &[
+    0xE000, 0xF8FF, // Private Use Area — Nerd-Font icon block
+    0,
+];
+
+/// Codepoints rasterized into the monospace (code) font atlas. Combines
+/// the regular UI glyph set with the Nerd-Font icon block so icons can
+/// appear inline in diff/merge text.
+#[rustfmt::skip]
+static MONO_GLYPH_RANGES: &[u32] = &[
+    0x0020, 0x00FF,
+    0x0370, 0x03FF,
+    0x2010, 0x205E,
+    0x2190, 0x21FF,
+    0x2200, 0x22FF,
+    0x2700, 0x27BF,
+    0xE000, 0xF8FF, // Nerd-Font private-use icons
     0,
 ];
 
@@ -905,32 +960,156 @@ fn tab_bar(ui: &imgui::Ui, state: &mut AppState) {
     if state.tabs.is_empty() {
         return;
     }
+
+    // Custom-drawn tab strip:
+    //   - Each tab is a single rounded rectangle that contains the badge
+    //     icon, the label, and an inline close glyph. Hit testing uses
+    //     one invisible_button per tab; clicks inside the close glyph's
+    //     sub-rect close the tab, anywhere else activates it.
+    //   - The active tab shares its fill colour with the horizontal rule
+    //     drawn beneath the strip and extends a few pixels past the
+    //     rule, so the tab body visually merges into the rule (the
+    //     classic browser-tab look). Inactive tabs sit on top of the
+    //     rule with a flat bottom.
+    let dl = ui.get_window_draw_list();
     let mut new_active: Option<SessionId> = None;
     let mut close: Option<SessionId> = None;
+
+    const PAD_X: f32 = 10.0;
+    const PAD_Y: f32 = 6.0;
+    const GAP_LABEL_CLOSE: f32 = 12.0;
+    const TAB_ROUNDING: f32 = 8.0;
+    const TAB_SPACING: f32 = 4.0;
+    const UNDERLINE_THICKNESS: f32 = 2.0;
+
+    let close_glyph = "\u{f00d}";
+    let close_size = ui.calc_text_size(close_glyph);
+    let mouse = ui.io().mouse_pos;
+    // Active tab is a grey one step brighter than inactive; hover preview
+    // uses the same brightness so hovering an inactive tab previews how it
+    // will look when selected.
+    let active_color = theme::SURFACE1;
+    let inactive_color = theme::SURFACE0;
+    let hover_color = theme::SURFACE1;
+    let label_color = theme::TEXT;
+    let close_idle = theme::OVERLAY1;
+    let close_hover = theme::TEXT;
+
+    let strip_left = ui.cursor_screen_pos()[0];
+    let strip_y = ui.cursor_screen_pos()[1];
+    let mut row_max_h = 0.0_f32;
+    let mut active_extent: Option<(f32, f32)> = None;
+    let mut last_right_x = strip_left;
+
     for tab in &state.tabs {
         let active = state.active == Some(tab.session_id);
-        let _col = if active {
-            Some(ui.push_style_color(imgui::StyleColor::Button, theme::BLUE))
-        } else {
-            None
-        };
         let badge = match tab.mode {
-            TabMode::TwoWay => "[2]",
-            TabMode::ThreeWay => "[3]",
+            TabMode::TwoWay => "\u{f0ec}",
+            TabMode::ThreeWay => "\u{f126}",
         };
-        let label = format!("{badge} {}##sw_{}", tab.label, tab.session_id);
-        if ui.button(label) {
-            new_active = Some(tab.session_id);
+        let label_text = format!("{badge}  {}", tab.label);
+        let label_size = ui.calc_text_size(&label_text);
+        let tab_h = label_size[1].max(close_size[1]) + PAD_Y * 2.0;
+        let tab_w = PAD_X + label_size[0] + GAP_LABEL_CLOSE + close_size[0] + PAD_X;
+
+        let p = ui.cursor_screen_pos();
+        let p_min = p;
+        let p_max = [p[0] + tab_w, p[1] + tab_h];
+
+        ui.invisible_button(format!("##tab_{}", tab.session_id), [tab_w, tab_h]);
+        let hovered = ui.is_item_hovered();
+        let clicked = ui.is_item_clicked();
+
+        let close_x = p_max[0] - PAD_X - close_size[0];
+        let close_y = p_min[1] + (tab_h - close_size[1]) * 0.5;
+        let on_close = hovered
+            && mouse[0] >= close_x - 3.0
+            && mouse[0] <= close_x + close_size[0] + 3.0
+            && mouse[1] >= close_y - 3.0
+            && mouse[1] <= close_y + close_size[1] + 3.0;
+
+        if clicked {
+            if on_close {
+                close = Some(tab.session_id);
+            } else {
+                new_active = Some(tab.session_id);
+            }
         }
-        drop(_col);
-        ui.same_line_with_spacing(0.0, 2.0);
-        if ui.small_button(format!("×##close_{}", tab.session_id)) {
-            close = Some(tab.session_id);
+
+        let bg = if active {
+            active_color
+        } else if hovered {
+            hover_color
+        } else {
+            inactive_color
+        };
+
+        // Active tab: extend past the underline so the two share an edge
+        // visually. Inactive tabs: stop at the underline so the rule
+        // shows beneath them.
+        let bottom_y = if active {
+            p_max[1] + UNDERLINE_THICKNESS
+        } else {
+            p_max[1]
+        };
+        dl.add_rect(p_min, [p_max[0], bottom_y], bg)
+            .filled(true)
+            .rounding(TAB_ROUNDING)
+            .round_bot_left(false)
+            .round_bot_right(false)
+            .build();
+
+        let text_y = p_min[1] + PAD_Y;
+        dl.add_text([p_min[0] + PAD_X, text_y], label_color, &label_text);
+
+        let close_color = if on_close { close_hover } else { close_idle };
+        dl.add_text([close_x, close_y], close_color, close_glyph);
+
+        if active {
+            active_extent = Some((p_min[0], p_max[0]));
         }
-        ui.same_line();
+        row_max_h = row_max_h.max(tab_h);
+        last_right_x = p_max[0];
+
+        ui.same_line_with_spacing(0.0, TAB_SPACING);
     }
-    // End the same-line run so the next widget wraps onto a new row.
     ui.new_line();
+
+    // Horizontal rule beneath the strip — matches the active-tab fill so
+    // the active tab appears to "sit in" the rule.
+    let underline_y = strip_y + row_max_h;
+    let win_pos = ui.window_pos();
+    let win_size = ui.window_size();
+    let line_left = win_pos[0];
+    let line_right = win_pos[0] + win_size[0];
+    let line_color = active_color;
+    if let Some((ax, bx)) = active_extent {
+        if ax > line_left {
+            dl.add_line([line_left, underline_y + UNDERLINE_THICKNESS * 0.5],
+                        [ax,        underline_y + UNDERLINE_THICKNESS * 0.5],
+                        line_color)
+                .thickness(UNDERLINE_THICKNESS)
+                .build();
+        }
+        if bx < line_right {
+            dl.add_line([bx,         underline_y + UNDERLINE_THICKNESS * 0.5],
+                        [line_right, underline_y + UNDERLINE_THICKNESS * 0.5],
+                        line_color)
+                .thickness(UNDERLINE_THICKNESS)
+                .build();
+        }
+    } else {
+        dl.add_line([line_left,  underline_y + UNDERLINE_THICKNESS * 0.5],
+                    [line_right, underline_y + UNDERLINE_THICKNESS * 0.5],
+                    line_color)
+            .thickness(UNDERLINE_THICKNESS)
+            .build();
+    }
+    let _ = last_right_x;
+    // Push the cursor below the underline so subsequent content doesn't
+    // overlap the rule.
+    let cur = ui.cursor_screen_pos();
+    ui.set_cursor_screen_pos([cur[0], underline_y + UNDERLINE_THICKNESS + 4.0]);
     if let Some(id) = new_active {
         state.active = Some(id);
     }
@@ -1061,7 +1240,7 @@ fn anchor_bar_two_way(
     ui.text("Anchors: ");
     for (i, a) in anchors.iter().enumerate() {
         ui.same_line();
-        ui.text(format!("A:{} ↔ B:{}", a.a, a.b));
+        ui.text(format!("A:{} \u{f0ec} B:{}", a.a, a.b));
         ui.same_line();
         if ui.small_button(format!("✕##rm_anc_{i}")) {
             match store.remove_anchor(session_id, i) {
@@ -1414,7 +1593,9 @@ fn open_two_way_paths(state: &mut AppState, a: PathBuf, b: PathBuf) {
         opts,
     ) {
         Ok(id) => {
-            let label = format!("{} -> {}", basename(&a), basename(&b));
+            // nf-fa-exchange between the two filenames; matches the 2-way
+            // tab badge so the icon language stays consistent.
+            let label = format!("{} \u{f0ec} {}", basename(&a), basename(&b));
             let recent = recents::RecentEntry::TwoWay {
                 a: a.clone(),
                 b: b.clone(),
@@ -1500,7 +1681,9 @@ fn open_three_way_paths_with_result(
         )
     {
         Ok(id) => {
-            let label = format!("{} (3-way)", basename(&base));
+            // The tab badge already shows the code-fork icon; the label
+            // here keeps just the base filename so we don't double up.
+            let label = basename(&base);
             let recent = recents::RecentEntry::ThreeWay {
                 base: base.clone(),
                 local: local.clone(),

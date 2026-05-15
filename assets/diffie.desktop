@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Diffie
+GenericName=Diff & Merge
+Comment=Code diffing & 3-way merge desktop app
+Exec=diffie %F
+Icon=diffie
+Terminal=false
+Categories=Development;Utility;
+StartupWMClass=diffie
+MimeType=text/plain;
