@@ -584,3 +584,103 @@ fn undo_after_typing_reverts_session_text() {
         "after external set_side_text + input_epoch bump the widget should reflect the new text, not write its old internal state back; got {text_final:?}",
     );
 }
+
+#[cfg(test)]
+mod anchor_pick_tests {
+    use super::super::common::{
+        next_anchor_pick, AnchorPick, RailAction, RailClick, RailEvent, Side,
+    };
+
+    fn click(side: Side, line: u32, anchored: bool, idx: Option<usize>) -> RailClick {
+        RailClick { side, line, already_anchored: anchored, anchor_idx: idx }
+    }
+
+    #[test]
+    fn idle_unanchored_click_enters_picking() {
+        let (next, act) = next_anchor_pick(
+            AnchorPick::Idle,
+            RailEvent::Click(click(Side::Left, 3, false, None)),
+        );
+        assert_eq!(next, AnchorPick::Picking { side: Side::Left, line: 3 });
+        assert_eq!(act, RailAction::None);
+    }
+
+    #[test]
+    fn idle_anchored_click_removes() {
+        let (next, act) = next_anchor_pick(
+            AnchorPick::Idle,
+            RailEvent::Click(click(Side::Right, 7, true, Some(2))),
+        );
+        assert_eq!(next, AnchorPick::Idle);
+        assert_eq!(act, RailAction::RemoveAnchor { idx: 2 });
+    }
+
+    #[test]
+    fn picking_escape_cancels() {
+        let (next, act) = next_anchor_pick(
+            AnchorPick::Picking { side: Side::Left, line: 4 },
+            RailEvent::Escape,
+        );
+        assert_eq!(next, AnchorPick::Idle);
+        assert_eq!(act, RailAction::None);
+    }
+
+    #[test]
+    fn picking_elsewhere_cancels() {
+        let (next, act) = next_anchor_pick(
+            AnchorPick::Picking { side: Side::Right, line: 9 },
+            RailEvent::ClickedElsewhere,
+        );
+        assert_eq!(next, AnchorPick::Idle);
+        assert_eq!(act, RailAction::None);
+    }
+
+    #[test]
+    fn picking_opposite_unanchored_creates() {
+        let (next, act) = next_anchor_pick(
+            AnchorPick::Picking { side: Side::Left, line: 5 },
+            RailEvent::Click(click(Side::Right, 11, false, None)),
+        );
+        assert_eq!(next, AnchorPick::Idle);
+        assert_eq!(act, RailAction::AddAnchor { a: 5, b: 11 });
+    }
+
+    #[test]
+    fn picking_opposite_anchored_is_noop() {
+        let pick = AnchorPick::Picking { side: Side::Left, line: 5 };
+        let (next, act) = next_anchor_pick(
+            pick,
+            RailEvent::Click(click(Side::Right, 11, true, Some(0))),
+        );
+        assert_eq!(next, pick);
+        assert_eq!(act, RailAction::None);
+    }
+
+    #[test]
+    fn picking_same_side_replaces_source() {
+        let (next, act) = next_anchor_pick(
+            AnchorPick::Picking { side: Side::Left, line: 5 },
+            RailEvent::Click(click(Side::Left, 9, false, None)),
+        );
+        assert_eq!(next, AnchorPick::Picking { side: Side::Left, line: 9 });
+        assert_eq!(act, RailAction::None);
+    }
+
+    #[test]
+    fn picking_starts_with_right_side() {
+        // Anchor mapping must put the LEFT line in `a` regardless of which
+        // side the user clicked first.
+        let (next, act) = next_anchor_pick(
+            AnchorPick::Picking { side: Side::Right, line: 8 },
+            RailEvent::Click(click(Side::Left, 2, false, None)),
+        );
+        assert_eq!(next, AnchorPick::Idle);
+        assert_eq!(act, RailAction::AddAnchor { a: 2, b: 8 });
+    }
+
+    #[test]
+    fn none_event_preserves_state() {
+        let s = AnchorPick::Picking { side: Side::Left, line: 1 };
+        assert_eq!(next_anchor_pick(s, RailEvent::None), (s, RailAction::None));
+    }
+}

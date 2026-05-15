@@ -258,25 +258,14 @@ pub fn render(
 }
 
 fn handle_anchor_click(
-    state: &mut DiffViewState,
-    side: Side,
-    line: u32,
-    status: &mut String,
-    store: &SessionStore,
-    session_id: SessionId,
+    _state: &mut DiffViewState,
+    _side: Side,
+    _line: u32,
+    _status: &mut String,
+    _store: &SessionStore,
+    _session_id: SessionId,
 ) {
-    match side {
-        Side::Left => state.pending_a = Some(line),
-        Side::Right => state.pending_b = Some(line),
-    }
-    if let (Some(a), Some(b)) = (state.pending_a, state.pending_b) {
-        match store.add_anchor_two_way(session_id, Anchor { a, b }) {
-            Ok(()) => *status = format!("anchor added: A:{a} <-> B:{b}"),
-            Err(e) => *status = format!("anchor error: {e}"),
-        }
-        state.pending_a = None;
-        state.pending_b = None;
-    }
+    // Stub during refactor; rail-based anchor flow replaces this in Task 4.
 }
 
 #[allow(clippy::too_many_arguments)]

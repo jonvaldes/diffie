@@ -7,8 +7,14 @@
 pub(super) const ROW_H_BASE: f32 = 24.0;
 /// Width of the line-number gutter, sized for ~4 digits in the code-row mono.
 pub(super) const GUTTER_W_BASE: f32 = 60.0;
+/// Width of each anchor rail inside the connector strip.
+pub(super) const RAIL_W_BASE: f32 = 18.0;
 
 pub(super) const CONNECTOR_W: f32 = 60.0;
+
+pub(super) fn rail_w() -> f32 {
+    RAIL_W_BASE * crate::app::code_font_zoom()
+}
 
 /// Deprecated: use `ui.text_line_height()` inside the mono font scope.
 /// Kept for any callers we missed.
@@ -76,9 +82,8 @@ pub struct DiffViewState {
     /// `igSetNextWindowScroll`.
     pub(super) pending_left_scroll: Option<f32>,
     pub(super) pending_right_scroll: Option<f32>,
-    /// Two-click anchor creation: line picked on side A awaiting partner on B.
-    pub(super) pending_a: Option<u32>,
-    pub(super) pending_b: Option<u32>,
+    /// Live state of the hover-to-anchor interaction.
+    pub(super) anchor_pick: AnchorPick,
     /// Jump-to-pair target consumed on the next render.
     pub(super) pending_jump: Option<PendingJump>,
     /// Bumped on external buffer mutations (undo/redo, Apply A->B/B->A)
@@ -88,7 +93,7 @@ pub struct DiffViewState {
     pub input_epoch: u32,
 }
 
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Side {
     Left,
     Right,
@@ -160,4 +165,102 @@ fn locate_hunk(ranges: &[(u32, f32, f32)], y: f32) -> Option<(u32, f32)> {
         let span = (b.2 - b.1).max(1.0);
         (b.0, ((y - b.1) / span).clamp(0.0, 1.0))
     })
+}
+
+// ---------------------------------------------------------------------------
+// Hover-to-anchor state machine
+// ---------------------------------------------------------------------------
+
+/// Which icon — if any — the mouse is over on a given rail, or which icon was
+/// just clicked. `line` is 1-based.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RailClick {
+    pub side: Side,
+    pub line: crate::diff::LineNo,
+    /// Whether `line` is already part of an anchor in `session.anchors`.
+    pub already_anchored: bool,
+    /// If `already_anchored`, the index of the anchor in `session.anchors`.
+    pub anchor_idx: Option<usize>,
+}
+
+/// Live interaction state for hover-to-anchor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum AnchorPick {
+    #[default]
+    Idle,
+    /// User clicked an unanchored icon and is now dragging.
+    Picking { side: Side, line: crate::diff::LineNo },
+}
+
+/// One frame's worth of input that can affect `AnchorPick`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RailEvent {
+    /// Mouse-down on a rail icon at `click`.
+    Click(RailClick),
+    /// Mouse-down somewhere that is NOT a rail icon (anywhere inside the
+    /// diff view), and not on a hunk hover panel.
+    ClickedElsewhere,
+    /// Escape key pressed this frame.
+    Escape,
+    /// Nothing this frame.
+    None,
+}
+
+/// Side-effect to perform after a transition.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RailAction {
+    /// No store mutation.
+    None,
+    /// Remove `session.anchors[idx]`.
+    RemoveAnchor { idx: usize },
+    /// Insert a new `Anchor { a, b }`. `a` is the LEFT-side line, `b` the right.
+    AddAnchor { a: crate::diff::LineNo, b: crate::diff::LineNo },
+}
+
+/// Pure state-machine step. Returns the next pick state and the side-effect
+/// (if any) the caller must apply to `SessionStore`. Encodes the full table
+/// from the spec — including the "click anchored target on opposite side
+/// during Picking" no-op and the same-side source replace.
+pub(super) fn next_anchor_pick(current: AnchorPick, event: RailEvent) -> (AnchorPick, RailAction) {
+    use AnchorPick::*;
+    match (current, event) {
+        (_, RailEvent::None) => (current, RailAction::None),
+
+        // Cancel paths.
+        (Picking { .. }, RailEvent::Escape) => (Idle, RailAction::None),
+        (Picking { .. }, RailEvent::ClickedElsewhere) => (Idle, RailAction::None),
+        (Idle, RailEvent::Escape) => (Idle, RailAction::None),
+        (Idle, RailEvent::ClickedElsewhere) => (Idle, RailAction::None),
+
+        // Idle + click.
+        (Idle, RailEvent::Click(c)) => {
+            if c.already_anchored {
+                match c.anchor_idx {
+                    Some(idx) => (Idle, RailAction::RemoveAnchor { idx }),
+                    None => (Idle, RailAction::None),
+                }
+            } else {
+                (Picking { side: c.side, line: c.line }, RailAction::None)
+            }
+        }
+
+        // Picking + click on same-side icon: move source.
+        (Picking { side, .. }, RailEvent::Click(c)) if c.side == side => {
+            (Picking { side: c.side, line: c.line }, RailAction::None)
+        }
+
+        // Picking + click on opposite-side icon.
+        (Picking { side: src_side, line: src_line }, RailEvent::Click(c)) => {
+            if c.already_anchored {
+                // Ambiguous — keep dragging. User must remove first.
+                (Picking { side: src_side, line: src_line }, RailAction::None)
+            } else {
+                let (a, b) = match src_side {
+                    Side::Left => (src_line, c.line),
+                    Side::Right => (c.line, src_line),
+                };
+                (Idle, RailAction::AddAnchor { a, b })
+            }
+        }
+    }
 }
