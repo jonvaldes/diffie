@@ -1,0 +1,73 @@
+name: windows
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  build:
+    name: build (windows-latest)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable, msvc)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache cargo registry and target
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: windows-msvc
+
+      - name: Core tests (no GUI deps)
+        run: cargo test --no-default-features --lib
+
+      - name: Build release binary
+        run: cargo build --release --target x86_64-pc-windows-msvc
+
+      - name: Stage artifact
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item target/x86_64-pc-windows-msvc/release/diffie.exe dist/
+          if (Test-Path assets) { Copy-Item -Recurse assets dist/ }
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: diffie-windows-x86_64
+          path: dist/
+          if-no-files-found: error
+
+  release:
+    name: attach to release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: diffie-windows-x86_64
+          path: dist
+
+      - name: Zip Windows build
+        run: |
+          cd dist
+          zip -r "../diffie-${GITHUB_REF_NAME}-windows-x86_64.zip" .
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: diffie-*-windows-x86_64.zip
