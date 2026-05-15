@@ -1577,10 +1577,10 @@ fn browse_replace_side_at(state: &mut AppState, id: SessionId, idx: usize) {
         t.label = match t.mode {
             TabMode::TwoWay => format!(
                 "{} \u{f0ec} {}",
-                t.paths.first().map(basename).unwrap_or_default(),
-                t.paths.get(1).map(basename).unwrap_or_default()
+                pretty_basename(t.paths.first()),
+                pretty_basename(t.paths.get(1))
             ),
-            TabMode::ThreeWay => t.paths.first().map(basename).unwrap_or_default(),
+            TabMode::ThreeWay => pretty_basename(t.paths.first()),
         };
     }
     // Bump the input epoch so imgui re-initialises the multiline text edit
@@ -1656,10 +1656,10 @@ fn load_typed_path_into_side(state: &mut AppState, id: SessionId, idx: usize, pa
         t.label = match t.mode {
             TabMode::TwoWay => format!(
                 "{} \u{f0ec} {}",
-                t.paths.first().map(basename).unwrap_or_default(),
-                t.paths.get(1).map(basename).unwrap_or_default()
+                pretty_basename(t.paths.first()),
+                pretty_basename(t.paths.get(1))
             ),
-            TabMode::ThreeWay => t.paths.first().map(basename).unwrap_or_default(),
+            TabMode::ThreeWay => pretty_basename(t.paths.first()),
         };
     }
     match mode {
@@ -1936,18 +1936,49 @@ fn basename(p: &PathBuf) -> String {
         .unwrap_or_else(|| p.to_string_lossy().into_owned())
 }
 
+/// Tab-label-friendly version of `basename`: returns `(untitled)` for
+/// `None` or empty paths so the rendered label never has a blank
+/// segment around the connecting icon.
+fn pretty_basename(p: Option<&PathBuf>) -> String {
+    match p {
+        Some(p) if !p.as_os_str().is_empty() => basename(p),
+        _ => "(untitled)".to_string(),
+    }
+}
+
 fn pick_file(title: &str) -> Option<PathBuf> {
     rfd::FileDialog::new().set_title(title).pick_file()
 }
 
+/// Open a fresh 2-way tab with two empty buffers and no bound paths.
+/// The user fills the panes via the per-pane filename field (typed
+/// path + Enter, or the `…` browse button) in the view's header strip.
 fn open_two_way(state: &mut AppState) {
-    let Some(a) = pick_file("Open file A (2-way)") else {
-        return;
-    };
-    let Some(b) = pick_file("Open file B (2-way)") else {
-        return;
-    };
-    open_two_way_paths(state, a, b);
+    let engine = Some(state.preferences.default_engine.clone());
+    let opts = state.preferences.default_options;
+    match state.sessions.open_two_way_with(
+        String::new(),
+        String::new(),
+        false,
+        false,
+        engine,
+        opts,
+    ) {
+        Ok(id) => {
+            let label = "(untitled) \u{f0ec} (untitled)".to_string();
+            state.tabs.push(Tab {
+                session_id: id,
+                label: label.clone(),
+                mode: TabMode::TwoWay,
+                paths: vec![PathBuf::new(), PathBuf::new()],
+                result_path: None,
+                path_inputs: vec![String::new(), String::new()],
+            });
+            state.active = Some(id);
+            state.status = "Opened empty 2-way".into();
+        }
+        Err(e) => state.status = format!("Open 2-way failed: {e}"),
+    }
 }
 
 fn open_two_way_paths(state: &mut AppState, a: PathBuf, b: PathBuf) {
