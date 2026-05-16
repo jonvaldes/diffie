@@ -168,8 +168,10 @@ pub fn render(
     // doesn't show; paint our own blinking vertical line at the caret byte.
     if widget_active {
         let style = ui.clone_style();
+        let dl = ui.get_window_draw_list();
         syntax_paint::paint_caret(
             ui,
+            &dl,
             [widget_pos[0], widget_pos[1], widget_pos[0] + widget_w, widget_pos[1] + widget_h],
             &state.buffer,
             caret_byte.get(),

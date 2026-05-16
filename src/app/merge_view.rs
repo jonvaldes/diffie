@@ -715,6 +715,7 @@ fn paint_pane_text(
         if widget_active {
             syntax_paint::paint_caret(
                 ui,
+                &dl,
                 [widget_left, widget_top, widget_right, widget_bottom],
                 buf,
                 caret_byte,

@@ -122,6 +122,7 @@ pub fn paint_line_with_spans(
 #[allow(clippy::too_many_arguments)]
 pub fn paint_caret(
     ui: &Ui,
+    dl: &imgui::DrawListMut,
     widget_rect: [f32; 4],
     buf: &str,
     caret_byte: i32,
@@ -142,7 +143,6 @@ pub fn paint_caret(
     let widget_top = widget_rect[1];
     let widget_right = widget_rect[2];
     let widget_bottom = widget_rect[3];
-    let dl = ui.get_window_draw_list();
     let target = caret_byte as usize;
     let mut byte_acc: usize = 0;
     let mut painted = false;
