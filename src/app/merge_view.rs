@@ -448,6 +448,7 @@ fn render_pane(
     }
 
     let _wp = ui.push_style_var(StyleVar::WindowPadding([0.0, 0.0]));
+    let _cbg = ui.push_style_color(imgui::StyleColor::ChildBg, [0.0, 0.0, 0.0, 0.0]);
     {
         let buf: &mut String = match pane {
             Pane::Base => &mut state.base_buf,
@@ -497,6 +498,7 @@ fn render_pane(
                 }
             });
     }
+    drop(_cbg);
     drop(_wp);
 
     let widget_active = widget_active_cell.get();
