@@ -1773,8 +1773,8 @@ fn current_session_summary(ui: &imgui::Ui, state: &mut AppState) {
                 ),
                 None => (None, None),
             };
-            let a_key = id << 1;
-            let b_key = (id << 1) | 1;
+            let a_key = id << 2;
+            let b_key = (id << 2) | 1;
             let a_lines_vec: Vec<String> = crate::session::lines_of(a_text)
                 .into_iter().map(|s| s.to_string()).collect();
             let b_lines_vec: Vec<String> = crate::session::lines_of(b_text)
@@ -1829,12 +1829,35 @@ fn current_session_summary(ui: &imgui::Ui, state: &mut AppState) {
                 state.status = "edited (Ctrl+Z to undo)".to_string();
             }
         }
-        SessionMode::ThreeWay { hunks, anchors, resolutions, .. } => {
+        SessionMode::ThreeWay { hunks, anchors, resolutions, base_text, local_text, remote_text, .. } => {
             let counts = three_way_header::count_hunks(hunks);
             three_way_header::render(ui, counts);
             ui.separator();
             anchor_bar_three_way(ui, &state.sessions, id, anchors, &mut state.status);
             ui.separator();
+            // Per-side syntax highlights for the three input panes, mirroring
+            // the 2-way path. Each side may have a different language if the
+            // user picked mixed extensions.
+            let (base_lang, local_lang, remote_lang) = match &tab_paths_snap {
+                Some(paths) => (
+                    paths.first().and_then(|p| syntax::lang_for_path(p)),
+                    paths.get(1).and_then(|p| syntax::lang_for_path(p)),
+                    paths.get(2).and_then(|p| syntax::lang_for_path(p)),
+                ),
+                None => (None, None, None),
+            };
+            let base_key   = (id << 2) | 0;
+            let local_key  = (id << 2) | 1;
+            let remote_key = (id << 2) | 2;
+            let base_lines:   Vec<String> = crate::session::lines_of(base_text)
+                .into_iter().map(|s| s.to_string()).collect();
+            let local_lines:  Vec<String> = crate::session::lines_of(local_text)
+                .into_iter().map(|s| s.to_string()).collect();
+            let remote_lines: Vec<String> = crate::session::lines_of(remote_text)
+                .into_iter().map(|s| s.to_string()).collect();
+            let base_h   = state.syntax.highlights(base_key,   base_lang,   &base_lines).to_vec();
+            let local_h  = state.syntax.highlights(local_key,  local_lang,  &local_lines).to_vec();
+            let remote_h = state.syntax.highlights(remote_key, remote_lang, &remote_lines).to_vec();
             let avail = ui.content_region_avail();
             let result_h = 200.0_f32.min(avail[1] * 0.4);
             let diff_h = (avail[1] - result_h - 8.0).max(50.0);
@@ -1859,6 +1882,9 @@ fn current_session_summary(ui: &imgui::Ui, state: &mut AppState) {
                             mono,
                             &mut focus_request,
                             &mut pending_edits,
+                            &base_h,
+                            &local_h,
+                            &remote_h,
                         );
                     });
                 if let Some(p) = focus_request {
