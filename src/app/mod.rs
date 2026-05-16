@@ -32,6 +32,7 @@ pub mod three_way_header;
 mod recents;
 mod result_pane;
 mod syntax;
+mod syntax_paint;
 mod theme;
 mod undo_stack;
 
