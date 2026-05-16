@@ -20,7 +20,7 @@ use imgui::{FontId, StyleVar, Ui};
 use crate::app::syntax::LineSpans;
 use crate::app::syntax_paint;
 use crate::app::theme;
-use crate::merge::{hunk_output_ranges, MergeHunk, Resolution};
+use crate::merge::{hunk_output_ranges, result_line_origins, LineOrigin, MergeHunk, Resolution};
 use crate::session::{SessionId, SessionStore};
 
 const STRIPE_W: f32 = 4.0;
@@ -152,6 +152,12 @@ pub fn render(
     let widget_active = widget_active_cell.get();
     let widget_focused = widget_focused_cell.get();
 
+    // Per-line origin tints: only meaningful when the buffer matches the
+    // computed merge output (no manual edit overriding things). We compare
+    // line counts as a cheap guard.
+    let origins = result_line_origins(hunks, resolutions);
+    let origins_match = origins.len() == state.buffer.lines().count();
+
     // Paint syntax-highlighted text on top of the transparent multiline.
     paint_text(
         ui,
@@ -162,6 +168,7 @@ pub fn render(
         result_highlights,
         scroll_y,
         lh,
+        if origins_match { Some(&origins) } else { None },
     );
 
     // Manual caret. Imgui's Text color is transparent so its native caret
@@ -234,6 +241,7 @@ fn paint_text(
     highlights: &[LineSpans],
     scroll_y: f32,
     lh: f32,
+    origins: Option<&[LineOrigin]>,
 ) {
     let style = ui.clone_style();
     let padding_x = style.frame_padding[0];
@@ -244,6 +252,8 @@ fn paint_text(
         widget_pos[0] + widget_w,
         widget_pos[1] + widget_h,
     ];
+    let widget_left = widget_rect[0];
+    let widget_right = widget_rect[2];
     syntax_paint::paint_text_lines(
         ui,
         widget_rect,
@@ -254,10 +264,30 @@ fn paint_text(
         padding_x,
         padding_y,
         lh,
-        |_dl, _line_idx, _line_text, _ln, _y0, _y1| {
-            // Result pane has no per-line decorations.
+        |dl, line_idx, _line_text, _ln, y0, y1| {
+            let Some(origins) = origins else { return };
+            let Some(origin) = origins.get(line_idx) else { return };
+            let Some(color) = origin_row_bg(*origin) else { return };
+            if y1 > y0 {
+                dl.add_rect([widget_left, y0], [widget_right, y1], color)
+                    .filled(true)
+                    .build();
+            }
         },
     );
+}
+
+/// Per-row background tint for each line origin. Mirrors the 2-way diff's
+/// row-background convention (low-alpha fills) but uses the 3-way side
+/// palette so the tint matches the gutter stripe and picker icons.
+fn origin_row_bg(origin: LineOrigin) -> Option<[f32; 4]> {
+    match origin {
+        LineOrigin::Stable => None,
+        LineOrigin::Local => Some([0.18, 0.50, 0.22, 0.30]),
+        LineOrigin::Remote => Some([0.18, 0.30, 0.55, 0.30]),
+        LineOrigin::Base => Some([0.55, 0.50, 0.18, 0.30]),
+        LineOrigin::Custom => Some([0.40, 0.40, 0.40, 0.30]),
+    }
 }
 
 // ---------------------------------------------------------------------------

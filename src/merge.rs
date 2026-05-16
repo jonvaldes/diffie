@@ -315,14 +315,13 @@ pub fn apply_resolutions(
                 Some(Resolution::Base) => base.clone(),
                 Some(Resolution::Custom { text: t }) => t.clone(),
                 None => {
-                    // Unresolved: emit conflict markers so the user sees them in the result.
-                    let mut v = vec!["<<<<<<< LOCAL".to_string()];
+                    // Unresolved: emit local then base then remote, no markers.
+                    // The result pane tints each line by its origin so the user
+                    // can still distinguish the three groups visually.
+                    let mut v = Vec::with_capacity(local.len() + base.len() + remote.len());
                     v.extend(local.clone());
-                    v.push("||||||| BASE".to_string());
                     v.extend(base.clone());
-                    v.push("=======".to_string());
                     v.extend(remote.clone());
-                    v.push(">>>>>>> REMOTE".to_string());
                     v
                 }
             },
@@ -363,10 +362,7 @@ pub fn hunk_output_ranges(
                 Some(Resolution::Remote) => remote.len() as u32,
                 Some(Resolution::Base) => base.len() as u32,
                 Some(Resolution::Custom { text: t }) => t.len() as u32,
-                None => {
-                    // Markers: 4 fence lines + local + base + remote.
-                    (4 + local.len() + base.len() + remote.len()) as u32
-                }
+                None => (local.len() + base.len() + remote.len()) as u32,
             },
         };
         if count == 0 {
@@ -376,6 +372,67 @@ pub fn hunk_output_ranges(
         let last = line_n + count - 1;
         out.push((h.id(), first, last));
         line_n += count;
+    }
+    out
+}
+
+/// Origin of a single output line in the merged result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LineOrigin {
+    /// Common content shared by all sides — paint with no tint.
+    Stable,
+    Local,
+    Remote,
+    Base,
+    /// User-supplied text via `Resolution::Custom`.
+    Custom,
+}
+
+/// One `LineOrigin` per output line of `apply_resolutions`. Length matches
+/// `apply_resolutions(...).lines().count()` exactly. Used by the result pane
+/// to tint each line by the side it came from.
+pub fn result_line_origins(
+    hunks: &[MergeHunk],
+    resolutions: &std::collections::HashMap<u32, Resolution>,
+) -> Vec<LineOrigin> {
+    let mut out: Vec<LineOrigin> = Vec::new();
+    for h in hunks {
+        match h {
+            MergeHunk::Stable { id, base: _, text } => {
+                let (lines, origin) = match resolutions.get(id) {
+                    Some(Resolution::Custom { text: t }) => (t.len(), LineOrigin::Custom),
+                    _ => (text.len(), LineOrigin::Stable),
+                };
+                for _ in 0..lines { out.push(origin); }
+            }
+            MergeHunk::LocalOnly { id, base, local } => {
+                let (lines, origin) = match resolutions.get(id) {
+                    Some(Resolution::Base) => (base.len(), LineOrigin::Base),
+                    Some(Resolution::Custom { text: t }) => (t.len(), LineOrigin::Custom),
+                    _ => (local.len(), LineOrigin::Local),
+                };
+                for _ in 0..lines { out.push(origin); }
+            }
+            MergeHunk::RemoteOnly { id, base, remote } => {
+                let (lines, origin) = match resolutions.get(id) {
+                    Some(Resolution::Base) => (base.len(), LineOrigin::Base),
+                    Some(Resolution::Custom { text: t }) => (t.len(), LineOrigin::Custom),
+                    _ => (remote.len(), LineOrigin::Remote),
+                };
+                for _ in 0..lines { out.push(origin); }
+            }
+            MergeHunk::Conflict { id, base, local, remote } => match resolutions.get(id) {
+                Some(Resolution::Local) => for _ in 0..local.len() { out.push(LineOrigin::Local); },
+                Some(Resolution::Remote) => for _ in 0..remote.len() { out.push(LineOrigin::Remote); },
+                Some(Resolution::Base) => for _ in 0..base.len() { out.push(LineOrigin::Base); },
+                Some(Resolution::Custom { text: t }) => for _ in 0..t.len() { out.push(LineOrigin::Custom); },
+                None => {
+                    for _ in 0..local.len() { out.push(LineOrigin::Local); }
+                    for _ in 0..base.len() { out.push(LineOrigin::Base); }
+                    for _ in 0..remote.len() { out.push(LineOrigin::Remote); }
+                }
+            },
+        }
     }
     out
 }
@@ -499,8 +556,8 @@ mod tests {
         }];
         let resolutions = std::collections::HashMap::new();
         let ranges = hunk_output_ranges(&hunks, &resolutions);
-        // Markers: <<<LOCAL, L, |||BASE, b, ===, R, >>>REMOTE = 7 lines.
-        assert_eq!(ranges, vec![(2, 1, 7)]);
+        // Unresolved conflict emits local + base + remote, no markers: 1+1+1 = 3.
+        assert_eq!(ranges, vec![(2, 1, 3)]);
     }
 
     #[test]
