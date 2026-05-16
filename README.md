@@ -1,9 +1,32 @@
 # Diffie
 
-A native desktop code diffing & 3-way merge app, written in Rust.
-
 **WARNING: THIS PROGRAM IS 100% SLOP, AND I DO NOT TRUST IT. I ADVISE YOU STAY CLEAR OF IT UNTIL IT'S MUCH, MUCH MORE HARDENED.**
 
+## Q: YOU'RE USING THE ABOMINABLE SLOP MACHINE TO BUILD THIS? DO YOU HAVE NO SHAME?
+
+A: Yes, I am using the slop machine. I don't like it. There's so many morally
+wrong things with the slop machine that you could fill entire books with them.
+
+And yet I'm using it indeed.
+
+The truth is, I'm using the slop machine because I have a compulsive need to
+build things, and between a demanding job and an extremely demanding family
+life I can't find time or energy to do it the normal way. And I was going
+insane.
+
+So this is really a mental health project for me. It is helping me remain sane.
+If it happens to help you too in any way, great!
+
+But if this slop contamination makes you run away and never look back, fair
+enough. Whatever lets you keep a bit of your sanity. 
+
+Sending you a big hug from here. I hope you have a wonderful day/week/month/year/life!
+
+
+
+## Sloppy summary of the project
+
+A native desktop code diffing & 3-way merge app, written in Rust.
 
 Diffie is built on `imgui-rs` + `wgpu` + `winit` and edits both sides of a diff (or all three sides of a merge) in place. The diff/merge core is a plain library — engine-agnostic, GUI-free, and unit-tested independently of the rendering layer.
 
