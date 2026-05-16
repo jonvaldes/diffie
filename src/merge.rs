@@ -217,6 +217,97 @@ impl<E: DiffEngine + Clone> ThreeWayMerge<E> {
     }
 }
 
+/// Compute 3-way merge hunks via the `merge3` crate (a port of bzr/breezy's
+/// merge3 algorithm). Sync regions are computed by intersecting base↔local
+/// and base↔remote matching blocks, so insertions on one side don't taint
+/// rows that are actually unchanged across all three files.
+///
+/// Anchors and `DiffOptions` are accepted for API parity but currently
+/// ignored: `merge3` exposes only the default matching-blocks function
+/// (gestalt PM) and an optional patience variant. Whitespace normalization
+/// is the caller's responsibility (apply it to the line buffers before
+/// calling).
+pub fn merge_with_merge3(
+    base: &[&str],
+    local: &[&str],
+    remote: &[&str],
+    _anchors: &[MergeAnchor],
+    _opts: &DiffOptions,
+) -> Vec<MergeHunk> {
+    // Walk sync regions ourselves so we can carry the full (base, local,
+    // remote) line range for *every* hunk — `MergeRegion::A/B/Same` only
+    // carry one side's range, which would leave the base pane without
+    // line layout for those hunks.
+    let m = merge3::Merge3::new(base, local, remote);
+    let mut hunks: Vec<MergeHunk> = Vec::new();
+    let mut next_id: u32 = 0;
+    let mut iz = 0usize;
+    let mut ia = 0usize;
+    let mut ib = 0usize;
+    let slice_strings = |s: &[&str], lo: usize, hi: usize| -> Vec<String> {
+        s[lo..hi].iter().map(|x| x.to_string()).collect()
+    };
+    for (zmatch, zend, amatch, aend, bmatch, bend) in m.find_sync_regions() {
+        // Region between previous sync and this sync: classify by which
+        // side(s) differ from base.
+        if amatch > ia || bmatch > ib || zmatch > iz {
+            let base_lines = slice_strings(base, iz, zmatch);
+            let local_lines = slice_strings(local, ia, amatch);
+            let remote_lines = slice_strings(remote, ib, bmatch);
+            let local_equal_base = local_lines == base_lines;
+            let remote_equal_base = remote_lines == base_lines;
+            let id = next_id; next_id += 1;
+            let hunk = match (local_equal_base, remote_equal_base) {
+                (true, true) => MergeHunk::Stable {
+                    id, base: base_lines.clone(), text: base_lines,
+                },
+                (true, false) => MergeHunk::RemoteOnly {
+                    id, base: base_lines, remote: remote_lines,
+                },
+                (false, true) => MergeHunk::LocalOnly {
+                    id, base: base_lines, local: local_lines,
+                },
+                (false, false) => {
+                    if local_lines == remote_lines {
+                        // Both sides made identical change.
+                        MergeHunk::Stable {
+                            id, base: base_lines, text: local_lines,
+                        }
+                    } else {
+                        MergeHunk::Conflict {
+                            id, base: base_lines, local: local_lines, remote: remote_lines,
+                        }
+                    }
+                }
+            };
+            hunks.push(hunk);
+        }
+        // The sync region itself: unchanged in both descendants.
+        let matchlen = zend - zmatch;
+        if matchlen > 0 {
+            let lines = slice_strings(base, zmatch, zend);
+            let id = next_id; next_id += 1;
+            hunks.push(MergeHunk::Stable {
+                id, base: lines.clone(), text: lines,
+            });
+        }
+        iz = zend; ia = aend; ib = bend;
+    }
+    // Coalesce adjacent Stable hunks for a cleaner UI.
+    let mut coalesced: Vec<MergeHunk> = Vec::with_capacity(hunks.len());
+    for h in hunks {
+        if let (Some(MergeHunk::Stable { base: pb, text: pt, .. }), MergeHunk::Stable { base: nb, text: nt, .. }) =
+            (coalesced.last_mut(), &h)
+        {
+            pb.extend(nb.iter().cloned());
+            pt.extend(nt.iter().cloned());
+        } else {
+            coalesced.push(h);
+        }
+    }
+    coalesced
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Shape {
     Stable,
@@ -495,6 +586,70 @@ mod tests {
 
         res.insert(conflict_id, Resolution::Custom { text: vec!["X".into()] });
         assert_eq!(apply_resolutions(&hunks, &res), "a\nX\nc");
+    }
+
+    #[test]
+    fn merge3_test_data_3way_1_no_phantom_one_sided() {
+        // The bug: row 2 (an unchanged "AAAA" in all three files) was
+        // showing as cyan (RemoteOnly) under the bucketing-based merge.
+        // With merge3-based merging, the second AAAA should be in a Stable
+        // region.
+        let base = split_lines("AAAA\nAAAA\nAAAA\n");
+        let local = split_lines("AAAA\nAAAA\nBBBB\nBBBB\n");
+        let remote = split_lines("AAAA\nAAAA\nBBBB\nAAAA\n");
+        let hunks = merge_with_merge3(&base, &local, &remote, &[], &DiffOptions::default());
+        // First hunk must be Stable covering at least the first two AAAAs.
+        let first = &hunks[0];
+        match first {
+            MergeHunk::Stable { base: b, text: t, .. } => {
+                assert!(b.len() >= 2, "expected first Stable to cover the leading AAAAs, got {:?}", b);
+                assert_eq!(b[0], "AAAA");
+                assert_eq!(b[1], "AAAA");
+                assert_eq!(b, t);
+            }
+            other => panic!("expected leading Stable hunk, got {:?}", other),
+        }
+        // No RemoteOnly hunk should exist for this input — the BBBB-line
+        // appears on *both* sides at the same position; the divergence is
+        // only on the trailing line (BBBB locally vs AAAA remotely).
+        assert!(
+            !hunks.iter().any(|h| matches!(h, MergeHunk::RemoteOnly { .. })),
+            "merge3 must not produce a RemoteOnly hunk here; hunks={:?}", hunks
+        );
+        // There should be a Conflict somewhere covering the divergent tail.
+        assert!(
+            hunks.iter().any(|h| matches!(h, MergeHunk::Conflict { .. })),
+            "expected a Conflict for the divergent tail; hunks={:?}", hunks
+        );
+    }
+
+    #[test]
+    fn merge3_basic_conflict() {
+        let base = split_lines("a\nb\nc\n");
+        let local = split_lines("a\nL\nc\n");
+        let remote = split_lines("a\nR\nc\n");
+        let hunks = merge_with_merge3(&base, &local, &remote, &[], &DiffOptions::default());
+        assert!(hunks.iter().any(|h| matches!(h, MergeHunk::Conflict { .. })));
+    }
+
+    #[test]
+    fn merge3_local_only_change() {
+        let base = split_lines("a\nb\nc\n");
+        let local = split_lines("a\nB\nc\n");
+        let remote = split_lines("a\nb\nc\n");
+        let hunks = merge_with_merge3(&base, &local, &remote, &[], &DiffOptions::default());
+        assert!(hunks.iter().any(|h| matches!(h, MergeHunk::LocalOnly { .. })));
+        assert!(!hunks.iter().any(|h| matches!(h, MergeHunk::Conflict { .. })));
+    }
+
+    #[test]
+    fn merge3_same_change_is_stable() {
+        let base = split_lines("a\nb\nc\n");
+        let same = split_lines("a\nB\nc\n");
+        let hunks = merge_with_merge3(&base, &same, &same, &[], &DiffOptions::default());
+        assert!(!hunks.iter().any(|h| matches!(h, MergeHunk::Conflict { .. })));
+        assert!(!hunks.iter().any(|h| matches!(h, MergeHunk::LocalOnly { .. })));
+        assert!(!hunks.iter().any(|h| matches!(h, MergeHunk::RemoteOnly { .. })));
     }
 
     #[test]

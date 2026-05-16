@@ -256,8 +256,14 @@ fn recompute_three_way(
     let base: Vec<&str> = base_vec.iter().copied().collect();
     let local: Vec<&str> = local_vec.iter().copied().collect();
     let remote: Vec<&str> = remote_vec.iter().copied().collect();
-    // Three-way merge is generic over a concrete engine type for performance,
-    // so we dispatch by name. Initial set: myers, patience, histogram.
+    // PROTOTYPE: route all 3-way merges through the merge3 crate, which uses
+    // sync-region intersection (bzr/breezy algorithm) instead of our bucket-
+    // by-base attribution. Set `DIFFIE_LEGACY_3WAY=1` to fall back to the
+    // old ThreeWayMerge<E> path for side-by-side comparison.
+    if std::env::var("DIFFIE_LEGACY_3WAY").ok().as_deref() != Some("1") {
+        let _ = engine_name; // merge3 has no engine-choice surface (yet)
+        return Ok(crate::merge::merge_with_merge3(&base, &local, &remote, anchors, opts));
+    }
     match engine_name {
         "myers" => {
             let m = ThreeWayMerge::new(MyersDiff);
