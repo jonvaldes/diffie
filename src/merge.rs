@@ -332,6 +332,54 @@ pub fn apply_resolutions(
     out.join("\n")
 }
 
+/// For each hunk, return `(hunk_id, first_line_1based, last_line_1based)` of
+/// the lines the hunk will contribute to the merged output, given the current
+/// resolutions. Mirrors `apply_resolutions`' line accounting exactly. Hunks
+/// that resolve to zero lines are skipped.
+pub fn hunk_output_ranges(
+    hunks: &[MergeHunk],
+    resolutions: &std::collections::HashMap<u32, Resolution>,
+) -> Vec<(u32, u32, u32)> {
+    let mut out = Vec::with_capacity(hunks.len());
+    let mut line_n: u32 = 1;
+    for h in hunks {
+        let count: u32 = match h {
+            MergeHunk::Stable { id, text, .. } => match resolutions.get(id) {
+                Some(Resolution::Custom { text: t }) => t.len() as u32,
+                _ => text.len() as u32,
+            },
+            MergeHunk::LocalOnly { id, base, local } => match resolutions.get(id) {
+                Some(Resolution::Base) => base.len() as u32,
+                Some(Resolution::Custom { text: t }) => t.len() as u32,
+                _ => local.len() as u32,
+            },
+            MergeHunk::RemoteOnly { id, base, remote } => match resolutions.get(id) {
+                Some(Resolution::Base) => base.len() as u32,
+                Some(Resolution::Custom { text: t }) => t.len() as u32,
+                _ => remote.len() as u32,
+            },
+            MergeHunk::Conflict { id, base, local, remote } => match resolutions.get(id) {
+                Some(Resolution::Local) => local.len() as u32,
+                Some(Resolution::Remote) => remote.len() as u32,
+                Some(Resolution::Base) => base.len() as u32,
+                Some(Resolution::Custom { text: t }) => t.len() as u32,
+                None => {
+                    // Markers: 4 fence lines + local + base + remote.
+                    (4 + local.len() + base.len() + remote.len()) as u32
+                }
+            },
+        };
+        if count == 0 {
+            continue;
+        }
+        let first = line_n;
+        let last = line_n + count - 1;
+        out.push((h.id(), first, last));
+        line_n += count;
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -402,5 +450,118 @@ mod tests {
         assert!(hunks.iter().all(|h| !matches!(h, MergeHunk::Conflict { .. })));
         let merged = apply_resolutions(&hunks, &std::collections::HashMap::new());
         assert_eq!(merged, "a\nB\nc");
+    }
+
+    #[test]
+    fn hunk_output_ranges_stable_uses_text_lines() {
+        let hunks = vec![MergeHunk::Stable {
+            id: 0,
+            base: vec!["b1".into(), "b2".into()],
+            text: vec!["t1".into(), "t2".into(), "t3".into()],
+        }];
+        let resolutions = std::collections::HashMap::new();
+        let ranges = hunk_output_ranges(&hunks, &resolutions);
+        assert_eq!(ranges, vec![(0, 1, 3)]);
+    }
+
+    #[test]
+    fn hunk_output_ranges_local_only_default_uses_local() {
+        let hunks = vec![MergeHunk::LocalOnly {
+            id: 0,
+            base: vec!["b".into()],
+            local: vec!["L1".into(), "L2".into()],
+        }];
+        let resolutions = std::collections::HashMap::new();
+        let ranges = hunk_output_ranges(&hunks, &resolutions);
+        assert_eq!(ranges, vec![(0, 1, 2)]);
+    }
+
+    #[test]
+    fn hunk_output_ranges_local_only_base_resolution_uses_base() {
+        let hunks = vec![MergeHunk::LocalOnly {
+            id: 7,
+            base: vec!["b1".into(), "b2".into(), "b3".into()],
+            local: vec!["L".into()],
+        }];
+        let mut resolutions = std::collections::HashMap::new();
+        resolutions.insert(7, Resolution::Base);
+        let ranges = hunk_output_ranges(&hunks, &resolutions);
+        assert_eq!(ranges, vec![(7, 1, 3)]);
+    }
+
+    #[test]
+    fn hunk_output_ranges_conflict_unresolved_includes_markers() {
+        let hunks = vec![MergeHunk::Conflict {
+            id: 2,
+            base: vec!["b".into()],
+            local: vec!["L".into()],
+            remote: vec!["R".into()],
+        }];
+        let resolutions = std::collections::HashMap::new();
+        let ranges = hunk_output_ranges(&hunks, &resolutions);
+        // Markers: <<<LOCAL, L, |||BASE, b, ===, R, >>>REMOTE = 7 lines.
+        assert_eq!(ranges, vec![(2, 1, 7)]);
+    }
+
+    #[test]
+    fn hunk_output_ranges_conflict_resolved_to_local() {
+        let hunks = vec![MergeHunk::Conflict {
+            id: 2,
+            base: vec!["b".into()],
+            local: vec!["L1".into(), "L2".into()],
+            remote: vec!["R".into()],
+        }];
+        let mut resolutions = std::collections::HashMap::new();
+        resolutions.insert(2, Resolution::Local);
+        let ranges = hunk_output_ranges(&hunks, &resolutions);
+        assert_eq!(ranges, vec![(2, 1, 2)]);
+    }
+
+    #[test]
+    fn hunk_output_ranges_skips_zero_line_hunks() {
+        // A custom resolution with zero lines: hunk emits nothing, must be skipped.
+        let hunks = vec![
+            MergeHunk::Stable {
+                id: 0,
+                base: vec!["b".into()],
+                text: vec!["b".into()],
+            },
+            MergeHunk::Conflict {
+                id: 1,
+                base: vec!["b".into()],
+                local: vec!["L".into()],
+                remote: vec!["R".into()],
+            },
+        ];
+        let mut resolutions = std::collections::HashMap::new();
+        resolutions.insert(1, Resolution::Custom { text: vec![] });
+        let ranges = hunk_output_ranges(&hunks, &resolutions);
+        assert_eq!(ranges, vec![(0, 1, 1)]); // hunk 1 skipped
+    }
+
+    #[test]
+    fn hunk_output_ranges_multiple_hunks_total_matches_apply_resolutions() {
+        let hunks = vec![
+            MergeHunk::Stable {
+                id: 0,
+                base: vec!["a".into(), "b".into()],
+                text: vec!["a".into(), "b".into()],
+            },
+            MergeHunk::LocalOnly {
+                id: 1,
+                base: vec!["c".into()],
+                local: vec!["c'".into(), "c''".into()],
+            },
+            MergeHunk::Stable {
+                id: 2,
+                base: vec!["d".into()],
+                text: vec!["d".into()],
+            },
+        ];
+        let resolutions = std::collections::HashMap::new();
+        let ranges = hunk_output_ranges(&hunks, &resolutions);
+        let total: u32 = ranges.iter().map(|(_, lo, hi)| hi - lo + 1).sum();
+        let out = apply_resolutions(&hunks, &resolutions);
+        assert_eq!(total as usize, out.lines().count());
     }
 }
