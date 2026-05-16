@@ -243,12 +243,16 @@ pub fn render(
     let local_layout = build_layout(hunks, Pane::Local, lh);
     let remote_layout = build_layout(hunks, Pane::Remote, lh);
 
+    // Layout: Remote | connector_rb | Base | connector_bl | Local. Putting
+    // Base in the middle makes each connector a true pair (Remote↔Base on the
+    // left, Base↔Local on the right), so per-pair ribbon coloring lines up
+    // naturally with what each adjacent pane shows.
     let panes_top_left = ui.cursor_screen_pos();
-    let base_pos = panes_top_left;
+    let remote_pos = panes_top_left;
+    let connector_rb_pos = [remote_pos[0] + pane_w, remote_pos[1]];
+    let base_pos = [connector_rb_pos[0] + CONNECTOR_W, remote_pos[1]];
     let connector_bl_pos = [base_pos[0] + pane_w, base_pos[1]];
     let local_pos = [connector_bl_pos[0] + CONNECTOR_W, base_pos[1]];
-    let connector_lr_pos = [local_pos[0] + pane_w, base_pos[1]];
-    let remote_pos = [connector_lr_pos[0] + CONNECTOR_W, base_pos[1]];
 
     let hover_panes: [Cell<Option<(u32, HunkKind, [f32; 2])>>; 3] =
         [Cell::new(None), Cell::new(None), Cell::new(None)];
@@ -260,26 +264,25 @@ pub fn render(
     // animation frame.
     let prev_targets = state.target;
 
+    let (_remote_rect, remote_scroll, remote_origin) = render_pane(
+        ui, state, remote_pos, pane_w, pane_h, Pane::Remote, session_id,
+        pending_edits, &remote_layout, &hover_panes[2], &focus_event, lh,
+    );
+
+    ui.set_cursor_screen_pos(connector_rb_pos);
+    ui.invisible_button("merge_connector_rb", [CONNECTOR_W, pane_h]);
+
     let (_base_rect, base_scroll, base_origin) = render_pane(
         ui, state, base_pos, pane_w, pane_h, Pane::Base, session_id,
         pending_edits, &base_layout, &hover_panes[0], &focus_event, lh,
     );
 
-    // Connector BASE↔LOCAL: empty area for the bezier ribbons.
     ui.set_cursor_screen_pos(connector_bl_pos);
     ui.invisible_button("merge_connector_bl", [CONNECTOR_W, pane_h]);
 
     let (_local_rect, local_scroll, local_origin) = render_pane(
         ui, state, local_pos, pane_w, pane_h, Pane::Local, session_id,
         pending_edits, &local_layout, &hover_panes[1], &focus_event, lh,
-    );
-
-    ui.set_cursor_screen_pos(connector_lr_pos);
-    ui.invisible_button("merge_connector_lr", [CONNECTOR_W, pane_h]);
-
-    let (_remote_rect, remote_scroll, remote_origin) = render_pane(
-        ui, state, remote_pos, pane_w, pane_h, Pane::Remote, session_id,
-        pending_edits, &remote_layout, &hover_panes[2], &focus_event, lh,
     );
 
     if let Some(p) = focus_event.get() {
@@ -301,6 +304,21 @@ pub fn render(
     // y0 of each pane's connector strip is the same.
     draw_connector(
         ui,
+        connector_rb_pos,
+        CONNECTOR_W,
+        pane_h,
+        remote_origin[1] - remote_scroll,
+        base_origin[1] - base_scroll,
+        &remote_layout.ranges,
+        &base_layout.ranges,
+        &remote_layout.line_ys,
+        &base_layout.line_ys,
+        anchors.iter().map(|a| (a.remote, a.base)).collect::<Vec<_>>().as_slice(),
+        hunks,
+        lh,
+    );
+    draw_connector(
+        ui,
         connector_bl_pos,
         CONNECTOR_W,
         pane_h,
@@ -311,21 +329,6 @@ pub fn render(
         &base_layout.line_ys,
         &local_layout.line_ys,
         anchors.iter().map(|a| (a.base, a.local)).collect::<Vec<_>>().as_slice(),
-        hunks,
-        lh,
-    );
-    draw_connector(
-        ui,
-        connector_lr_pos,
-        CONNECTOR_W,
-        pane_h,
-        local_origin[1] - local_scroll,
-        remote_origin[1] - remote_scroll,
-        &local_layout.ranges,
-        &remote_layout.ranges,
-        &local_layout.line_ys,
-        &remote_layout.line_ys,
-        anchors.iter().map(|a| (a.local, a.remote)).collect::<Vec<_>>().as_slice(),
         hunks,
         lh,
     );
