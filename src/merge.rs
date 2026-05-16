@@ -12,7 +12,12 @@ pub struct MergeAnchor {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum MergeHunk {
-    Stable { id: u32, text: Vec<String> },
+    /// `base` is the original base text for the hunk (used to lay out the
+    /// BASE pane). `text` is the merged result shown on Local/Remote panes
+    /// and used by `apply_resolutions`. For "no change" Stable runs the two
+    /// are equal; they diverge when both sides made the same change to base
+    /// (e.g., both deleted the same lines).
+    Stable { id: u32, base: Vec<String>, text: Vec<String> },
     LocalOnly { id: u32, base: Vec<String>, local: Vec<String> },
     RemoteOnly { id: u32, base: Vec<String>, remote: Vec<String> },
     Conflict { id: u32, base: Vec<String>, local: Vec<String>, remote: Vec<String> },
@@ -270,8 +275,8 @@ fn build_hunk(id: u32, shape: Shape, local: &[SideOp], remote: &[SideOp]) -> Mer
         // text is the changed text (which == local_text == remote_text), not base.
         Shape::Stable => {
             let any_change = local.iter().any(|o| !matches!(o, SideOp::Keep(_)));
-            let text = if any_change { local_text } else { base_text };
-            MergeHunk::Stable { id, text }
+            let text = if any_change { local_text } else { base_text.clone() };
+            MergeHunk::Stable { id, base: base_text, text }
         }
         Shape::LocalOnly => MergeHunk::LocalOnly { id, base: base_text, local: local_text },
         Shape::RemoteOnly => MergeHunk::RemoteOnly { id, base: base_text, remote: remote_text },
@@ -290,7 +295,7 @@ pub fn apply_resolutions(
     let mut out: Vec<String> = Vec::new();
     for h in hunks {
         let lines: Vec<String> = match h {
-            MergeHunk::Stable { id, text } => match resolutions.get(id) {
+            MergeHunk::Stable { id, text, .. } => match resolutions.get(id) {
                 Some(Resolution::Custom { text: t }) => t.clone(),
                 _ => text.clone(),
             },

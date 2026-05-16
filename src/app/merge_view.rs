@@ -127,6 +127,7 @@ fn hunk_kind(h: &MergeHunk) -> Option<HunkKind> {
 
 fn pane_text<'a>(h: &'a MergeHunk, pane: Pane) -> &'a [String] {
     match (h, pane) {
+        (MergeHunk::Stable { base, .. }, Pane::Base) => base,
         (MergeHunk::Stable { text, .. }, _) => text,
         (MergeHunk::LocalOnly { base, .. }, Pane::Base) => base,
         (MergeHunk::LocalOnly { local, .. }, Pane::Local) => local,
