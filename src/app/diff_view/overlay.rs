@@ -238,45 +238,18 @@ pub(super) fn paint_pane_text(
             }
 
             // Caret. Blink: ~1s period, on for first half. Only when active.
-            if widget_active && caret_byte >= 0 {
-                let blink_on = (ui.time() * 2.0).rem_euclid(2.0) < 1.0;
-                if blink_on {
-                    let target = caret_byte as usize;
-                    let mut byte_acc: usize = 0;
-                    let mut painted = false;
-                    for (line_idx, line_text) in buf.lines().enumerate() {
-                        let line_end = byte_acc + line_text.len();
-                        if target >= byte_acc && target <= line_end {
-                            let local = target - byte_acc;
-                            let x = widget_left - scroll_x
-                                + syntax_paint::text_x_at_byte(ui, line_text, local, padding_x);
-                            let y = widget_top + padding_y + (line_idx as f32) * lh - scroll_y;
-                            if y + lh >= widget_top && y <= widget_bottom {
-                                dl.add_line(
-                                    [x, y + 1.0],
-                                    [x, y + lh - 1.0],
-                                    theme::TEXT(),
-                                )
-                                .thickness(1.0)
-                                .build();
-                            }
-                            painted = true;
-                            break;
-                        }
-                        byte_acc = line_end + 1; // +1 for '\n'
-                    }
-                    // Caret past the last newline (trailing empty line).
-                    if !painted && target >= byte_acc {
-                        let line_idx = buf.lines().count();
-                        let x = widget_left + padding_x - scroll_x;
-                        let y = widget_top + padding_y + (line_idx as f32) * lh - scroll_y;
-                        if y + lh >= widget_top && y <= widget_bottom {
-                            dl.add_line([x, y + 1.0], [x, y + lh - 1.0], theme::TEXT())
-                                .thickness(1.0)
-                                .build();
-                        }
-                    }
-                }
+            if widget_active {
+                syntax_paint::paint_caret(
+                    ui,
+                    [widget_left, widget_top, widget_right, widget_bottom],
+                    buf,
+                    caret_byte,
+                    scroll_x,
+                    scroll_y,
+                    padding_x,
+                    padding_y,
+                    lh,
+                );
             }
         },
     );

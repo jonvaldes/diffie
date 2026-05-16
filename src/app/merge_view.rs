@@ -712,45 +712,18 @@ fn paint_pane_text(
             );
         }
 
-        if widget_active && caret_byte >= 0 {
-            let blink_on = (ui.time() * 2.0).rem_euclid(2.0) < 1.0;
-            if blink_on {
-                let target = caret_byte as usize;
-                let mut byte_acc: usize = 0;
-                let mut painted = false;
-                for (line_idx, line_text) in buf.lines().enumerate() {
-                    let line_end = byte_acc + line_text.len();
-                    if target >= byte_acc && target <= line_end {
-                        let local = target - byte_acc;
-                        let clamped = local.min(line_text.len());
-                        let mut snap = clamped;
-                        while snap > 0 && !line_text.is_char_boundary(snap) {
-                            snap -= 1;
-                        }
-                        let x = widget_left + padding_x - scroll_x
-                            + ui.calc_text_size(&line_text[..snap])[0];
-                        let y = widget_top + padding_y + (line_idx as f32) * lh - scroll_y;
-                        if y + lh >= widget_top && y <= widget_bottom {
-                            dl.add_line([x, y + 1.0], [x, y + lh - 1.0], theme::TEXT())
-                                .thickness(1.0)
-                                .build();
-                        }
-                        painted = true;
-                        break;
-                    }
-                    byte_acc = line_end + 1;
-                }
-                if !painted && target >= byte_acc {
-                    let line_idx = buf.lines().count();
-                    let x = widget_left + padding_x - scroll_x;
-                    let y = widget_top + padding_y + (line_idx as f32) * lh - scroll_y;
-                    if y + lh >= widget_top && y <= widget_bottom {
-                        dl.add_line([x, y + 1.0], [x, y + lh - 1.0], theme::TEXT())
-                            .thickness(1.0)
-                            .build();
-                    }
-                }
-            }
+        if widget_active {
+            syntax_paint::paint_caret(
+                ui,
+                [widget_left, widget_top, widget_right, widget_bottom],
+                buf,
+                caret_byte,
+                scroll_x,
+                scroll_y,
+                padding_x,
+                padding_y,
+                lh,
+            );
         }
     });
 

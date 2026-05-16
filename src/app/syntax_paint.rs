@@ -113,6 +113,67 @@ pub fn paint_line_with_spans(
     }
 }
 
+/// Paint a blinking vertical caret line at byte offset `caret_byte` inside
+/// `buf`, clipped to `widget_rect = [left, top, right, bottom]`. Walks lines
+/// to locate the caret's row + column. Skips painting entirely when
+/// `caret_byte < 0` or the current blink half is "off". Shared by all three
+/// text panes since they each suppress imgui's native caret to render
+/// their own syntax-colored text on the draw list.
+#[allow(clippy::too_many_arguments)]
+pub fn paint_caret(
+    ui: &Ui,
+    widget_rect: [f32; 4],
+    buf: &str,
+    caret_byte: i32,
+    scroll_x: f32,
+    scroll_y: f32,
+    padding_x: f32,
+    padding_y: f32,
+    lh: f32,
+) {
+    if caret_byte < 0 || lh <= 0.0 {
+        return;
+    }
+    let blink_on = (ui.time() * 2.0).rem_euclid(2.0) < 1.0;
+    if !blink_on {
+        return;
+    }
+    let widget_left = widget_rect[0];
+    let widget_top = widget_rect[1];
+    let widget_right = widget_rect[2];
+    let widget_bottom = widget_rect[3];
+    let dl = ui.get_window_draw_list();
+    let target = caret_byte as usize;
+    let mut byte_acc: usize = 0;
+    let mut painted = false;
+    for (line_idx, line_text) in buf.lines().enumerate() {
+        let line_end = byte_acc + line_text.len();
+        if target >= byte_acc && target <= line_end {
+            let local = target - byte_acc;
+            let x = widget_left - scroll_x + text_x_at_byte(ui, line_text, local, padding_x);
+            let y = widget_top + padding_y + (line_idx as f32) * lh - scroll_y;
+            if y + lh >= widget_top && y <= widget_bottom && x >= widget_left && x <= widget_right {
+                dl.add_line([x, y + 1.0], [x, y + lh - 1.0], theme::TEXT())
+                    .thickness(1.0)
+                    .build();
+            }
+            painted = true;
+            break;
+        }
+        byte_acc = line_end + 1; // +1 for '\n'
+    }
+    if !painted && target >= byte_acc {
+        let line_idx = buf.lines().count();
+        let x = widget_left + padding_x - scroll_x;
+        let y = widget_top + padding_y + (line_idx as f32) * lh - scroll_y;
+        if y + lh >= widget_top && y <= widget_bottom {
+            dl.add_line([x, y + 1.0], [x, y + lh - 1.0], theme::TEXT())
+                .thickness(1.0)
+                .build();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

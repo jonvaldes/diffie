@@ -166,15 +166,17 @@ pub fn render(
 
     // Manual caret. Imgui's Text color is transparent so its native caret
     // doesn't show; paint our own blinking vertical line at the caret byte.
-    if widget_active && caret_byte.get() >= 0 {
-        paint_caret(
+    if widget_active {
+        let style = ui.clone_style();
+        syntax_paint::paint_caret(
             ui,
-            widget_pos,
-            widget_w,
-            widget_h,
+            [widget_pos[0], widget_pos[1], widget_pos[0] + widget_w, widget_pos[1] + widget_h],
             &state.buffer,
             caret_byte.get(),
+            0.0,
             scroll_y,
+            style.frame_padding[0],
+            style.frame_padding[1],
             lh,
         );
     }
@@ -266,73 +268,6 @@ fn paint_text(
                 0.0,
                 padding_x,
             );
-        }
-    });
-}
-
-// ---------------------------------------------------------------------------
-// Caret painting.
-// ---------------------------------------------------------------------------
-
-#[allow(clippy::too_many_arguments)]
-fn paint_caret(
-    ui: &Ui,
-    widget_pos: [f32; 2],
-    widget_w: f32,
-    widget_h: f32,
-    buf: &str,
-    caret_byte: i32,
-    scroll_y: f32,
-    lh: f32,
-) {
-    if lh <= 0.0 || caret_byte < 0 {
-        return;
-    }
-    // Blink at the standard imgui rate.
-    let blink_on = (ui.time() * 2.0).rem_euclid(2.0) < 1.0;
-    if !blink_on {
-        return;
-    }
-    let style = ui.clone_style();
-    let padding_x = style.frame_padding[0];
-    let padding_y = style.frame_padding[1];
-    let widget_top = widget_pos[1];
-    let widget_bottom = widget_top + widget_h;
-    let widget_left = widget_pos[0];
-    let widget_right = widget_left + widget_w;
-
-    let target = caret_byte as usize;
-    let mut byte_acc: usize = 0;
-    let dl = ui.get_window_draw_list();
-    dl.with_clip_rect([widget_left, widget_top], [widget_right, widget_bottom], || {
-        let mut painted = false;
-        for (line_idx, line_text) in buf.lines().enumerate() {
-            let line_end = byte_acc + line_text.len();
-            if target >= byte_acc && target <= line_end {
-                let local = target - byte_acc;
-                let snap = syntax_paint::snap_to_char_boundary(line_text, local);
-                let x = widget_left + padding_x + ui.calc_text_size(&line_text[..snap])[0];
-                let y = widget_top + padding_y + (line_idx as f32) * lh - scroll_y;
-                if y + lh >= widget_top && y <= widget_bottom {
-                    dl.add_line([x, y + 1.0], [x, y + lh - 1.0], theme::TEXT())
-                        .thickness(1.0)
-                        .build();
-                }
-                painted = true;
-                break;
-            }
-            byte_acc = line_end + 1;
-        }
-        if !painted && target >= byte_acc {
-            // Caret after the final newline.
-            let line_idx = buf.lines().count();
-            let x = widget_left + padding_x;
-            let y = widget_top + padding_y + (line_idx as f32) * lh - scroll_y;
-            if y + lh >= widget_top && y <= widget_bottom {
-                dl.add_line([x, y + 1.0], [x, y + lh - 1.0], theme::TEXT())
-                    .thickness(1.0)
-                    .build();
-            }
         }
     });
 }
