@@ -12,6 +12,7 @@ use crate::session::{SessionId, TwoWaySide};
 
 use super::common::{AnchorPick, PendingJump, Side};
 use crate::app::syntax::LineSpans;
+use crate::app::syntax_paint;
 
 /// Pure: 1-based row from a mouse y, the widget's top in screen space,
 /// the widget's scroll, and the line height.
@@ -81,18 +82,6 @@ pub(super) fn anchor_icon_center(
     let x = (rail_left + rail_right) * 0.5;
     let y = line_screen_y(pane_top, line, scroll_y, lh) + lh * 0.5;
     [x, y]
-}
-
-/// Compute the x offset of a byte position within `line`, clamped to a
-/// char boundary, using imgui's font metrics (matches the multiline widget's
-/// own hit-testing).
-pub(super) fn text_x_at_byte(ui: &Ui, line: &str, byte_offset: usize, padding_x: f32) -> f32 {
-    let clamped = byte_offset.min(line.len());
-    let mut snap = clamped;
-    while snap > 0 && !line.is_char_boundary(snap) {
-        snap -= 1;
-    }
-    padding_x + ui.calc_text_size(&line[..snap])[0]
 }
 
 /// Paint EVERYTHING for one pane on the foreground draw list:
@@ -220,9 +209,9 @@ pub(super) fn paint_pane_text(
                                     continue;
                                 }
                                 let x0 = widget_left - scroll_x
-                                    + text_x_at_byte(ui, line_text, sp.start as usize, padding_x);
+                                    + syntax_paint::text_x_at_byte(ui, line_text, sp.start as usize, padding_x);
                                 let x1 = widget_left - scroll_x
-                                    + text_x_at_byte(ui, line_text, sp.end as usize, padding_x);
+                                    + syntax_paint::text_x_at_byte(ui, line_text, sp.end as usize, padding_x);
                                 let x0c = x0.max(widget_left).min(widget_right);
                                 let x1c = x1.max(widget_left).min(widget_right);
                                 if x1c > x0c {
@@ -235,78 +224,17 @@ pub(super) fn paint_pane_text(
                     }
                 }
 
-                // Paint text. If there are highlight spans for this line,
-                // walk the line and emit a chunk per span boundary in default
-                // color + each span in its color. Otherwise emit the whole
-                // line in default color.
-                let text_y = y;
-                let line_spans_opt = highlights.get(line_idx);
-                if let Some(line_spans) = line_spans_opt.filter(|v| !v.is_empty()) {
-                    // Walk char-indexed positions.
-                    let chars: Vec<(usize, char)> = line_text.char_indices().collect();
-                    let mut cursor_col: usize = 0;
-                    for span in line_spans {
-                        let s = span.start_col;
-                        let e = span.end_col.min(chars.len());
-                        if e <= s {
-                            continue;
-                        }
-                        // Default-colored gap before this span.
-                        if s > cursor_col {
-                            let gap_start_byte = chars[cursor_col].0;
-                            let gap_end_byte = if s >= chars.len() {
-                                line_text.len()
-                            } else {
-                                chars[s].0
-                            };
-                            if gap_end_byte > gap_start_byte {
-                                let x = widget_left - scroll_x
-                                    + text_x_at_byte(ui, line_text, gap_start_byte, padding_x);
-                                dl.add_text(
-                                    [x, text_y],
-                                    theme::TEXT(),
-                                    &line_text[gap_start_byte..gap_end_byte],
-                                );
-                            }
-                        }
-                        // Colored span.
-                        if s >= chars.len() {
-                            cursor_col = s;
-                            continue;
-                        }
-                        let span_start_byte = chars[s].0;
-                        let span_end_byte = if e >= chars.len() {
-                            line_text.len()
-                        } else {
-                            chars[e].0
-                        };
-                        if span_end_byte > span_start_byte {
-                            let x = widget_left - scroll_x
-                                + text_x_at_byte(ui, line_text, span_start_byte, padding_x);
-                            dl.add_text(
-                                [x, text_y],
-                                span.kind.color(),
-                                &line_text[span_start_byte..span_end_byte],
-                            );
-                        }
-                        cursor_col = e;
-                    }
-                    // Tail after the last span.
-                    if cursor_col < chars.len() {
-                        let tail_byte = chars[cursor_col].0;
-                        if tail_byte < line_text.len() {
-                            let x = widget_left - scroll_x
-                                + text_x_at_byte(ui, line_text, tail_byte, padding_x);
-                            dl.add_text([x, text_y], theme::TEXT(), &line_text[tail_byte..]);
-                        }
-                    }
-                } else if !line_text.is_empty() {
-                    dl.add_text(
-                        [widget_left + padding_x - scroll_x, text_y],
-                        theme::TEXT(),
-                        line_text,
-                    );
-                }
+                // Paint text via the shared per-line span painter.
+                let line_origin = [widget_left + padding_x - scroll_x, y];
+                syntax_paint::paint_line_with_spans(
+                    ui,
+                    &dl,
+                    line_origin,
+                    line_text,
+                    highlights.get(line_idx),
+                    scroll_x,
+                    padding_x,
+                );
             }
 
             // Caret. Blink: ~1s period, on for first half. Only when active.
@@ -321,7 +249,7 @@ pub(super) fn paint_pane_text(
                         if target >= byte_acc && target <= line_end {
                             let local = target - byte_acc;
                             let x = widget_left - scroll_x
-                                + text_x_at_byte(ui, line_text, local, padding_x);
+                                + syntax_paint::text_x_at_byte(ui, line_text, local, padding_x);
                             let y = widget_top + padding_y + (line_idx as f32) * lh - scroll_y;
                             if y + lh >= widget_top && y <= widget_bottom {
                                 dl.add_line(

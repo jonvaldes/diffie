@@ -6,7 +6,7 @@
 //! Both view kinds suppress imgui's own text rendering and rely on this
 //! helper to paint text on the foreground draw list.
 
-use imgui::Ui;
+use imgui::{DrawListMut, Ui};
 
 use crate::app::syntax::LineSpans;
 use crate::app::theme;
@@ -29,13 +29,14 @@ pub(crate) fn text_x_at_byte(ui: &Ui, line: &str, byte_offset: usize, padding_x:
     padding_x + ui.calc_text_size(&line[..snap])[0]
 }
 
-/// Paint one line of text on the current window's draw list. If `line_spans`
-/// is provided and non-empty, emit one chunk per span boundary: default-color
-/// gaps + span-colored ranges + default-color tail. Otherwise emit the whole
-/// line in `theme::TEXT()`. `line_origin_x` is the screen-space x of byte 0 of
-/// the line (i.e. `widget_left + padding_x - scroll_x`).
+/// Paint one line of text on a draw list. If `line_spans` is provided and
+/// non-empty, emit one chunk per span boundary: default-color gaps +
+/// span-colored ranges + default-color tail. Otherwise emit the whole line
+/// in `theme::TEXT()`. `line_origin` is the screen-space position of byte 0
+/// (i.e. `[widget_left + padding_x - scroll_x, y]`).
 pub fn paint_line_with_spans(
     ui: &Ui,
+    dl: &DrawListMut,
     line_origin: [f32; 2],
     line_text: &str,
     line_spans: Option<&LineSpans>,
@@ -45,7 +46,6 @@ pub fn paint_line_with_spans(
     if line_text.is_empty() {
         return;
     }
-    let dl = ui.get_window_draw_list();
     let widget_left = line_origin[0] - padding_x + scroll_x;
     let text_y = line_origin[1];
 
