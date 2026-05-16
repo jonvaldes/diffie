@@ -1829,6 +1829,9 @@ fn current_session_summary(ui: &imgui::Ui, state: &mut AppState) {
             }
         }
         SessionMode::ThreeWay { hunks, anchors, .. } => {
+            let counts = three_way_header::count_hunks(hunks);
+            three_way_header::render(ui, counts);
+            ui.separator();
             anchor_bar_three_way(ui, &state.sessions, id, anchors, &mut state.status);
             ui.separator();
             let avail = ui.content_region_avail();
