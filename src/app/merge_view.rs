@@ -213,6 +213,13 @@ pub fn render(
     if remote_changed {
         state.remote_buf = remote_text.clone();
     }
+    // External buffer changes (file load, undo/redo, Apply-side) need a fresh
+    // widget id so imgui re-initialises stb_textedit from the new buffer.
+    // Callers already bump on the known paths, but bump again here so any
+    // future entry point that mutates session text stays correct.
+    if base_changed || local_changed || remote_changed {
+        state.input_epoch = state.input_epoch.wrapping_add(1);
+    }
 
     let avail = ui.content_region_avail();
     let total_w = avail[0];
