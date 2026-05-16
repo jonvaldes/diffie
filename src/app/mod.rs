@@ -1858,6 +1858,13 @@ fn current_session_summary(ui: &imgui::Ui, state: &mut AppState) {
             let base_h   = state.syntax.highlights(base_key,   base_lang,   &base_lines).to_vec();
             let local_h  = state.syntax.highlights(local_key,  local_lang,  &local_lines).to_vec();
             let remote_h = state.syntax.highlights(remote_key, remote_lang, &remote_lines).to_vec();
+            // Result-pane highlights: use BASE's language as the canonical
+            // file type for the merged output. The cache key uses bits 11
+            // which the three input-pane keys (00/01/10) don't touch.
+            let result_text = state.sessions.compute_result(id).unwrap_or_default();
+            let result_lines: Vec<String> = result_text.lines().map(String::from).collect();
+            let result_key = (id << 2) | 3;
+            let result_highlights = state.syntax.highlights(result_key, base_lang, &result_lines).to_vec();
             let avail = ui.content_region_avail();
             let result_h = 200.0_f32.min(avail[1] * 0.4);
             let diff_h = (avail[1] - result_h - 8.0).max(50.0);
@@ -1915,6 +1922,7 @@ fn current_session_summary(ui: &imgui::Ui, state: &mut AppState) {
                             &mut focus_request,
                             hunks,
                             resolutions,
+                            &result_highlights,
                         );
                     });
                 if let Some(p) = focus_request {
