@@ -1828,7 +1828,7 @@ fn current_session_summary(ui: &imgui::Ui, state: &mut AppState) {
                 state.status = "edited (Ctrl+Z to undo)".to_string();
             }
         }
-        SessionMode::ThreeWay { hunks, anchors, .. } => {
+        SessionMode::ThreeWay { hunks, anchors, resolutions, .. } => {
             let counts = three_way_header::count_hunks(hunks);
             three_way_header::render(ui, counts);
             ui.separator();
@@ -1886,6 +1886,8 @@ fn current_session_summary(ui: &imgui::Ui, state: &mut AppState) {
                             result,
                             mono,
                             &mut focus_request,
+                            hunks,
+                            resolutions,
                         );
                     });
                 if let Some(p) = focus_request {
