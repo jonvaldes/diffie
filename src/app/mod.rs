@@ -1416,9 +1416,21 @@ enum HeaderAction {
 fn pane_header_bar(ui: &imgui::Ui, state: &mut AppState, id: SessionId) -> Option<HeaderAction> {
     let tab_idx = state.tabs.iter().position(|t| t.session_id == id)?;
     let mode = state.tabs[tab_idx].mode;
-    let (segments, role_labels): (usize, &[&str]) = match mode {
-        TabMode::TwoWay => (2, &["A", "B"]),
-        TabMode::ThreeWay => (3, &["BASE", "LOCAL", "REMOTE"]),
+    // Role marker per pane. For 3-way panes the marker is the same
+    // shape+color the result pane uses to identify each source
+    // (diamond/sapphire = Remote, square/yellow = Base, circle/green = Local).
+    // 2-way panes have no marker.
+    use crate::session::ThreeWaySide;
+    let (segments, role_entries): (usize, &[(Option<ThreeWaySide>, &str)]) = match mode {
+        TabMode::TwoWay => (2, &[(None, "A"), (None, "B")]),
+        TabMode::ThreeWay => (
+            3,
+            &[
+                (Some(ThreeWaySide::Remote), "REMOTE"),
+                (Some(ThreeWaySide::Base), "BASE"),
+                (Some(ThreeWaySide::Local), "LOCAL"),
+            ],
+        ),
     };
     if state.tabs[tab_idx].path_inputs.len() < segments {
         state.tabs[tab_idx]
@@ -1433,9 +1445,15 @@ fn pane_header_bar(ui: &imgui::Ui, state: &mut AppState, id: SessionId) -> Optio
     let avail_w = ui.content_region_avail()[0];
     let seg_gap = 8.0;
     let seg_w = ((avail_w - seg_gap * (segments as f32 - 1.0)) / segments as f32).max(160.0);
-    let role_w = role_labels
+    const ROLE_ICON_HALF: f32 = 5.5;
+    const ROLE_ICON_GAP: f32 = 6.0;
+    let icon_slot_w =
+        |has_icon: bool| if has_icon { ROLE_ICON_HALF * 2.0 + ROLE_ICON_GAP } else { 0.0 };
+    let role_w = role_entries
         .iter()
-        .map(|r| ui.calc_text_size(&format!("[{r}]"))[0])
+        .map(|(side, label)| {
+            icon_slot_w(side.is_some()) + ui.calc_text_size(format!("[{label}]"))[0]
+        })
         .fold(0.0_f32, f32::max);
     let save_btn_w = ui.calc_text_size(save_glyph)[0] + 14.0;
     let browse_btn_w = ui.calc_text_size(browse_glyph)[0] + 12.0;
@@ -1449,7 +1467,18 @@ fn pane_header_bar(ui: &imgui::Ui, state: &mut AppState, id: SessionId) -> Optio
         ui.set_cursor_screen_pos([seg_left, start[1]]);
 
         ui.align_text_to_frame_padding();
-        ui.text_disabled(format!("[{}]", role_labels[i]));
+        let (side, label) = role_entries[i];
+        // Draw the source-color shape (3-way only) just left of the label,
+        // vertically centered on the row, then advance the cursor past it.
+        let mut label_x = seg_left;
+        if let Some(s) = side {
+            let cy = start[1] + ui.frame_height() * 0.5;
+            let cx = seg_left + ROLE_ICON_HALF;
+            result_pane::paint_role_icon(ui, [cx, cy], s, ROLE_ICON_HALF);
+            label_x = seg_left + ROLE_ICON_HALF * 2.0 + ROLE_ICON_GAP;
+        }
+        ui.set_cursor_screen_pos([label_x, start[1]]);
+        ui.text_disabled(format!("[{label}]"));
         ui.same_line();
         ui.set_cursor_screen_pos([seg_left + role_w + 8.0, start[1]]);
 
@@ -1545,9 +1574,9 @@ fn browse_replace_side_at(state: &mut AppState, id: SessionId, idx: usize) {
     let side = match (mode, idx) {
         (TabMode::TwoWay, 0) => crate::session::SideRef::TwoWay(crate::session::TwoWaySide::A),
         (TabMode::TwoWay, 1) => crate::session::SideRef::TwoWay(crate::session::TwoWaySide::B),
-        (TabMode::ThreeWay, 0) => crate::session::SideRef::ThreeWay(crate::session::ThreeWaySide::Base),
-        (TabMode::ThreeWay, 1) => crate::session::SideRef::ThreeWay(crate::session::ThreeWaySide::Local),
-        (TabMode::ThreeWay, 2) => crate::session::SideRef::ThreeWay(crate::session::ThreeWaySide::Remote),
+        (TabMode::ThreeWay, 0) => crate::session::SideRef::ThreeWay(crate::session::ThreeWaySide::Remote),
+        (TabMode::ThreeWay, 1) => crate::session::SideRef::ThreeWay(crate::session::ThreeWaySide::Base),
+        (TabMode::ThreeWay, 2) => crate::session::SideRef::ThreeWay(crate::session::ThreeWaySide::Local),
         _ => return,
     };
     let Some(path) = pick_file("Open file") else {
@@ -1582,7 +1611,7 @@ fn browse_replace_side_at(state: &mut AppState, id: SessionId, idx: usize) {
                 pretty_basename(t.paths.first()),
                 pretty_basename(t.paths.get(1))
             ),
-            TabMode::ThreeWay => pretty_basename(t.paths.first()),
+            TabMode::ThreeWay => pretty_basename(t.paths.get(1)),
         };
     }
     // Bump the input epoch so imgui re-initialises the multiline text edit
@@ -1632,9 +1661,9 @@ fn load_typed_path_into_side(state: &mut AppState, id: SessionId, idx: usize, pa
     let side = match (mode, idx) {
         (TabMode::TwoWay, 0) => crate::session::SideRef::TwoWay(crate::session::TwoWaySide::A),
         (TabMode::TwoWay, 1) => crate::session::SideRef::TwoWay(crate::session::TwoWaySide::B),
-        (TabMode::ThreeWay, 0) => crate::session::SideRef::ThreeWay(crate::session::ThreeWaySide::Base),
-        (TabMode::ThreeWay, 1) => crate::session::SideRef::ThreeWay(crate::session::ThreeWaySide::Local),
-        (TabMode::ThreeWay, 2) => crate::session::SideRef::ThreeWay(crate::session::ThreeWaySide::Remote),
+        (TabMode::ThreeWay, 0) => crate::session::SideRef::ThreeWay(crate::session::ThreeWaySide::Remote),
+        (TabMode::ThreeWay, 1) => crate::session::SideRef::ThreeWay(crate::session::ThreeWaySide::Base),
+        (TabMode::ThreeWay, 2) => crate::session::SideRef::ThreeWay(crate::session::ThreeWaySide::Local),
         _ => return,
     };
     let read = match fileio::read_text(&path) {
@@ -1661,7 +1690,7 @@ fn load_typed_path_into_side(state: &mut AppState, id: SessionId, idx: usize, pa
                 pretty_basename(t.paths.first()),
                 pretty_basename(t.paths.get(1))
             ),
-            TabMode::ThreeWay => pretty_basename(t.paths.first()),
+            TabMode::ThreeWay => pretty_basename(t.paths.get(1)),
         };
     }
     match mode {
@@ -1708,9 +1737,9 @@ fn save_three_way_side(state: &mut AppState, id: SessionId, idx: usize) {
         return;
     };
     let (text, trailing, role) = match idx {
-        0 => (base_text, *base_trailing_newline, "BASE"),
-        1 => (local_text, *local_trailing_newline, "LOCAL"),
-        2 => (remote_text, *remote_trailing_newline, "REMOTE"),
+        0 => (remote_text, *remote_trailing_newline, "REMOTE"),
+        1 => (base_text, *base_trailing_newline, "BASE"),
+        2 => (local_text, *local_trailing_newline, "LOCAL"),
         _ => return,
     };
     match fileio::write_text(&path, text, trailing) {
@@ -1749,14 +1778,17 @@ fn current_session_summary(ui: &imgui::Ui, state: &mut AppState) {
         &mut state.status,
     );
     ui.separator();
-    // Per-pane header strip: filename + browse + save, one segment per pane.
+    // Per-pane header strip (filename + browse + save) is rendered per-mode,
+    // immediately above the code views — so it sits directly atop the panes
+    // it labels, below the engine bar / three-way header / anchor bar.
     // Actions are deferred (the dialog/save happens after the snapshot
     // borrow ends) so we can mutate state freely.
-    let header_action = pane_header_bar(ui, state, id);
-    ui.separator();
+    let header_action: Option<HeaderAction>;
     match &snap.mode {
         SessionMode::TwoWay { hunks, anchors, a_text, b_text, .. } => {
             anchor_bar_two_way(ui, &state.sessions, id, anchors, &mut state.status);
+            ui.separator();
+            header_action = pane_header_bar(ui, state, id);
             ui.separator();
             // 2-way edits the source files directly — there is no separate
             // "result" so the diff fills the remaining vertical space.
@@ -1835,14 +1867,18 @@ fn current_session_summary(ui: &imgui::Ui, state: &mut AppState) {
             ui.separator();
             anchor_bar_three_way(ui, &state.sessions, id, anchors, &mut state.status);
             ui.separator();
+            header_action = pane_header_bar(ui, state, id);
+            ui.separator();
             // Per-side syntax highlights for the three input panes, mirroring
             // the 2-way path. Each side may have a different language if the
             // user picked mixed extensions.
+            // tab.paths is laid out as [REMOTE, BASE, LOCAL] to match the
+            // header strip and pane order.
             let (base_lang, local_lang, remote_lang) = match &tab_paths_snap {
                 Some(paths) => (
-                    paths.first().and_then(|p| syntax::lang_for_path(p)),
                     paths.get(1).and_then(|p| syntax::lang_for_path(p)),
                     paths.get(2).and_then(|p| syntax::lang_for_path(p)),
+                    paths.first().and_then(|p| syntax::lang_for_path(p)),
                 ),
                 None => (None, None, None),
             };
@@ -1866,8 +1902,18 @@ fn current_session_summary(ui: &imgui::Ui, state: &mut AppState) {
             let result_key = (id << 2) | 3;
             let result_highlights = state.syntax.highlights(result_key, base_lang, &result_lines).to_vec();
             let avail = ui.content_region_avail();
-            let result_h = 200.0_f32.min(avail[1] * 0.4);
-            let diff_h = (avail[1] - result_h - 8.0).max(50.0);
+            const SPLITTER_H: f32 = 6.0;
+            let default_result_h = 200.0_f32.min(avail[1] * 0.4);
+            let stored_h = state
+                .result_panes
+                .get(&id)
+                .and_then(|r| r.pane_height);
+            let min_pane_h = 50.0_f32;
+            let max_result_h = (avail[1] - SPLITTER_H - min_pane_h).max(min_pane_h);
+            let result_h = stored_h
+                .unwrap_or(default_result_h)
+                .clamp(min_pane_h, max_result_h);
+            let diff_h = (avail[1] - result_h - SPLITTER_H).max(min_pane_h);
             {
                 let store = &state.sessions;
                 let status = &mut state.status;
@@ -1904,6 +1950,48 @@ fn current_session_summary(ui: &imgui::Ui, state: &mut AppState) {
                     }
                     state.status = "edited (Ctrl+Z to undo)".to_string();
                 }
+            }
+            // Splitter between the merge area and the result pane. Drag to
+            // resize the result pane; the new height persists in ResultState.
+            {
+                let splitter_pos = ui.cursor_screen_pos();
+                let avail_w = ui.content_region_avail()[0];
+                ui.invisible_button(
+                    format!("##result_splitter_{id}"),
+                    [avail_w, SPLITTER_H],
+                );
+                let hovered = ui.is_item_hovered();
+                let active = ui.is_item_active();
+                if hovered || active {
+                    ui.set_mouse_cursor(Some(imgui::MouseCursor::ResizeNS));
+                }
+                if active {
+                    let dy = ui.io().mouse_delta[1];
+                    if dy != 0.0 {
+                        let new_h = (result_h - dy).clamp(min_pane_h, max_result_h);
+                        state
+                            .result_panes
+                            .entry(id)
+                            .or_default()
+                            .pane_height = Some(new_h);
+                    }
+                }
+                let dl = ui.get_window_draw_list();
+                let color = if active {
+                    theme::with_alpha(theme::TEXT(), 0.50)
+                } else if hovered {
+                    theme::with_alpha(theme::TEXT(), 0.30)
+                } else {
+                    theme::with_alpha(theme::TEXT(), 0.12)
+                };
+                let pad = 1.0;
+                dl.add_rect(
+                    [splitter_pos[0], splitter_pos[1] + pad],
+                    [splitter_pos[0] + avail_w, splitter_pos[1] + SPLITTER_H - pad],
+                    color,
+                )
+                .filled(true)
+                .build();
             }
             {
                 let mono = state.mono_font;
@@ -2074,13 +2162,13 @@ fn open_two_way_paths(state: &mut AppState, a: PathBuf, b: PathBuf) {
 }
 
 fn open_three_way(state: &mut AppState) {
+    let Some(remote) = pick_file("Open REMOTE (3-way)") else {
+        return;
+    };
     let Some(base) = pick_file("Open BASE (3-way)") else {
         return;
     };
     let Some(local) = pick_file("Open LOCAL (3-way)") else {
-        return;
-    };
-    let Some(remote) = pick_file("Open REMOTE (3-way)") else {
         return;
     };
     open_three_way_paths(state, base, local, remote);
@@ -2162,7 +2250,7 @@ fn open_three_way_paths_with_result(
                     }
                 }
             }
-            let paths = vec![base, local, remote];
+            let paths = vec![remote, base, local];
             let path_inputs = paths.iter().map(|p| p.display().to_string()).collect();
             state.tabs.push(Tab {
                 session_id: id,

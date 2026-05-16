@@ -349,10 +349,20 @@ pub fn render(
     );
 
     // Hover overlay panels. Drawn last so they sit above panes + connectors.
+    // The hover_panes index maps to the role of the pane the cursor is over;
+    // each overlay shows a single icon-button that picks *that* pane's
+    // version as the resolution.
     for (i, cell) in hover_panes.iter().enumerate() {
         if let Some((hunk_id, kind, pos)) = cell.get() {
-            let _ = i;
-            draw_control_overlay(ui, store, session_id, hunk_id, kind, status, pos, lh);
+            let pane_side = match i {
+                0 => crate::session::ThreeWaySide::Base,
+                1 => crate::session::ThreeWaySide::Local,
+                2 => crate::session::ThreeWaySide::Remote,
+                _ => continue,
+            };
+            draw_control_overlay(
+                ui, store, session_id, hunk_id, kind, pane_side, status, pos, lh,
+            );
         }
     }
 
@@ -737,6 +747,7 @@ fn draw_control_overlay(
     session_id: SessionId,
     hunk_id: u32,
     kind: HunkKind,
+    pane_side: crate::session::ThreeWaySide,
     status: &mut String,
     pos: [f32; 2],
     lh: f32,
@@ -751,11 +762,10 @@ fn draw_control_overlay(
     };
 
     // See diff_view::overlay::draw_control_overlay: the panel needs to be
-    // its own top-level imgui window so its buttons can receive clicks
+    // its own top-level imgui window so its button can receive clicks
     // over the input_text_multiline pane's child window.
-    let _pad = ui.push_style_var(StyleVar::FramePadding([6.0, 2.0]));
-    let _spacing = ui.push_style_var(StyleVar::ItemSpacing([4.0, 0.0]));
-    let _win_pad = ui.push_style_var(StyleVar::WindowPadding([4.0, 3.0]));
+    let _pad = ui.push_style_var(StyleVar::FramePadding([4.0, 2.0]));
+    let _win_pad = ui.push_style_var(StyleVar::WindowPadding([3.0, 3.0]));
     let _win_round = ui.push_style_var(StyleVar::WindowRounding(4.0));
     let _win_border = ui.push_style_var(StyleVar::WindowBorderSize(1.0));
     let _border_col = ui.push_style_color(imgui::StyleColor::Border, border_color);
@@ -782,37 +792,43 @@ fn draw_control_overlay(
     ui.window(&win_name)
         .position([panel_x, panel_y], imgui::Condition::Always)
         .flags(flags)
-        .build(|| match kind {
-            HunkKind::LocalOnly => {
-                if ui.small_button(format!("Use Local##ovL{hunk_id}")) {
-                    apply_res(store, session_id, hunk_id, Resolution::Local, status);
-                }
-                ui.same_line();
-                if ui.small_button(format!("Use Base##ovB{hunk_id}")) {
-                    apply_res(store, session_id, hunk_id, Resolution::Base, status);
-                }
+        .build(|| {
+            use crate::session::ThreeWaySide;
+            let resolution = match pane_side {
+                ThreeWaySide::Remote => Resolution::Remote,
+                ThreeWaySide::Base => Resolution::Base,
+                ThreeWaySide::Local => Resolution::Local,
+            };
+            const ICON_HALF: f32 = 7.0;
+            const BTN_W: f32 = 22.0;
+            const BTN_H: f32 = 18.0;
+            let btn_origin = ui.cursor_screen_pos();
+            let btn_id = format!("##ovUse_{hunk_id}");
+            let clicked = ui.invisible_button(btn_id, [BTN_W, BTN_H]);
+            let hovered = ui.is_item_hovered();
+            let active = ui.is_item_active();
+            let dl = ui.get_window_draw_list();
+            if hovered || active {
+                let style = ui.clone_style();
+                let bg_col = if active {
+                    style.colors[imgui::StyleColor::ButtonActive as usize]
+                } else {
+                    style.colors[imgui::StyleColor::ButtonHovered as usize]
+                };
+                dl.add_rect(
+                    btn_origin,
+                    [btn_origin[0] + BTN_W, btn_origin[1] + BTN_H],
+                    bg_col,
+                )
+                .filled(true)
+                .rounding(style.frame_rounding)
+                .build();
             }
-            HunkKind::RemoteOnly => {
-                if ui.small_button(format!("Use Remote##ovR{hunk_id}")) {
-                    apply_res(store, session_id, hunk_id, Resolution::Remote, status);
-                }
-                ui.same_line();
-                if ui.small_button(format!("Use Base##ovB{hunk_id}")) {
-                    apply_res(store, session_id, hunk_id, Resolution::Base, status);
-                }
-            }
-            HunkKind::Conflict => {
-                if ui.small_button(format!("Use Local##ovL{hunk_id}")) {
-                    apply_res(store, session_id, hunk_id, Resolution::Local, status);
-                }
-                ui.same_line();
-                if ui.small_button(format!("Use Base##ovB{hunk_id}")) {
-                    apply_res(store, session_id, hunk_id, Resolution::Base, status);
-                }
-                ui.same_line();
-                if ui.small_button(format!("Use Remote##ovR{hunk_id}")) {
-                    apply_res(store, session_id, hunk_id, Resolution::Remote, status);
-                }
+            let cx = btn_origin[0] + BTN_W * 0.5;
+            let cy = btn_origin[1] + BTN_H * 0.5;
+            crate::app::result_pane::paint_role_icon(ui, [cx, cy], pane_side, ICON_HALF);
+            if clicked {
+                apply_res(store, session_id, hunk_id, resolution, status);
             }
         });
 }

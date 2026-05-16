@@ -36,6 +36,9 @@ pub struct ResultState {
     /// Bumped on picker-driven mutations so we re-sync from `compute_result`
     /// next frame regardless of the editor's active state.
     force_reload: bool,
+    /// User-adjusted result pane height (px). `None` means use the default
+    /// (`200.min(avail*0.4)`). Set by the splitter between merge & result.
+    pub pane_height: Option<f32>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -515,6 +518,24 @@ fn paint_and_hit_pickers(
     }
 
     clicked
+}
+
+/// Draw a filled role icon for a 3-way side using the same shape + color as
+/// the picker icons in the result-pane gutter. Used by the merge view's pane
+/// header strip so each label visually matches its source in the result.
+pub(crate) fn paint_role_icon(
+    _ui: &Ui,
+    center: [f32; 2],
+    side: crate::session::ThreeWaySide,
+    half: f32,
+) {
+    use crate::session::ThreeWaySide;
+    let (shape, color) = match side {
+        ThreeWaySide::Remote => (IconShape::Diamond, theme::SAPPHIRE()),
+        ThreeWaySide::Base => (IconShape::Square, theme::YELLOW()),
+        ThreeWaySide::Local => (IconShape::Circle, theme::GREEN()),
+    };
+    fill_shape(shape, center, half, color);
 }
 
 fn paint_icon(ui: &Ui, center: [f32; 2], icon: &PickerIcon) {
