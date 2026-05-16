@@ -651,9 +651,9 @@ fn paint_pane_text(
             let Some(kind_v) = *kind else { continue };
             if ln >= *lo && ln <= *hi {
                 return Some(match kind_v {
-                    HunkKind::LocalOnly => theme::with_alpha(theme::BLUE(), 0.22),
-                    HunkKind::RemoteOnly => theme::with_alpha(theme::MAUVE(), 0.22),
-                    HunkKind::Conflict => theme::with_alpha(theme::PEACH(), 0.30),
+                    HunkKind::LocalOnly => theme::with_alpha(theme::GREEN(), 0.22),
+                    HunkKind::RemoteOnly => theme::with_alpha(theme::SAPPHIRE(), 0.22),
+                    HunkKind::Conflict => theme::with_alpha(theme::RED(), 0.30),
                 });
             }
         }
@@ -976,9 +976,9 @@ fn stroke_bezier_curve(
 fn ribbon_color(h: &MergeHunk) -> [f32; 4] {
     match h {
         MergeHunk::Stable { .. } => theme::with_alpha(theme::OVERLAY1(), 0.10),
-        MergeHunk::LocalOnly { .. } => theme::with_alpha(theme::BLUE(), 0.28),
-        MergeHunk::RemoteOnly { .. } => theme::with_alpha(theme::MAUVE(), 0.28),
-        MergeHunk::Conflict { .. } => theme::with_alpha(theme::PEACH(), 0.32),
+        MergeHunk::LocalOnly { .. } => theme::with_alpha(theme::GREEN(), 0.28),
+        MergeHunk::RemoteOnly { .. } => theme::with_alpha(theme::SAPPHIRE(), 0.28),
+        MergeHunk::Conflict { .. } => theme::with_alpha(theme::RED(), 0.32),
     }
 }
 
