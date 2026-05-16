@@ -18,6 +18,8 @@ use imgui::{FontId, StyleVar, Ui};
 
 use super::theme;
 use super::undo_stack::DiffEdit;
+use crate::app::syntax::LineSpans;
+use crate::app::syntax_paint;
 use crate::merge::{MergeAnchor, MergeHunk, Resolution};
 use crate::session::{SessionId, SessionMode, SessionStore, SideRef, ThreeWaySide};
 
@@ -192,6 +194,9 @@ pub fn render(
     mono_font: Option<FontId>,
     focus_request: &mut Option<crate::app::FocusedPane>,
     pending_edits: &mut Vec<DiffEdit>,
+    base_highlights: &[LineSpans],
+    local_highlights: &[LineSpans],
+    remote_highlights: &[LineSpans],
 ) {
     // Sync buffers from session at frame start.
     let snap = match store.snapshot(session_id) {
@@ -273,7 +278,8 @@ pub fn render(
 
     let (_remote_rect, remote_scroll, remote_origin) = render_pane(
         ui, state, remote_pos, pane_w, pane_h, Pane::Remote, session_id,
-        pending_edits, &remote_layout, &hover_panes[2], &focus_event, lh,
+        pending_edits, &remote_layout, &hover_panes[2], &focus_event,
+        remote_highlights, lh,
     );
 
     ui.set_cursor_screen_pos(connector_rb_pos);
@@ -281,7 +287,8 @@ pub fn render(
 
     let (_base_rect, base_scroll, base_origin) = render_pane(
         ui, state, base_pos, pane_w, pane_h, Pane::Base, session_id,
-        pending_edits, &base_layout, &hover_panes[0], &focus_event, lh,
+        pending_edits, &base_layout, &hover_panes[0], &focus_event,
+        base_highlights, lh,
     );
 
     ui.set_cursor_screen_pos(connector_bl_pos);
@@ -289,7 +296,8 @@ pub fn render(
 
     let (_local_rect, local_scroll, local_origin) = render_pane(
         ui, state, local_pos, pane_w, pane_h, Pane::Local, session_id,
-        pending_edits, &local_layout, &hover_panes[1], &focus_event, lh,
+        pending_edits, &local_layout, &hover_panes[1], &focus_event,
+        local_highlights, lh,
     );
 
     if let Some(p) = focus_event.get() {
@@ -366,6 +374,7 @@ fn render_pane(
     layout: &PaneLayout,
     hover_out: &Cell<Option<(u32, HunkKind, [f32; 2])>>,
     focus_event: &Cell<Option<crate::app::FocusedPane>>,
+    highlights: &[LineSpans],
     lh: f32,
 ) -> ([f32; 4], f32, [f32; 2]) {
     let g_w = gutter_w();
@@ -583,6 +592,7 @@ fn render_pane(
         caret_byte.get(),
         widget_active,
         hover_out,
+        highlights,
     );
 
     // Gutter on the left of this pane (line numbers).
@@ -635,6 +645,7 @@ fn paint_pane_text(
     caret_byte: i32,
     widget_active: bool,
     hover_out: &Cell<Option<(u32, HunkKind, [f32; 2])>>,
+    highlights: &[LineSpans],
 ) {
     let widget_top = widget_rect[1];
     let widget_bottom = widget_rect[3];
@@ -689,13 +700,16 @@ fn paint_pane_text(
                 }
             }
 
-            if !line_text.is_empty() {
-                dl.add_text(
-                    [widget_left + padding_x - scroll_x, y],
-                    theme::TEXT(),
-                    line_text,
-                );
-            }
+            let line_origin = [widget_left + padding_x - scroll_x, y];
+            syntax_paint::paint_line_with_spans(
+                ui,
+                &dl,
+                line_origin,
+                line_text,
+                highlights.get(line_idx),
+                scroll_x,
+                padding_x,
+            );
         }
 
         if widget_active && caret_byte >= 0 {
