@@ -19,9 +19,10 @@ mod overlay;
 mod tests;
 
 pub use common::{DiffViewState, Side};
+pub(crate) use common::VBAR_W;
 use common::{
     build_pane_ranges, gutter_w, next_anchor_pick, rail_w, target_scroll, AnchorPick,
-    PendingJump, RailAction, RailClick, RailEvent, CONNECTOR_W,
+    PendingJump, RailAction, RailClick, RailEvent, CONNECTOR_W, VBAR_THUMB_MIN_H,
 };
 
 /// Minimum scroll change (px) to treat as intentional user input.
@@ -80,6 +81,35 @@ pub(crate) fn caret_x_in_inner(buf: &str, caret_byte: usize, ui: &Ui, padding_x:
 /// return the scroll_x that keeps the caret inside the viewport with `margin`
 /// pixels of slack on each side. Returns `scroll_x` unchanged if the caret is
 /// already comfortably inside.
+/// Vertical-scrollbar thumb geometry in screen space. Returns `(thumb_top_y,
+/// thumb_h)`. `content_h <= track_h` is the no-overflow case — the caller should
+/// suppress painting entirely; we still return a sensible fallback for safety.
+pub(crate) fn vbar_thumb_geom(track_top: f32, track_h: f32, scroll_y: f32, content_h: f32) -> (f32, f32) {
+    if content_h <= track_h || track_h <= 0.0 {
+        return (track_top, track_h.max(0.0));
+    }
+    let ratio = (track_h / content_h).clamp(0.0, 1.0);
+    let h = (track_h * ratio).max(VBAR_THUMB_MIN_H).min(track_h);
+    let max_scroll = (content_h - track_h).max(1.0);
+    let y = track_top + (scroll_y / max_scroll).clamp(0.0, 1.0) * (track_h - h);
+    (y, h)
+}
+
+/// Invert `vbar_thumb_geom` for a desired thumb top: returns the scroll_y that
+/// would place the thumb there, clamped to `[0, max_scroll]`.
+pub(crate) fn vbar_scroll_for_thumb_y(
+    desired_thumb_top: f32,
+    track_top: f32,
+    track_h: f32,
+    thumb_h: f32,
+    content_h: f32,
+) -> f32 {
+    let avail = (track_h - thumb_h).max(1.0);
+    let max_scroll = (content_h - track_h).max(0.0);
+    let frac = ((desired_thumb_top - track_top) / avail).clamp(0.0, 1.0);
+    frac * max_scroll
+}
+
 pub(crate) fn track_caret_scroll_x(caret_x: f32, scroll_x: f32, view_w: f32, margin: f32) -> f32 {
     if caret_x < scroll_x + margin {
         (caret_x - margin).max(0.0)
@@ -480,6 +510,63 @@ fn render_pane(
         Side::Left => state.last_left_scroll_y,
         Side::Right => state.last_right_scroll_y,
     };
+
+    // ----- custom vertical scrollbar: drag handling -----
+    // The inner multiline's own vertical scrollbar lives at x = inner_pos +
+    // inner_w, which sits past the right edge of the outer's viewport whenever
+    // inner_w > widget_w — so it gets clipped (worst-case completely hidden at
+    // scroll_x = 0). We hide it (ScrollbarSize=0 around the inner build below)
+    // and paint our own thumb on `widget_rect`'s right edge instead.
+    //
+    // Thumb position uses *previous frame*'s displayed scroll (what the user
+    // saw), which is also what we'll show again this frame unless drag fires.
+    let track_top = widget_pos[1];
+    let track_h = pane_h;
+    let (prev_thumb_y, thumb_h) = vbar_thumb_geom(track_top, track_h, prev_displayed, content_h);
+    let vbar_x_r = widget_pos[0] + widget_w;
+    let vbar_x_l = vbar_x_r - VBAR_W;
+    let mouse = ui.io().mouse_pos;
+    let in_x = mouse[0] >= vbar_x_l && mouse[0] <= vbar_x_r;
+    let in_thumb = in_x && mouse[1] >= prev_thumb_y && mouse[1] <= prev_thumb_y + thumb_h;
+    let in_track = in_x && mouse[1] >= track_top && mouse[1] <= track_top + track_h;
+    let mouse_down = ui.is_mouse_down(imgui::MouseButton::Left);
+    let mouse_clicked = ui.is_mouse_clicked(imgui::MouseButton::Left);
+    let drag_slot: &mut Option<f32> = match side {
+        Side::Left => &mut state.left_vbar_drag,
+        Side::Right => &mut state.right_vbar_drag,
+    };
+    let mut drag_override: Option<f32> = None;
+    if content_h > track_h {
+        if let Some(off) = *drag_slot {
+            if mouse_down {
+                let desired_top = mouse[1] - off;
+                drag_override = Some(vbar_scroll_for_thumb_y(
+                    desired_top, track_top, track_h, thumb_h, content_h,
+                ));
+            } else {
+                *drag_slot = None;
+            }
+        } else if mouse_clicked && in_thumb {
+            *drag_slot = Some(mouse[1] - prev_thumb_y);
+        } else if mouse_clicked && in_track {
+            // Page-jump: center the thumb on the click and start dragging from there.
+            let off = thumb_h * 0.5;
+            *drag_slot = Some(off);
+            drag_override = Some(vbar_scroll_for_thumb_y(
+                mouse[1] - off,
+                track_top,
+                track_h,
+                thumb_h,
+                content_h,
+            ));
+        }
+    } else {
+        *drag_slot = None;
+    }
+    // True for any frame the user is interacting with the custom scrollbar:
+    // either a fresh click just landed on the track, or an existing drag is
+    // in progress. Used below to suppress the multiline's mouse input.
+    let scrollbar_grabbing = drag_slot.is_some() || (mouse_clicked && in_track);
     // Split wheel into vertical (smooth, smooth-eased into the inner
     // multiline) and horizontal (pinned onto the outer scroll child).
     // Imgui's own UpdateMouseWheel only operates on the topmost hovered
@@ -501,11 +588,16 @@ fn render_pane(
     } else {
         (0.0, 0.0)
     };
-    // Compute this frame's *target*. Pending (sync / jump) overrides; otherwise
-    // mouse wheel deflects from the previous target so multiple wheel ticks
-    // before the easing catches up still register fully.
-    let mut target = pending_scroll
-        .unwrap_or_else(|| prev_target - wheel * lh * SCROLL_LINES_PER_WHEEL_TICK);
+    // Compute this frame's *target*. Drag wins over everything else (no easing
+    // — we want the thumb to feel pinned to the cursor). Otherwise pending
+    // (sync / jump) overrides; otherwise mouse wheel deflects from the
+    // previous target so multiple wheel ticks before the easing catches up
+    // still register fully.
+    let mut target = if let Some(s) = drag_override {
+        s
+    } else {
+        pending_scroll.unwrap_or_else(|| prev_target - wheel * lh * SCROLL_LINES_PER_WHEEL_TICK)
+    };
     if target < 0.0 {
         target = 0.0;
     }
@@ -518,12 +610,18 @@ fn render_pane(
     }
 
     // Ease the displayed scroll toward target with an exponential decay.
-    let dt = ui.io().delta_time.max(0.0).min(0.1);
-    let k = 1.0 - (-dt * SCROLL_SMOOTH_SPEED).exp();
-    let mut displayed = prev_displayed + (target - prev_displayed) * k;
-    if (target - displayed).abs() < SCROLL_SNAP_EPSILON {
-        displayed = target;
-    }
+    // Drag skips the easing.
+    let displayed = if drag_override.is_some() {
+        target
+    } else {
+        let dt = ui.io().delta_time.max(0.0).min(0.1);
+        let k = 1.0 - (-dt * SCROLL_SMOOTH_SPEED).exp();
+        let mut d = prev_displayed + (target - prev_displayed) * k;
+        if (target - d).abs() < SCROLL_SNAP_EPSILON {
+            d = target;
+        }
+        d
+    };
     let own_scroll = displayed;
 
     // Wrap the input_text_multiline in our own outer child window with
@@ -609,6 +707,25 @@ fn render_pane(
                     }
                 }
 
+                // Shrink the inner multiline's own vertical scrollbar to a
+                // single pixel. It would otherwise be painted at x =
+                // inner_pos + inner_w, which clips out when the outer is
+                // scrolled left of max_x. Setting it to exactly 0 trips an
+                // imgui assertion in GetWindowScrollbarRect (scrollbar_size
+                // must be > 0); 1.0 satisfies it and the 1px strip lives at
+                // inner_w's right edge — outside the outer's clip rect — so
+                // it never shows. We paint our own thumb at the outer's
+                // fixed right edge after this child closes.
+                let _sb = ui.push_style_var(imgui::StyleVar::ScrollbarSize(1.0));
+
+                // Disable the multiline entirely while the user is dragging
+                // our custom scrollbar — otherwise the click/drag bleeds
+                // through and starts a text selection (the multiline always
+                // wins ActiveID over later-rendered items, regardless of
+                // `set_item_allow_overlap`). BeginDisabled blocks all input
+                // to subsequent items; visuals are unaffected here because
+                // we paint text/caret ourselves on the foreground draw list.
+                unsafe { imgui::sys::igBeginDisabled(scrollbar_grabbing) };
                 let changed = ui
                     .input_text_multiline(&widget_id, buf, [inner_w, pane_h])
                     .no_undo_redo(true)
@@ -617,6 +734,8 @@ fn render_pane(
                         CaretCapture { cursor: &caret_byte },
                     )
                     .build();
+                unsafe { imgui::sys::igEndDisabled() };
+                drop(_sb);
                 ui.set_item_allow_overlap();
                 widget_active_cell.set(ui.is_item_active());
                 if changed {
@@ -709,5 +828,48 @@ fn render_pane(
         hover_out,
     );
 
+    // Custom vertical scrollbar — painted last so it sits above text. Pinned
+    // to widget_rect's right edge (which doesn't move when the user scrolls
+    // horizontally), so it never disappears off-screen the way the inner
+    // multiline's native scrollbar did.
+    let vbar_visible = content_h > pane_h;
+    let vbar_active = drag_slot.is_some();
+    paint_vbar(ui, widget_rect, own_scroll, content_h, vbar_active);
+
+    // Override imgui's auto-set TextInput (I-beam) cursor with Arrow when the
+    // mouse is over the scrollbar or actively dragging it. set_mouse_cursor
+    // is read at end-of-frame, so a late write wins.
+    if vbar_visible && (in_track || vbar_active) {
+        ui.set_mouse_cursor(Some(imgui::MouseCursor::Arrow));
+    }
+
     (widget_rect, scroll_y_out)
+}
+
+pub(crate) fn paint_vbar(ui: &Ui, widget_rect: [f32; 4], scroll_y: f32, content_h: f32, active: bool) {
+    let track_top = widget_rect[1];
+    let track_bot = widget_rect[3];
+    let track_h = track_bot - track_top;
+    if content_h <= track_h || track_h <= 0.0 {
+        return;
+    }
+    let x_r = widget_rect[2];
+    let x_l = x_r - VBAR_W;
+    let (ty, th) = vbar_thumb_geom(track_top, track_h, scroll_y, content_h);
+    let dl = ui.get_foreground_draw_list();
+    // Track — subtle, doesn't fight with the syntax-highlighted text behind.
+    dl.add_rect_filled_multicolor(
+        [x_l, track_top],
+        [x_r, track_bot],
+        [0.0, 0.0, 0.0, 0.18],
+        [0.0, 0.0, 0.0, 0.18],
+        [0.0, 0.0, 0.0, 0.18],
+        [0.0, 0.0, 0.0, 0.18],
+    );
+    // Thumb — brighter when dragging.
+    let thumb_a = if active { 0.85 } else { 0.55 };
+    dl.add_rect([x_l + 2.0, ty + 1.0], [x_r - 2.0, ty + th - 1.0], [0.75, 0.75, 0.75, thumb_a])
+        .filled(true)
+        .rounding(3.0)
+        .build();
 }

@@ -91,7 +91,20 @@ pub struct DiffViewState {
     /// stb_textedit state from `buf` instead of writing stale internal
     /// bytes back.
     pub input_epoch: u32,
+    /// Active drag offset for the custom vertical scrollbar thumb. `Some(off)`
+    /// means the user is mid-drag — `off` is the pixel distance from the thumb
+    /// top to the mouse cursor at drag start, preserved so the cursor stays
+    /// glued to the same spot on the thumb. The inner multiline's own
+    /// scrollbar is hidden because it sits past the horizontally-scrolling
+    /// viewport's right edge; we paint our own at the outer's fixed right edge.
+    pub(super) left_vbar_drag: Option<f32>,
+    pub(super) right_vbar_drag: Option<f32>,
 }
+
+/// Width of the custom vertical scrollbar painted on the right edge of each pane.
+pub(crate) const VBAR_W: f32 = 12.0;
+/// Minimum thumb height so the grab target stays usable on very long files.
+pub(crate) const VBAR_THUMB_MIN_H: f32 = 24.0;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Side {

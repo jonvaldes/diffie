@@ -90,6 +90,13 @@ pub struct MergeViewState {
     /// Bumped on external buffer mutations (undo/redo, Apply Local/Base/Remote);
     /// mixed into the widget ID so imgui re-initialises stb_textedit from `buf`.
     pub input_epoch: u32,
+    /// Active drag offset for each pane's custom vertical scrollbar thumb.
+    /// `Some(off)` means mid-drag — `off` is the pixel distance from thumb top
+    /// to the mouse cursor at drag start. See diff_view for the rationale: the
+    /// inner multiline's native scrollbar sits past the horizontally-scrolling
+    /// viewport's right edge and gets clipped, so we paint our own at the
+    /// outer's fixed right edge.
+    vbar_drag: [Option<f32>; 3],
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -424,8 +431,69 @@ fn render_pane(
         (0.0, 0.0)
     };
     let prev_target = state.target[pane as usize];
-    let mut target = pending_scroll
-        .unwrap_or(prev_target - wheel * lh * SCROLL_LINES_PER_WHEEL_TICK);
+    let prev_displayed = state.last[pane as usize];
+
+    // Custom vertical scrollbar — drag handling. The inner multiline's native
+    // scrollbar lives at x = inner_pos + inner_w, which clips out whenever
+    // inner_w > widget_w. We hide it (ScrollbarSize=0 below) and paint our own
+    // at widget_rect's right edge. See diff_view::render_pane for the same
+    // pattern.
+    let track_top = widget_pos[1];
+    let track_h = pane_h;
+    let (prev_thumb_y, thumb_h) = crate::app::diff_view::vbar_thumb_geom(
+        track_top, track_h, prev_displayed, content_h,
+    );
+    let vbar_x_r = widget_pos[0] + widget_w;
+    let vbar_x_l = vbar_x_r - crate::app::diff_view::VBAR_W;
+    let mouse = ui.io().mouse_pos;
+    let in_x = mouse[0] >= vbar_x_l && mouse[0] <= vbar_x_r;
+    let in_thumb = in_x && mouse[1] >= prev_thumb_y && mouse[1] <= prev_thumb_y + thumb_h;
+    let in_track = in_x && mouse[1] >= track_top && mouse[1] <= track_top + track_h;
+    let mouse_down = ui.is_mouse_down(imgui::MouseButton::Left);
+    let mouse_clicked = ui.is_mouse_clicked(imgui::MouseButton::Left);
+    let drag_slot = &mut state.vbar_drag[pane as usize];
+    let mut drag_override: Option<f32> = None;
+    if content_h > track_h {
+        if let Some(off) = *drag_slot {
+            if mouse_down {
+                drag_override = Some(crate::app::diff_view::vbar_scroll_for_thumb_y(
+                    mouse[1] - off,
+                    track_top,
+                    track_h,
+                    thumb_h,
+                    content_h,
+                ));
+            } else {
+                *drag_slot = None;
+            }
+        } else if mouse_clicked && in_thumb {
+            *drag_slot = Some(mouse[1] - prev_thumb_y);
+        } else if mouse_clicked && in_track {
+            let off = thumb_h * 0.5;
+            *drag_slot = Some(off);
+            drag_override = Some(crate::app::diff_view::vbar_scroll_for_thumb_y(
+                mouse[1] - off,
+                track_top,
+                track_h,
+                thumb_h,
+                content_h,
+            ));
+        }
+    } else {
+        *drag_slot = None;
+    }
+    let dragging = drag_slot.is_some();
+    // True for any frame the user is interacting with the custom scrollbar.
+    // Used below to suppress the multiline's mouse input — `set_item_allow_overlap`
+    // on a later invisible_button can't out-race the multiline for ActiveID,
+    // so we stomp io.MouseDown/Clicked around the multiline build instead.
+    let scrollbar_grabbing = dragging || (mouse_clicked && in_track);
+
+    let mut target = if let Some(s) = drag_override {
+        s
+    } else {
+        pending_scroll.unwrap_or(prev_target - wheel * lh * SCROLL_LINES_PER_WHEEL_TICK)
+    };
     if target < 0.0 {
         target = 0.0;
     }
@@ -434,13 +502,17 @@ fn render_pane(
     }
     state.target[pane as usize] = target;
 
-    let prev_displayed = state.last[pane as usize];
-    let dt = ui.io().delta_time.max(0.0).min(0.1);
-    let k = 1.0 - (-dt * SCROLL_SMOOTH_SPEED).exp();
-    let mut displayed = prev_displayed + (target - prev_displayed) * k;
-    if (target - displayed).abs() < SCROLL_SNAP_EPSILON {
-        displayed = target;
-    }
+    let displayed = if drag_override.is_some() {
+        target
+    } else {
+        let dt = ui.io().delta_time.max(0.0).min(0.1);
+        let k = 1.0 - (-dt * SCROLL_SMOOTH_SPEED).exp();
+        let mut d = prev_displayed + (target - prev_displayed) * k;
+        if (target - d).abs() < SCROLL_SNAP_EPSILON {
+            d = target;
+        }
+        d
+    };
 
     let max_line_w = state.max_line_w[pane as usize];
     let style = ui.clone_style();
@@ -510,6 +582,17 @@ fn render_pane(
                     }
                 }
 
+                // Shrink the inner multiline's native vertical scrollbar to
+                // 1px — see diff_view::render_pane for the full reasoning
+                // (0.0 trips an imgui assertion; the 1px strip sits past
+                // the outer's clip rect so it's invisible). We paint our
+                // own thumb on the outer's fixed right edge after this
+                // child closes.
+                let _sb = ui.push_style_var(StyleVar::ScrollbarSize(1.0));
+                // Disable the multiline entirely while the user is dragging
+                // our scrollbar — see diff_view::render_pane. Visuals are
+                // unaffected because we paint text/caret ourselves.
+                unsafe { imgui::sys::igBeginDisabled(scrollbar_grabbing) };
                 let changed = ui
                     .input_text_multiline(&widget_id, buf, [inner_w, pane_h])
                     .no_undo_redo(true)
@@ -518,6 +601,8 @@ fn render_pane(
                         CaretCapture { cursor: &caret_byte },
                     )
                     .build();
+                unsafe { imgui::sys::igEndDisabled() };
+                drop(_sb);
                 ui.set_item_allow_overlap();
                 widget_active_cell.set(ui.is_item_active());
                 if changed {
@@ -607,6 +692,14 @@ fn render_pane(
 
     // Gutter on the left of this pane (line numbers).
     paint_gutter(ui, pane_pos, g_w, pane_h, scroll_y_out, lh, buf_line_count as u32);
+
+    // Custom vertical scrollbar, pinned to widget_rect's fixed right edge.
+    crate::app::diff_view::paint_vbar(ui, widget_rect, scroll_y_out, content_h, dragging);
+
+    // Restore Arrow cursor over the scrollbar / while dragging it.
+    if content_h > pane_h && (in_track || dragging) {
+        ui.set_mouse_cursor(Some(imgui::MouseCursor::Arrow));
+    }
 
     (widget_rect, scroll_y_out, origin_out)
 }
