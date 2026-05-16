@@ -15,7 +15,7 @@
 use std::cell::Cell;
 use std::collections::HashMap;
 
-use imgui::{FontId, Ui};
+use imgui::{FontId, StyleVar, Ui};
 
 use crate::app::syntax::LineSpans;
 use crate::app::syntax_paint;
@@ -27,6 +27,9 @@ const STRIPE_W: f32 = 4.0;
 const GUTTER_W: f32 = 56.0;
 const ICON_HALF: f32 = 6.0;
 const ICON_SPACING: f32 = 18.0;
+const SCROLL_LINES_PER_WHEEL_TICK: f32 = 3.0;
+const SCROLL_SMOOTH_SPEED: f32 = 25.0;
+const SCROLL_SNAP_EPSILON: f32 = 0.5;
 
 #[derive(Default)]
 pub struct ResultState {
@@ -36,6 +39,12 @@ pub struct ResultState {
     /// Bumped on picker-driven mutations so we re-sync from `compute_result`
     /// next frame regardless of the editor's active state.
     force_reload: bool,
+    /// Eased vertical scroll we push to the inner multiline each frame.
+    /// We own scrolling explicitly (mirroring merge_view's input panes) so
+    /// the manually-painted text + gutter icons stay aligned regardless of
+    /// the widget's focus state.
+    scroll_y: f32,
+    scroll_target: f32,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -89,55 +98,71 @@ pub fn render(
     let stripe_x = origin[0] + GUTTER_W;
     let stripe_rect = [stripe_x, origin[1], stripe_x + STRIPE_W, origin[1] + widget_h];
 
+    // Compute content height + max scroll. The inner multiline contains
+    // every line of the merged buffer; the visible viewport is widget_h.
+    let line_count = state.buffer.lines().count().max(1) as f32;
+    let style = ui.clone_style();
+    let padding_y = style.frame_padding[1];
+    let content_h = line_count * lh + padding_y * 2.0;
+    let max_scroll = (content_h - widget_h).max(0.0);
+
+    // Mouse wheel adjusts our target scroll when hovering the result pane.
+    let hovered = ui.is_mouse_hovering_rect(widget_pos, [widget_pos[0] + widget_w, widget_pos[1] + widget_h]);
+    let wheel = if hovered { ui.io().mouse_wheel } else { 0.0 };
+    state.scroll_target = (state.scroll_target - wheel * lh * SCROLL_LINES_PER_WHEEL_TICK).clamp(0.0, max_scroll);
+
+    // Ease displayed scroll toward target.
+    let dt = ui.io().delta_time.max(0.0).min(0.1);
+    let k = 1.0 - (-dt * SCROLL_SMOOTH_SPEED).exp();
+    let mut displayed = state.scroll_y + (state.scroll_target - state.scroll_y) * k;
+    if (state.scroll_target - displayed).abs() < SCROLL_SNAP_EPSILON {
+        displayed = state.scroll_target;
+    }
+    if displayed > max_scroll { displayed = max_scroll; }
+    if displayed < 0.0 { displayed = 0.0; }
+    state.scroll_y = displayed;
+
     ui.set_cursor_screen_pos(widget_pos);
 
-    // Render the multiline directly (no outer child_window wrap — that would
-    // interfere with the internal scroll the widget already manages). Suppress
-    // imgui's native text + bg rendering via transparent style colors and a
-    // callback that captures the internal child's scroll_y so we can paint a
-    // syntax-colored version on top at the right y positions.
-    let caret_byte: Cell<i32> = Cell::new(-1);
-    let scroll_y_cell: Cell<f32> = Cell::new(0.0);
+    // Wrap the multiline in our own outer child window so we can pin the
+    // inner's vertical scroll to our `displayed` value every frame. This
+    // keeps the manually-painted text + gutter icons aligned with whatever
+    // imgui is rendering, regardless of widget focus.
     let new_buf_cell: Cell<Option<String>> = Cell::new(None);
+    let widget_active_cell: Cell<bool> = Cell::new(false);
+    let widget_focused_cell: Cell<bool> = Cell::new(false);
 
-    let _frame_bg = ui.push_style_color(imgui::StyleColor::FrameBg, [0.0, 0.0, 0.0, 0.0]);
-    let _frame_bg_hov = ui.push_style_color(imgui::StyleColor::FrameBgHovered, [0.0, 0.0, 0.0, 0.0]);
-    let _frame_bg_act = ui.push_style_color(imgui::StyleColor::FrameBgActive, [0.0, 0.0, 0.0, 0.0]);
-    let _text_color = ui.push_style_color(imgui::StyleColor::Text, [0.0, 0.0, 0.0, 0.0]);
-
-    struct ResultCallback<'a> {
-        cursor: &'a Cell<i32>,
-        scroll_y: &'a Cell<f32>,
-    }
-    impl<'a> imgui::InputTextCallbackHandler for ResultCallback<'a> {
-        fn on_always(&mut self, data: imgui::TextCallbackData) {
-            self.cursor.set(data.cursor_pos() as i32);
-            // Inside the callback we're in the multiline's internal child
-            // frame — its scroll_y is what we want.
+    let _wp = ui.push_style_var(StyleVar::WindowPadding([0.0, 0.0]));
+    let _cbg = ui.push_style_color(imgui::StyleColor::ChildBg, [0.0, 0.0, 0.0, 0.0]);
+    ui.child_window("##diffie_result_outer")
+        .size([widget_w, widget_h])
+        .build(|| {
+            // Pin the inner multiline's vertical scroll to our eased value
+            // so wheel-driven and picker-driven scroll always wins over
+            // imgui's own behavior.
             unsafe {
-                self.scroll_y.set(imgui::sys::igGetScrollY());
+                imgui::sys::igSetNextWindowScroll(imgui::sys::ImVec2 { x: -1.0, y: displayed });
             }
-        }
-    }
+            let _frame_bg = ui.push_style_color(imgui::StyleColor::FrameBg, [0.0, 0.0, 0.0, 0.0]);
+            let _frame_bg_hov = ui.push_style_color(imgui::StyleColor::FrameBgHovered, [0.0, 0.0, 0.0, 0.0]);
+            let _frame_bg_act = ui.push_style_color(imgui::StyleColor::FrameBgActive, [0.0, 0.0, 0.0, 0.0]);
+            let _text_color = ui.push_style_color(imgui::StyleColor::Text, [0.0, 0.0, 0.0, 0.0]);
 
-    let changed = ui
-        .input_text_multiline("##diffie_result", &mut state.buffer, [widget_w, widget_h])
-        .callback(
-            imgui::InputTextMultilineCallback::ALWAYS,
-            ResultCallback { cursor: &caret_byte, scroll_y: &scroll_y_cell },
-        )
-        .build();
-    let widget_active = ui.is_item_active();
-    let widget_focused = ui.is_item_focused();
-    if changed {
-        new_buf_cell.set(Some(state.buffer.clone()));
-    }
-    drop(_text_color);
-    drop(_frame_bg_act);
-    drop(_frame_bg_hov);
-    drop(_frame_bg);
+            let changed = ui
+                .input_text_multiline("##diffie_result", &mut state.buffer, [widget_w, widget_h])
+                .build();
+            widget_active_cell.set(ui.is_item_active());
+            widget_focused_cell.set(ui.is_item_focused());
+            if changed {
+                new_buf_cell.set(Some(state.buffer.clone()));
+            }
+        });
+    drop(_cbg);
+    drop(_wp);
 
-    let scroll_y = scroll_y_cell.get();
+    let scroll_y = displayed;
+    let widget_active = widget_active_cell.get();
+    let widget_focused = widget_focused_cell.get();
 
     // Paint syntax-highlighted text on top of the transparent multiline.
     paint_text(
