@@ -28,6 +28,7 @@ mod diff_view;
 mod engine_bar;
 mod merge_view;
 mod preferences;
+pub mod three_way_header;
 mod recents;
 mod result_pane;
 mod syntax;
