@@ -113,6 +113,68 @@ pub fn paint_line_with_spans(
     }
 }
 
+/// Iterate the visible subset of `buf`'s lines and paint each line's text
+/// via [`paint_line_with_spans`]. For each visible line the caller's
+/// `per_line` closure is invoked first with `(dl, line_idx, line_text,
+/// ln_1based, y_top_clipped, y_bottom_clipped)` so it can paint per-row
+/// decorations (row backgrounds, hunk tints, sub-line spans, …) before the
+/// text is drawn. The widget-rect clip rect is pushed once around the whole
+/// loop. Shared by diff_view, merge_view, and result_pane.
+#[allow(clippy::too_many_arguments)]
+pub fn paint_text_lines<F>(
+    ui: &Ui,
+    widget_rect: [f32; 4],
+    buf: &str,
+    highlights: &[LineSpans],
+    scroll_x: f32,
+    scroll_y: f32,
+    padding_x: f32,
+    padding_y: f32,
+    lh: f32,
+    mut per_line: F,
+) where
+    F: FnMut(&imgui::DrawListMut, usize, &str, u32, f32, f32),
+{
+    if widget_rect[3] <= widget_rect[1] || lh <= 0.0 {
+        return;
+    }
+    let widget_left = widget_rect[0];
+    let widget_top = widget_rect[1];
+    let widget_right = widget_rect[2];
+    let widget_bottom = widget_rect[3];
+    let widget_h = widget_bottom - widget_top;
+
+    let first_line = (scroll_y / lh).floor() as u32 + 1;
+    let last_line = ((scroll_y + widget_h) / lh).ceil() as u32 + 1;
+
+    let dl = ui.get_window_draw_list();
+    dl.with_clip_rect([widget_left, widget_top], [widget_right, widget_bottom], || {
+        for (line_idx, line_text) in buf.lines().enumerate() {
+            let ln = (line_idx as u32) + 1;
+            if ln < first_line || ln > last_line {
+                continue;
+            }
+            let y = widget_top + padding_y + (ln as f32 - 1.0) * lh - scroll_y;
+            if y + lh < widget_top || y > widget_bottom {
+                continue;
+            }
+            let y0 = y.max(widget_top);
+            let y1 = (y + lh).min(widget_bottom);
+            per_line(&dl, line_idx, line_text, ln, y0, y1);
+            let line_origin = [widget_left + padding_x - scroll_x, y];
+            paint_line_with_spans(
+                ui,
+                &dl,
+                line_origin,
+                line_text,
+                highlights.get(line_idx),
+                scroll_x,
+                padding_x,
+            );
+        }
+    });
+}
+
 /// Paint a blinking vertical caret line at byte offset `caret_byte` inside
 /// `buf`, clipped to `widget_rect = [left, top, right, bottom]`. Walks lines
 /// to locate the caret's row + column. Skips painting entirely when

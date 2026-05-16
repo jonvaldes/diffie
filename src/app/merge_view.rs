@@ -660,10 +660,7 @@ fn paint_pane_text(
     let padding_x = style.frame_padding[0];
     let padding_y = style.frame_padding[1];
 
-    let first_line = (scroll_y / lh).floor() as u32 + 1;
-    let last_line = ((scroll_y + widget_h) / lh).ceil() as u32 + 1;
-
-    // Build a fast line-no -> tint lookup for visible lines.
+    // Per-line tint lookup keyed on the layout's hunk ranges.
     let tint_for_line = |ln: u32| -> Option<[f32; 4]> {
         for (_id, kind, lo, hi) in &layout.hunks {
             let Some(kind_v) = *kind else { continue };
@@ -678,20 +675,17 @@ fn paint_pane_text(
         None
     };
 
-    let dl = ui.get_window_draw_list();
-    dl.with_clip_rect([widget_left, widget_top], [widget_right, widget_bottom], || {
-        for (line_idx, line_text) in buf.lines().enumerate() {
-            let ln = (line_idx as u32) + 1;
-            if ln < first_line || ln > last_line {
-                continue;
-            }
-            let y = widget_top + padding_y + (ln as f32 - 1.0) * lh - scroll_y;
-            if y + lh < widget_top || y > widget_bottom {
-                continue;
-            }
-            let y0 = y.max(widget_top);
-            let y1 = (y + lh).min(widget_bottom);
-
+    syntax_paint::paint_text_lines(
+        ui,
+        widget_rect,
+        buf,
+        highlights,
+        scroll_x,
+        scroll_y,
+        padding_x,
+        padding_y,
+        lh,
+        |dl, _line_idx, _line_text, ln, y0, y1| {
             if let Some(bg) = tint_for_line(ln) {
                 if y1 > y0 {
                     dl.add_rect([widget_left, y0], [widget_right, y1], bg)
@@ -699,34 +693,24 @@ fn paint_pane_text(
                         .build();
                 }
             }
+        },
+    );
 
-            let line_origin = [widget_left + padding_x - scroll_x, y];
-            syntax_paint::paint_line_with_spans(
-                ui,
-                &dl,
-                line_origin,
-                line_text,
-                highlights.get(line_idx),
-                scroll_x,
-                padding_x,
-            );
-        }
-
-        if widget_active {
-            syntax_paint::paint_caret(
-                ui,
-                &dl,
-                [widget_left, widget_top, widget_right, widget_bottom],
-                buf,
-                caret_byte,
-                scroll_x,
-                scroll_y,
-                padding_x,
-                padding_y,
-                lh,
-            );
-        }
-    });
+    if widget_active {
+        let dl = ui.get_window_draw_list();
+        syntax_paint::paint_caret(
+            ui,
+            &dl,
+            [widget_left, widget_top, widget_right, widget_bottom],
+            buf,
+            caret_byte,
+            scroll_x,
+            scroll_y,
+            padding_x,
+            padding_y,
+            lh,
+        );
+    }
 
     // Hover detection.
     let mouse_pos = ui.io().mouse_pos;

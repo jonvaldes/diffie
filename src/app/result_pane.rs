@@ -235,43 +235,29 @@ fn paint_text(
     scroll_y: f32,
     lh: f32,
 ) {
-    if widget_h <= 0.0 || lh <= 0.0 {
-        return;
-    }
     let style = ui.clone_style();
     let padding_x = style.frame_padding[0];
     let padding_y = style.frame_padding[1];
-    let widget_top = widget_pos[1];
-    let widget_bottom = widget_top + widget_h;
-    let widget_left = widget_pos[0];
-    let widget_right = widget_left + widget_w;
-
-    let first_line = (scroll_y / lh).floor() as u32 + 1;
-    let last_line = ((scroll_y + widget_h) / lh).ceil() as u32 + 1;
-
-    let dl = ui.get_window_draw_list();
-    dl.with_clip_rect([widget_left, widget_top], [widget_right, widget_bottom], || {
-        for (line_idx, line_text) in buf.lines().enumerate() {
-            let ln = (line_idx as u32) + 1;
-            if ln < first_line || ln > last_line {
-                continue;
-            }
-            let y = widget_top + padding_y + (ln as f32 - 1.0) * lh - scroll_y;
-            if y + lh < widget_top || y > widget_bottom {
-                continue;
-            }
-            let line_origin = [widget_left + padding_x, y];
-            syntax_paint::paint_line_with_spans(
-                ui,
-                &dl,
-                line_origin,
-                line_text,
-                highlights.get(line_idx),
-                0.0,
-                padding_x,
-            );
-        }
-    });
+    let widget_rect = [
+        widget_pos[0],
+        widget_pos[1],
+        widget_pos[0] + widget_w,
+        widget_pos[1] + widget_h,
+    ];
+    syntax_paint::paint_text_lines(
+        ui,
+        widget_rect,
+        buf,
+        highlights,
+        0.0,
+        scroll_y,
+        padding_x,
+        padding_y,
+        lh,
+        |_dl, _line_idx, _line_text, _ln, _y0, _y1| {
+            // Result pane has no per-line decorations.
+        },
+    );
 }
 
 // ---------------------------------------------------------------------------

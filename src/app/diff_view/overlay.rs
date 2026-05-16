@@ -120,11 +120,7 @@ pub(super) fn paint_pane_text(
     let padding_x = style.frame_padding[0];
     let padding_y = style.frame_padding[1];
 
-    let first_line = ((scroll_y / lh).floor() as i64).max(0) as u32 + 1;
-    let last_line = ((scroll_y + widget_h) / lh).ceil() as u32 + 1;
-
     // Map line_no (1-based) on this side -> (OpKind, Option<&Vec<SubSpan>>, move_id).
-    // Walk hunks once.
     let row_info = |ln: u32| -> Option<(OpKind, Option<&Vec<SubSpan>>, Option<u32>)> {
         for h in hunks {
             let range = match side {
@@ -155,105 +151,82 @@ pub(super) fn paint_pane_text(
         None
     };
 
-    let dl = ui.get_window_draw_list();
-    dl.with_clip_rect(
-        [widget_left, widget_top],
-        [widget_right, widget_bottom],
-        || {
-            // Walk lines once; paint bg, sub-line spans, then colored text.
-            for (line_idx, line_text) in buf.lines().enumerate() {
-                let ln = (line_idx as u32) + 1;
-                if ln < first_line || ln > last_line {
-                    continue;
+    syntax_paint::paint_text_lines(
+        ui,
+        widget_rect,
+        buf,
+        highlights,
+        scroll_x,
+        scroll_y,
+        padding_x,
+        padding_y,
+        lh,
+        |dl, _line_idx, line_text, ln, y0, y1| {
+            let Some((op_kind, spans_opt, move_id)) = row_info(ln) else { return };
+            // Per-row background.
+            let bg = if move_id.is_some() {
+                Some(theme::with_alpha(theme::PEACH(), 0.30))
+            } else {
+                match op_kind {
+                    OpKind::Equal => None,
+                    OpKind::Delete => Some([0.55, 0.18, 0.18, 0.30]),
+                    OpKind::Insert => Some([0.18, 0.50, 0.22, 0.30]),
                 }
-                let y = line_screen_y(widget_top, ln, scroll_y, lh) + padding_y;
-                if y + lh < widget_top || y > widget_bottom {
-                    continue;
+            };
+            if let Some(color) = bg {
+                if y1 > y0 {
+                    dl.add_rect([widget_left, y0], [widget_right, y1], color)
+                        .filled(true)
+                        .build();
                 }
-                let y0 = y.max(widget_top);
-                let y1 = (y + lh).min(widget_bottom);
-
-                // Per-row background.
-                let info = row_info(ln);
-                if let Some((op_kind, spans_opt, move_id)) = info {
-                    let bg = if move_id.is_some() {
-                        Some(theme::with_alpha(theme::PEACH(), 0.30))
-                    } else {
-                        match op_kind {
-                            OpKind::Equal => None,
-                            OpKind::Delete => Some([0.55, 0.18, 0.18, 0.30]),
-                            OpKind::Insert => Some([0.18, 0.50, 0.22, 0.30]),
+            }
+            // Sub-line spans (Changed ranges only).
+            if let Some(spans) = spans_opt {
+                let span_color = match op_kind {
+                    OpKind::Delete => [0.75, 0.20, 0.20, 0.45],
+                    OpKind::Insert => [0.20, 0.65, 0.25, 0.45],
+                    OpKind::Equal => [0.0, 0.0, 0.0, 0.0],
+                };
+                if !matches!(op_kind, OpKind::Equal) && y1 > y0 {
+                    for sp in spans {
+                        if !matches!(sp.kind, SubSpanKind::Changed) {
+                            continue;
                         }
-                    };
-                    if let Some(color) = bg {
-                        if y1 > y0 {
-                            dl.add_rect([widget_left, y0], [widget_right, y1], color)
+                        if sp.end <= sp.start {
+                            continue;
+                        }
+                        let x0 = widget_left - scroll_x
+                            + syntax_paint::text_x_at_byte(ui, line_text, sp.start as usize, padding_x);
+                        let x1 = widget_left - scroll_x
+                            + syntax_paint::text_x_at_byte(ui, line_text, sp.end as usize, padding_x);
+                        let x0c = x0.max(widget_left).min(widget_right);
+                        let x1c = x1.max(widget_left).min(widget_right);
+                        if x1c > x0c {
+                            dl.add_rect([x0c, y0], [x1c, y1], span_color)
                                 .filled(true)
                                 .build();
                         }
                     }
-
-                    // Sub-line spans (Changed ranges only).
-                    if let Some(spans) = spans_opt {
-                        let span_color = match op_kind {
-                            OpKind::Delete => [0.75, 0.20, 0.20, 0.45],
-                            OpKind::Insert => [0.20, 0.65, 0.25, 0.45],
-                            OpKind::Equal => [0.0, 0.0, 0.0, 0.0],
-                        };
-                        if !matches!(op_kind, OpKind::Equal) && y1 > y0 {
-                            for sp in spans {
-                                if !matches!(sp.kind, SubSpanKind::Changed) {
-                                    continue;
-                                }
-                                if sp.end <= sp.start {
-                                    continue;
-                                }
-                                let x0 = widget_left - scroll_x
-                                    + syntax_paint::text_x_at_byte(ui, line_text, sp.start as usize, padding_x);
-                                let x1 = widget_left - scroll_x
-                                    + syntax_paint::text_x_at_byte(ui, line_text, sp.end as usize, padding_x);
-                                let x0c = x0.max(widget_left).min(widget_right);
-                                let x1c = x1.max(widget_left).min(widget_right);
-                                if x1c > x0c {
-                                    dl.add_rect([x0c, y0], [x1c, y1], span_color)
-                                        .filled(true)
-                                        .build();
-                                }
-                            }
-                        }
-                    }
                 }
-
-                // Paint text via the shared per-line span painter.
-                let line_origin = [widget_left + padding_x - scroll_x, y];
-                syntax_paint::paint_line_with_spans(
-                    ui,
-                    &dl,
-                    line_origin,
-                    line_text,
-                    highlights.get(line_idx),
-                    scroll_x,
-                    padding_x,
-                );
-            }
-
-            // Caret. Blink: ~1s period, on for first half. Only when active.
-            if widget_active {
-                syntax_paint::paint_caret(
-                    ui,
-                    &dl,
-                    [widget_left, widget_top, widget_right, widget_bottom],
-                    buf,
-                    caret_byte,
-                    scroll_x,
-                    scroll_y,
-                    padding_x,
-                    padding_y,
-                    lh,
-                );
             }
         },
     );
+
+    if widget_active {
+        let dl = ui.get_window_draw_list();
+        syntax_paint::paint_caret(
+            ui,
+            &dl,
+            [widget_left, widget_top, widget_right, widget_bottom],
+            buf,
+            caret_byte,
+            scroll_x,
+            scroll_y,
+            padding_x,
+            padding_y,
+            lh,
+        );
+    }
 
     // Hover detection (outside the clip block — just sets the out cell).
     let mouse_pos = ui.io().mouse_pos;
