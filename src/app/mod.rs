@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use imgui::{Context, FontGlyphRanges, FontId, FontSource};
 use imgui_wgpu::{Renderer, RendererConfig};
@@ -16,7 +16,7 @@ use imgui_winit_support::{HiDpiMode, WinitPlatform};
 use winit::{
     application::ApplicationHandler,
     event::WindowEvent,
-    event_loop::{ActiveEventLoop, EventLoop},
+    event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
     window::{Window, WindowId},
 };
 
@@ -201,7 +201,31 @@ struct AppState {
     /// CLI-supplied session to open on the first frame. Drained inside
     /// `frame_ui` once the GPU / imgui context is up.
     pending_initial: Option<InitialOpen>,
+    /// True when something needs to keep redrawing as fast as possible —
+    /// e.g. mid-ease scroll. Recomputed at the end of every frame from the
+    /// per-session view states. Used by the event loop to switch between
+    /// `Poll` (animating) and `Wait` (idle).
+    animating: bool,
+    /// Most-recent time at which we kicked a caret-blink redraw. While a
+    /// text input is focused but nothing else is animating, the loop wakes
+    /// at ~`CARET_BLINK_INTERVAL` to give the caret a frame to toggle.
+    last_blink_request: Instant,
+    /// Most-recent time an input event landed. We keep redrawing for a
+    /// short grace period after this so animations triggered by the input
+    /// (scroll easing, hover transitions) have time to start — without it,
+    /// the loop can go idle on the same frame the input fired, before the
+    /// view code has a chance to mark itself animating.
+    last_input_at: Instant,
 }
+
+/// Imgui's default caret blink rate is one cycle per second; rendering at
+/// half that interval is enough to keep on/off transitions visible.
+const CARET_BLINK_INTERVAL: Duration = Duration::from_millis(500);
+
+/// How long to keep rendering after the last input event before allowing the
+/// loop to drop into a true idle wait. Covers the gap between an input
+/// arriving and the resulting animation showing up in `is_animating()`.
+const INPUT_REDRAW_GRACE: Duration = Duration::from_millis(200);
 
 /// Identifier shared between diff/merge views and the result pane so view
 /// code can record "the focused pane" without a generic-side enum. The Edit
@@ -239,6 +263,9 @@ impl Default for AppState {
             preferences_draft: preferences::AppPreferences::default(),
             theme_apply_pending: false,
             pending_initial: None,
+            animating: false,
+            last_blink_request: Instant::now(),
+            last_input_at: Instant::now(),
         }
     }
 }
@@ -265,6 +292,10 @@ struct App {
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        // Wait for events by default. `about_to_wait` overrides this each
+        // iteration based on whether anything is mid-animation or an input
+        // is focused (caret blink).
+        event_loop.set_control_flow(ControlFlow::Wait);
         if self.gpu.is_some() {
             return;
         }
@@ -431,13 +462,53 @@ impl ApplicationHandler for App {
                     event_loop.exit();
                 }
             }
+            // Any user input invalidates the current frame — schedule a
+            // redraw and stamp the grace-period clock so `about_to_wait`
+            // keeps rendering for a short window after the input lands.
+            WindowEvent::CursorMoved { .. }
+            | WindowEvent::CursorEntered { .. }
+            | WindowEvent::CursorLeft { .. }
+            | WindowEvent::MouseInput { .. }
+            | WindowEvent::MouseWheel { .. }
+            | WindowEvent::KeyboardInput { .. }
+            | WindowEvent::Ime(_)
+            | WindowEvent::ModifiersChanged(_)
+            | WindowEvent::Focused(_)
+            | WindowEvent::ThemeChanged(_)
+            | WindowEvent::ScaleFactorChanged { .. } => {
+                self.state.last_input_at = Instant::now();
+                gpu.window.request_redraw();
+            }
             _ => {}
         }
     }
 
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        if let Some(gpu) = self.gpu.as_ref() {
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        let Some(gpu) = self.gpu.as_ref() else { return };
+        let now = Instant::now();
+        let in_input_grace = now < self.state.last_input_at + INPUT_REDRAW_GRACE;
+        if self.state.animating || in_input_grace {
+            // Mid-animation (e.g. easing scroll) — or recently received an
+            // input and want to give any resulting animation time to start.
+            // Render as fast as the platform will let us.
             gpu.window.request_redraw();
+            event_loop.set_control_flow(ControlFlow::Poll);
+        } else if self.state.focused.is_some() {
+            // Idle but a text input is focused — wake up periodically so
+            // imgui's blinking caret has frames to toggle on.
+            let now = Instant::now();
+            let next = self.state.last_blink_request + CARET_BLINK_INTERVAL;
+            if now >= next {
+                gpu.window.request_redraw();
+                self.state.last_blink_request = now;
+                event_loop.set_control_flow(ControlFlow::WaitUntil(
+                    now + CARET_BLINK_INTERVAL,
+                ));
+            } else {
+                event_loop.set_control_flow(ControlFlow::WaitUntil(next));
+            }
+        } else {
+            event_loop.set_control_flow(ControlFlow::Wait);
         }
     }
 }
@@ -514,6 +585,19 @@ fn render(gpu: &mut Gpu, state: &mut AppState) {
     }
     gpu.queue.submit(Some(encoder.finish()));
     frame.present();
+
+    // Recompute "any animation in flight?" for the active session — drives
+    // the event loop's wait/poll decision in `about_to_wait`.
+    state.animating = state
+        .active
+        .map(|id| {
+            state.diff_views.get(&id).is_some_and(|v| v.is_animating())
+                || state
+                    .merge_views
+                    .get(&id)
+                    .is_some_and(|v| v.is_animating())
+        })
+        .unwrap_or(false);
 }
 
 // --- UI -------------------------------------------------------------------
@@ -1903,7 +1987,7 @@ fn current_session_summary(ui: &imgui::Ui, state: &mut AppState) {
             let result_highlights = state.syntax.highlights(result_key, base_lang, &result_lines).to_vec();
             let avail = ui.content_region_avail();
             const SPLITTER_H: f32 = 6.0;
-            let default_result_h = 200.0_f32.min(avail[1] * 0.4);
+            let default_result_h = avail[1] * 0.5;
             let stored_h = state
                 .result_panes
                 .get(&id)
@@ -2162,16 +2246,33 @@ fn open_two_way_paths(state: &mut AppState, a: PathBuf, b: PathBuf) {
 }
 
 fn open_three_way(state: &mut AppState) {
-    let Some(remote) = pick_file("Open REMOTE (3-way)") else {
-        return;
-    };
-    let Some(base) = pick_file("Open BASE (3-way)") else {
-        return;
-    };
-    let Some(local) = pick_file("Open LOCAL (3-way)") else {
-        return;
-    };
-    open_three_way_paths(state, base, local, remote);
+    let engine = Some(state.preferences.default_engine.clone());
+    let opts = state.preferences.default_options;
+    match state.sessions.open_three_way_with(
+        String::new(),
+        String::new(),
+        String::new(),
+        false,
+        false,
+        false,
+        engine,
+        opts,
+    ) {
+        Ok(id) => {
+            let label = "(untitled)".to_string();
+            state.tabs.push(Tab {
+                session_id: id,
+                label: label.clone(),
+                mode: TabMode::ThreeWay,
+                paths: vec![PathBuf::new(), PathBuf::new(), PathBuf::new()],
+                result_path: None,
+                path_inputs: vec![String::new(), String::new(), String::new()],
+            });
+            state.active = Some(id);
+            state.status = "Opened empty 3-way".into();
+        }
+        Err(e) => state.status = format!("Open 3-way failed: {e}"),
+    }
 }
 
 fn open_three_way_paths(

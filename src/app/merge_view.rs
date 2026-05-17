@@ -99,6 +99,15 @@ pub struct MergeViewState {
     vbar_drag: [Option<f32>; 3],
 }
 
+impl MergeViewState {
+    /// True when any pane's eased scroll hasn't yet reached its target — used
+    /// by the event loop to keep redrawing while the animation runs.
+    pub fn is_animating(&self) -> bool {
+        const EPS: f32 = 0.5;
+        (0..3).any(|i| (self.target[i] - self.last[i]).abs() > EPS)
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Pane {
     Base = 0,

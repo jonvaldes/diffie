@@ -35,15 +35,21 @@ pub fn count_hunks(hunks: &[MergeHunk]) -> MergeCounts {
 // Diagram constants (relative to a 80x60 px canvas).
 // ---------------------------------------------------------------------------
 
-const CANVAS_W: f32 = 80.0;
-const CANVAS_H: f32 = 60.0;
-const STRIP_H: f32 = 72.0;
+const CANVAS_W: f32 = 130.0;
+const CANVAS_H: f32 = 42.0;
+const STRIP_H: f32 = 48.0;
 const MARKER_HALF: f32 = 6.0;
+/// Pixels between a marker's bounding box and its inline text label.
+const LABEL_GAP: f32 = 4.0;
+/// Horizontal padding on each side of the diagram. The left-side "Remote"
+/// label hangs outside the marker, so without this the text clips the
+/// window edge.
+const LATERAL_MARGIN: f32 = 20.0;
 
-const BASE_POS: [f32; 2] = [40.0, 8.0];    // top center
-const REMOTE_POS: [f32; 2] = [12.0, 30.0]; // left
-const LOCAL_POS: [f32; 2] = [68.0, 30.0];  // right
-const MERGE_POS: [f32; 2] = [40.0, 52.0];  // bottom center
+const BASE_POS: [f32; 2] = [LATERAL_MARGIN + 45.0, 12.0];   // top center (label to left)
+const REMOTE_POS: [f32; 2] = [LATERAL_MARGIN + 20.0, 24.0]; // left (label outside-left)
+const LOCAL_POS: [f32; 2] = [LATERAL_MARGIN + 70.0, 24.0];  // right (label outside-right)
+const MERGE_POS: [f32; 2] = [LATERAL_MARGIN + 45.0, 36.0];  // bottom center (label to right)
 
 // ---------------------------------------------------------------------------
 // Render entry point.
@@ -55,9 +61,10 @@ pub fn render(ui: &Ui, counts: MergeCounts) {
     let origin = ui.cursor_screen_pos();
     let avail_w = ui.content_region_avail()[0];
 
-    draw_diagram(ui, origin);
-    draw_counts(ui, [origin[0] + CANVAS_W + 16.0, origin[1] + 6.0], counts);
-    draw_legend(ui, [origin[0] + avail_w - legend_width(ui), origin[1] + 6.0]);
+    // Counts on the left, diagram centered in the remaining space.
+    draw_counts(ui, [origin[0], origin[1] + 6.0], counts);
+    let diagram_x = origin[0] + (avail_w - CANVAS_W).max(0.0) * 0.5;
+    draw_diagram(ui, [diagram_x, origin[1]]);
 
     ui.set_cursor_screen_pos([origin[0], origin[1] + STRIP_H]);
 }
@@ -81,10 +88,28 @@ fn draw_diagram(ui: &Ui, origin: [f32; 2]) {
     fill_circle(p(LOCAL_POS), MARKER_HALF, theme::GREEN());
     fill_diamond(p(MERGE_POS), MARKER_HALF, theme::OVERLAY1());
 
-    // Suppress unused-variable warning for `ui` — we keep the same signature
-    // as `draw_counts`/`draw_legend` for consistency; `ui` may be used for
-    // clipping in future iterations.
-    let _ = ui;
+    // Inline labels next to each marker. All four are placed to the side
+    // of their marker: Base/Remote on the left, Local/Merge on the right.
+    let dl = ui.get_window_draw_list();
+    let text_color = theme::TEXT();
+    let lh = ui.text_line_height();
+
+    let put_left = |label: &str, marker: [f32; 2]| {
+        let w = ui.calc_text_size(label)[0];
+        let x = marker[0] - MARKER_HALF - LABEL_GAP - w;
+        let y = marker[1] - lh * 0.5;
+        dl.add_text([x, y], text_color, label);
+    };
+    let put_right = |label: &str, marker: [f32; 2]| {
+        let x = marker[0] + MARKER_HALF + LABEL_GAP;
+        let y = marker[1] - lh * 0.5;
+        dl.add_text([x, y], text_color, label);
+    };
+
+    put_left("Base", p(BASE_POS));
+    put_left("Remote", p(REMOTE_POS));
+    put_right("Local", p(LOCAL_POS));
+    put_right("Merge", p(MERGE_POS));
 }
 
 fn draw_counts(ui: &Ui, top_left: [f32; 2], counts: MergeCounts) {
@@ -113,37 +138,6 @@ fn draw_counts(ui: &Ui, top_left: [f32; 2], counts: MergeCounts) {
 
 fn conflict_count_color(n: u32) -> [f32; 4] {
     if n > 0 { theme::RED() } else { theme::OVERLAY1() }
-}
-
-const LEGEND_ENTRIES: [(&str, fn() -> [f32; 4]); 4] = [
-    ("Remote", theme::SAPPHIRE),
-    ("Base",   theme::YELLOW),
-    ("Local",  theme::GREEN),
-    ("Merge",  theme::OVERLAY1),
-];
-
-fn legend_width(ui: &Ui) -> f32 {
-    let mut w = 0.0_f32;
-    for (label, _) in LEGEND_ENTRIES {
-        w += ui.calc_text_size(label)[0] + 24.0;
-    }
-    w
-}
-
-fn draw_legend(ui: &Ui, top_left: [f32; 2]) {
-    let dl = ui.get_window_draw_list();
-    let lh = ui.text_line_height();
-    let mut x = top_left[0];
-    let y = top_left[1];
-    for (label, color_fn) in LEGEND_ENTRIES {
-        let sz = lh - 4.0;
-        dl.add_rect([x, y + 2.0], [x + sz, y + 2.0 + sz], color_fn())
-            .filled(true)
-            .build();
-        let tx = x + sz + 4.0;
-        dl.add_text([tx, y], theme::TEXT(), label);
-        x = tx + ui.calc_text_size(label)[0] + 12.0;
-    }
 }
 
 // ---------------------------------------------------------------------------

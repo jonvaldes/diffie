@@ -106,6 +106,16 @@ pub(crate) const VBAR_W: f32 = 12.0;
 /// Minimum thumb height so the grab target stays usable on very long files.
 pub(crate) const VBAR_THUMB_MIN_H: f32 = 24.0;
 
+impl DiffViewState {
+    /// True when either pane's eased scroll hasn't yet reached its target —
+    /// the event loop uses this to keep redrawing while the animation runs.
+    pub fn is_animating(&self) -> bool {
+        const EPS: f32 = 0.5;
+        (self.target_left_scroll - self.last_left_scroll_y).abs() > EPS
+            || (self.target_right_scroll - self.last_right_scroll_y).abs() > EPS
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Side {
     Left,
