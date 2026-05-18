@@ -702,8 +702,29 @@ fn render_pane(
     // Gutter on the left of this pane (line numbers).
     paint_gutter(ui, pane_pos, g_w, pane_h, scroll_y_out, lh, buf_line_count as u32);
 
-    // Custom vertical scrollbar, pinned to widget_rect's fixed right edge.
-    crate::app::diff_view::paint_vbar(ui, widget_rect, scroll_y_out, content_h, dragging);
+    // Custom vertical scrollbar with a minimap layer painted from the pane's
+    // hunks — band colors match the per-row tints used by `tint_for_line`.
+    let bands: Vec<crate::app::diff_view::MinimapBand> = layout
+        .hunks
+        .iter()
+        .filter_map(|(_id, kind, lo, hi)| {
+            let color = match (*kind)? {
+                HunkKind::LocalOnly => theme::with_alpha(theme::GREEN(), 0.85),
+                HunkKind::RemoteOnly => theme::with_alpha(theme::SAPPHIRE(), 0.85),
+                HunkKind::Conflict => [0.55, 0.18, 0.18, 0.85],
+            };
+            Some(crate::app::diff_view::MinimapBand { line_lo: *lo, line_hi: *hi, color })
+        })
+        .collect();
+    crate::app::diff_view::paint_vbar(
+        ui,
+        widget_rect,
+        scroll_y_out,
+        content_h,
+        dragging,
+        &bands,
+        buf_line_count as u32,
+    );
 
     // Restore Arrow cursor over the scrollbar / while dragging it.
     if content_h > pane_h && (in_track || dragging) {

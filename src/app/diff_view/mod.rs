@@ -9,7 +9,7 @@ use std::cell::Cell;
 
 use imgui::{FontId, Ui};
 
-use crate::diff::{Anchor, Hunk};
+use crate::diff::{Anchor, DiffOp, Hunk};
 use crate::session::{SessionId, SessionMode, SessionStore, SideRef, TwoWaySide};
 
 mod common;
@@ -834,7 +834,16 @@ fn render_pane(
     // multiline's native scrollbar did.
     let vbar_visible = content_h > pane_h;
     let vbar_active = drag_slot.is_some();
-    paint_vbar(ui, widget_rect, own_scroll, content_h, vbar_active);
+    let bands = build_minimap_bands(hunks, side);
+    paint_vbar(
+        ui,
+        widget_rect,
+        own_scroll,
+        content_h,
+        vbar_active,
+        &bands,
+        buf_line_count_for_gutter,
+    );
 
     // Override imgui's auto-set TextInput (I-beam) cursor with Arrow when the
     // mouse is over the scrollbar or actively dragging it. set_mouse_cursor
@@ -846,7 +855,54 @@ fn render_pane(
     (widget_rect, scroll_y_out)
 }
 
-pub(crate) fn paint_vbar(ui: &Ui, widget_rect: [f32; 4], scroll_y: f32, content_h: f32, active: bool) {
+/// One colored band on the scrollbar track. Acts as a "minimap" marker
+/// pointing at a hunk's location in the file. Lines are 1-based inclusive.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct MinimapBand {
+    pub line_lo: u32,
+    pub line_hi: u32,
+    pub color: [f32; 4],
+}
+
+/// Build scrollbar-minimap bands for one side of a 2-way diff. Mirrors the
+/// per-row tint convention: Left/A deletions paint red, Right/B insertions
+/// paint green. Pure-equal hunks and hunks with an empty range on this side
+/// (insert-only on the left, delete-only on the right) are skipped.
+fn build_minimap_bands(hunks: &[Hunk], side: Side) -> Vec<MinimapBand> {
+    let mut bands = Vec::new();
+    for h in hunks {
+        let range = match side {
+            Side::Left => h.a_range,
+            Side::Right => h.b_range,
+        };
+        if range == (0, 0) || range.1 < range.0 {
+            continue;
+        }
+        let has_change = h
+            .ops
+            .iter()
+            .any(|op| matches!(op, DiffOp::Delete { .. } | DiffOp::Insert { .. }));
+        if !has_change {
+            continue;
+        }
+        let color = match side {
+            Side::Left => [0.55, 0.18, 0.18, 0.85],
+            Side::Right => [0.18, 0.50, 0.22, 0.85],
+        };
+        bands.push(MinimapBand { line_lo: range.0, line_hi: range.1, color });
+    }
+    bands
+}
+
+pub(crate) fn paint_vbar(
+    ui: &Ui,
+    widget_rect: [f32; 4],
+    scroll_y: f32,
+    content_h: f32,
+    active: bool,
+    bands: &[MinimapBand],
+    total_lines: u32,
+) {
     let track_top = widget_rect[1];
     let track_bot = widget_rect[3];
     let track_h = track_bot - track_top;
@@ -869,6 +925,25 @@ pub(crate) fn paint_vbar(ui: &Ui, widget_rect: [f32; 4], scroll_y: f32, content_
         [0.0, 0.0, 0.0, 0.18],
         [0.0, 0.0, 0.0, 0.18],
     );
+    // Minimap bands. Map each band's line range onto the track. Enforce a
+    // 2px minimum height so single-line hunks remain visible at any zoom.
+    if total_lines > 0 {
+        let lines_f = total_lines as f32;
+        for b in bands {
+            let lo = b.line_lo.saturating_sub(1) as f32;
+            let hi = b.line_hi.min(total_lines) as f32;
+            let mut y0 = track_top + (lo / lines_f) * track_h;
+            let mut y1 = track_top + (hi / lines_f) * track_h;
+            if y1 - y0 < 2.0 {
+                let mid = 0.5 * (y0 + y1);
+                y0 = mid - 1.0;
+                y1 = mid + 1.0;
+            }
+            dl.add_rect([x_l, y0], [x_r, y1], b.color)
+                .filled(true)
+                .build();
+        }
+    }
     // Thumb — brighter when dragging.
     let thumb_a = if active { 0.85 } else { 0.55 };
     dl.add_rect([x_l + 2.0, ty + 1.0], [x_r - 2.0, ty + th - 1.0], [0.75, 0.75, 0.75, thumb_a])
