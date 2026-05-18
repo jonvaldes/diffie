@@ -2120,6 +2120,16 @@ fn current_session_summary(ui: &imgui::Ui, state: &mut AppState) {
                 .unwrap_or(default_result_h)
                 .clamp(min_pane_h, max_result_h);
             let diff_h = (avail[1] - result_h - SPLITTER_H).max(min_pane_h);
+            // Snapshot the 4 scroll targets BEFORE rendering so the post-render
+            // sync pass can detect which pane (if any) was user-driven this
+            // frame. Slots 0..3 are Base/Local/Remote/Result.
+            let prev_scroll_targets: [f32; 4] = state
+                .merge_views
+                .entry(id)
+                .or_default()
+                .target;
+
+            let upper_ranges;
             {
                 let store = &state.sessions;
                 let status = &mut state.status;
@@ -2127,10 +2137,11 @@ fn current_session_summary(ui: &imgui::Ui, state: &mut AppState) {
                 let view_state = state.merge_views.entry(id).or_default();
                 let mut focus_request: Option<FocusedPane> = None;
                 let mut pending_edits: Vec<undo_stack::DiffEdit> = Vec::new();
+                let mut ranges_out: Option<merge_view::UpperPaneRanges> = None;
                 ui.child_window("merge_area")
                     .size([0.0, diff_h])
                     .build(|| {
-                        merge_view::render(
+                        ranges_out = Some(merge_view::render(
                             ui,
                             store,
                             id,
@@ -2144,8 +2155,14 @@ fn current_session_summary(ui: &imgui::Ui, state: &mut AppState) {
                             &base_h,
                             &local_h,
                             &remote_h,
-                        );
+                        ));
                     });
+                upper_ranges = ranges_out.unwrap_or(merge_view::UpperPaneRanges {
+                    base: Vec::new(),
+                    local: Vec::new(),
+                    remote: Vec::new(),
+                    view_h: 0.0,
+                });
                 if let Some(p) = focus_request {
                     state.focused = Some((id, p));
                 }
@@ -2202,26 +2219,49 @@ fn current_session_summary(ui: &imgui::Ui, state: &mut AppState) {
             {
                 let mono = state.mono_font;
                 let result = state.result_panes.entry(id).or_default();
+                let view_state = state.merge_views.entry(id).or_default();
                 let mut focus_request: Option<FocusedPane> = None;
+                let mut result_sync: Option<result_pane::ResultPaneSync> = None;
                 ui.child_window("result_area")
                     .size([0.0, 0.0])
                     .border(true)
                     .build(|| {
-                        result_pane::render(
+                        result_sync = Some(result_pane::render(
                             ui,
                             &state.sessions,
                             id,
                             result,
+                            view_state,
                             mono,
                             &mut focus_request,
                             hunks,
                             resolutions,
                             &result_highlights,
-                        );
+                        ));
                     });
                 if let Some(p) = focus_request {
                     state.focused = Some((id, p));
                 }
+
+                // Unified 4-way scroll sync. Slot order matches MergeViewState:
+                // [Base, Local, Remote, Result].
+                let rs = result_sync.unwrap_or_default();
+                merge_view::sync_scrolls(
+                    view_state,
+                    prev_scroll_targets,
+                    [
+                        upper_ranges.view_h,
+                        upper_ranges.view_h,
+                        upper_ranges.view_h,
+                        rs.view_h,
+                    ],
+                    [
+                        &upper_ranges.base,
+                        &upper_ranges.local,
+                        &upper_ranges.remote,
+                        &rs.ranges,
+                    ],
+                );
             }
         }
     }

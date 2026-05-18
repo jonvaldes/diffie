@@ -66,10 +66,14 @@ pub struct MergeViewState {
     remote_buf: String,
     /// Last *displayed* scroll_y per pane — the eased value pushed to imgui
     /// last frame. Used by overlay paint and as the start of the next ease.
-    last: [f32; 3],
+    /// Slots 0..3 are the upper panes (Base/Local/Remote); slot 3 is the
+    /// result pane in the 3-way view, so vertical scroll syncs across all
+    /// four panes.
+    pub last: [f32; 4],
     /// Where each pane is scrolling toward. Wheel, sync, and jump update
-    /// this; `last` eases toward it each frame.
-    target: [f32; 3],
+    /// this; `last` eases toward it each frame. Same 4-slot layout as
+    /// `last` (slot 3 = result pane).
+    pub target: [f32; 4],
     /// Outer-scroll-window horizontal scroll position per pane, captured
     /// each frame from imgui via igGetScrollX. Each multiline is wrapped
     /// in an outer child window with HORIZONTAL_SCROLLBAR; imgui handles
@@ -85,8 +89,9 @@ pub struct MergeViewState {
     /// scroll only fires when the byte position changes, so the user
     /// can wheel-scroll away from the caret without it snapping back.
     last_caret: [Option<i32>; 3],
-    /// Pending scroll value to apply next frame on a given pane.
-    pending: [Option<f32>; 3],
+    /// Pending scroll value to apply next frame on a given pane. Slot 3 is
+    /// the result pane (consumed by `result_pane::render`).
+    pub pending: [Option<f32>; 4],
     /// First-frame focus line (1-based) per pane. Set by the open path to
     /// the first non-Stable hunk's start so the user lands at the first
     /// difference. Resolved to a `pending` scroll inside the pane render
@@ -109,7 +114,7 @@ impl MergeViewState {
     /// by the event loop to keep redrawing while the animation runs.
     pub fn is_animating(&self) -> bool {
         const EPS: f32 = 0.5;
-        (0..3).any(|i| (self.target[i] - self.last[i]).abs() > EPS)
+        (0..4).any(|i| (self.target[i] - self.last[i]).abs() > EPS)
     }
 }
 
@@ -224,6 +229,15 @@ fn build_layout(hunks: &[MergeHunk], pane: Pane, lh: f32) -> PaneLayout {
 
 // ---------------------------------- render -----------------------------------
 
+/// Output of `render` returned to the caller so it can run the 4-way scroll
+/// sync (3 upper panes + result pane) after `result_pane::render` has run.
+pub struct UpperPaneRanges {
+    pub base: Vec<(u32, f32, f32)>,
+    pub local: Vec<(u32, f32, f32)>,
+    pub remote: Vec<(u32, f32, f32)>,
+    pub view_h: f32,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn render(
     ui: &Ui,
@@ -239,14 +253,20 @@ pub fn render(
     base_highlights: &[LineSpans],
     local_highlights: &[LineSpans],
     remote_highlights: &[LineSpans],
-) {
+) -> UpperPaneRanges {
+    let empty = UpperPaneRanges {
+        base: Vec::new(),
+        local: Vec::new(),
+        remote: Vec::new(),
+        view_h: 0.0,
+    };
     // Sync buffers from session at frame start.
     let snap = match store.snapshot(session_id) {
         Ok(s) => s,
-        Err(_) => return,
+        Err(_) => return empty,
     };
     let SessionMode::ThreeWay { base_text, local_text, remote_text, .. } = &snap.mode else {
-        return;
+        return empty;
     };
     let base_changed = state.base_buf != *base_text;
     if base_changed {
@@ -312,12 +332,6 @@ pub fn render(
         [Cell::new(None), Cell::new(None), Cell::new(None)];
     let focus_event: Cell<Option<crate::app::FocusedPane>> = Cell::new(None);
 
-    // Snapshot last frame's targets before any render_pane call mutates
-    // them. Sync detection compares targets (not eased displayed scroll)
-    // so a single user gesture fires sync exactly once instead of every
-    // animation frame.
-    let prev_targets = state.target;
-
     let (_remote_rect, remote_scroll, remote_origin) = render_pane(
         ui, state, remote_pos, pane_w, pane_h, Pane::Remote, session_id,
         pending_edits, &remote_layout, &hover_panes[2], &focus_event,
@@ -346,15 +360,8 @@ pub fn render(
         *focus_request = Some(p);
     }
 
-    let view_hs = [pane_h, pane_h, pane_h];
-    sync_scrolls(
-        state,
-        prev_targets,
-        view_hs,
-        &base_layout.ranges,
-        &local_layout.ranges,
-        &remote_layout.ranges,
-    );
+    // 4-way scroll sync runs in the caller (mod.rs) after `result_pane::render`
+    // so the result pane joins the same sync pass as the three upper panes.
 
     // Draw bezier connectors on top, *after* the panes have all rendered.
     // origin y is the top of each pane's text widget in screen space; the
@@ -413,6 +420,13 @@ pub fn render(
 
     // Reserve space so subsequent widgets land below the panes.
     ui.set_cursor_screen_pos([panes_top_left[0], panes_top_left[1] + pane_h]);
+
+    UpperPaneRanges {
+        base: base_layout.ranges,
+        local: local_layout.ranges,
+        remote: remote_layout.ranges,
+        view_h: pane_h,
+    }
 }
 
 /// Returns (widget_rect, scroll_y, content_origin_screen_pos).
@@ -1238,24 +1252,27 @@ fn draw_connector(
     let _ = dl;
 }
 
-fn sync_scrolls(
+/// 4-way scroll sync across the three upper panes (Base/Local/Remote) and
+/// the result pane. Slot order matches `MergeViewState::target`:
+/// `[Base, Local, Remote, Result]`. Called from the host after both
+/// `merge_view::render` and `result_pane::render` have updated their
+/// respective `state.target` slots so a single user gesture in any pane
+/// propagates to the other three on the next frame.
+pub fn sync_scrolls(
     state: &mut MergeViewState,
-    prev_targets: [f32; 3],
-    view_h: [f32; 3],
-    base_ranges: &[(u32, f32, f32)],
-    local_ranges: &[(u32, f32, f32)],
-    remote_ranges: &[(u32, f32, f32)],
+    prev_targets: [f32; 4],
+    view_h: [f32; 4],
+    ranges: [&[(u32, f32, f32)]; 4],
 ) {
-    let ranges = [base_ranges, local_ranges, remote_ranges];
     let mut driver: Option<usize> = None;
-    for i in 0..3 {
+    for i in 0..4 {
         if (state.target[i] - prev_targets[i]).abs() > ECHO_TOLERANCE {
             driver = Some(i);
             break;
         }
     }
     if let Some(src) = driver {
-        for dst in 0..3 {
+        for dst in 0..4 {
             if dst == src {
                 continue;
             }

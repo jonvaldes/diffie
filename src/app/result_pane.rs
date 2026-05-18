@@ -17,14 +17,34 @@ use std::collections::HashMap;
 
 use imgui::{FontId, StyleVar, Ui};
 
+use crate::app::merge_view::MergeViewState;
 use crate::app::syntax::LineSpans;
 use crate::app::syntax_paint;
 use crate::app::theme;
 use crate::merge::{hunk_output_ranges, result_line_origins, LineOrigin, MergeHunk, Resolution};
 use crate::session::{SessionId, SessionStore};
 
+/// Slot in `MergeViewState`'s 4-way scroll arrays that we use for the
+/// result pane. Slots 0..3 are the three upper panes
+/// (Base / Local / Remote); 3 is the result.
+pub const RESULT_SCROLL_SLOT: usize = 3;
+
+/// Wheel/easing constants — kept in sync with the values in `merge_view`
+/// so result-pane scrolling feels identical to the three upper panes.
+const SCROLL_LINES_PER_WHEEL_TICK: f32 = 3.0;
+const SCROLL_SMOOTH_SPEED: f32 = 25.0;
+const SCROLL_SNAP_EPSILON: f32 = 0.5;
+/// Tolerance for "scroll moved by something other than us" (i.e. user
+/// dragged the native vertical scrollbar). Keep it well above the easing
+/// snap epsilon so a frame mid-ease isn't misread as a drag.
+const DRAG_DETECT_TOLERANCE: f32 = 1.5;
+
 const STRIPE_W: f32 = 4.0;
 const GUTTER_W: f32 = 56.0;
+/// Width of the line-number column drawn to the left of the picker gutter.
+/// Mirrors the merge view's per-pane gutter so the result pane reads
+/// visually consistent with the three upper panes.
+const LN_GUTTER_W: f32 = 50.0;
 const ICON_HALF: f32 = 6.0;
 const ICON_SPACING: f32 = 18.0;
 
@@ -37,8 +57,18 @@ pub struct ResultState {
     /// next frame regardless of the editor's active state.
     force_reload: bool,
     /// User-adjusted result pane height (px). `None` means use the default
-    /// (`200.min(avail*0.4)`). Set by the splitter between merge & result.
+    /// (50% of available vertical space). Set by the splitter between merge & result.
     pub pane_height: Option<f32>,
+}
+
+/// Output line ranges + view height returned to the caller so it can run
+/// the unified 4-way scroll sync alongside `merge_view::render`.
+#[derive(Default)]
+pub struct ResultPaneSync {
+    /// Per-hunk (id, content_y_top, content_y_bottom) in result-pane content
+    /// space. Empty when nothing rendered (e.g. snapshot failure).
+    pub ranges: Vec<(u32, f32, f32)>,
+    pub view_h: f32,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -47,12 +77,13 @@ pub fn render(
     store: &SessionStore,
     session_id: SessionId,
     state: &mut ResultState,
+    merge_state: &mut MergeViewState,
     mono_font: Option<FontId>,
     focus_request: &mut Option<crate::app::FocusedPane>,
     hunks: &[MergeHunk],
     resolutions: &HashMap<u32, Resolution>,
     result_highlights: &[LineSpans],
-) {
+) -> ResultPaneSync {
     if state.force_reload || !state.was_active_last_frame {
         if let Ok(text) = store.compute_result(session_id) {
             if text != state.buffer {
@@ -65,7 +96,7 @@ pub fn render(
 
     if !state.initialized {
         ui.text_disabled("Computing…");
-        return;
+        return ResultPaneSync::default();
     }
 
     let avail = ui.content_region_avail();
@@ -73,24 +104,32 @@ pub fn render(
     let origin = ui.cursor_screen_pos();
     let lh = ui.text_line_height();
 
-    let gutter_rect = [
+    // Column layout, left → right:
+    //   [line-number gutter] [picker gutter] [stripe] [text]
+    // Line numbers and picker icons each get their own gutter so the picker
+    // column matches what it was before, just shifted right by `LN_GUTTER_W`.
+    let widget_h = avail[1];
+    let ln_gutter_rect = [
         origin[0],
         origin[1],
-        origin[0] + GUTTER_W,
-        origin[1] + avail[1],
+        origin[0] + LN_GUTTER_W,
+        origin[1] + widget_h,
     ];
-    let widget_pos = [origin[0] + GUTTER_W + STRIPE_W, origin[1]];
-    let widget_w = (avail[0] - GUTTER_W - STRIPE_W).max(40.0);
-    let widget_h = avail[1];
+    let gutter_rect = [
+        origin[0] + LN_GUTTER_W,
+        origin[1],
+        origin[0] + LN_GUTTER_W + GUTTER_W,
+        origin[1] + widget_h,
+    ];
+    let stripe_x = origin[0] + LN_GUTTER_W + GUTTER_W;
+    let stripe_rect = [stripe_x, origin[1], stripe_x + STRIPE_W, origin[1] + widget_h];
+    let widget_pos = [stripe_x + STRIPE_W, origin[1]];
+    let widget_w = (avail[0] - LN_GUTTER_W - GUTTER_W - STRIPE_W).max(40.0);
 
     // Reserve the gutter strip up front. The actual icons + hit tests are
     // painted/placed AFTER the text widget so we can read its scroll position.
     ui.set_cursor_screen_pos(origin);
-    ui.dummy([GUTTER_W, widget_h]);
-
-    // Stripe lives in its own column between gutter and text.
-    let stripe_x = origin[0] + GUTTER_W;
-    let stripe_rect = [stripe_x, origin[1], stripe_x + STRIPE_W, origin[1] + widget_h];
+    ui.dummy([LN_GUTTER_W + GUTTER_W, widget_h]);
 
     // Size the inner multiline to the full content height so it never has
     // to scroll internally; the outer child window owns scrolling — that way
@@ -108,6 +147,50 @@ pub fn render(
     let widget_focused_cell: Cell<bool> = Cell::new(false);
     let scroll_y_cell: Cell<f32> = Cell::new(0.0);
     let caret_byte: Cell<i32> = Cell::new(-1);
+
+    // Scroll model: keep this in step with `merge_view::render_pane`. We
+    // ease a `displayed` value from `last` toward `target`, and override
+    // imgui's native vertical scroll on the outer child every frame via
+    // `igSetNextWindowScroll`. Wheel events feed `target` directly;
+    // sync from `merge_view::sync_scrolls` (slot 3) likewise feeds
+    // `target`. Native scrollbar drag is detected post-build by comparing
+    // the reported scroll_y to what we set, and snaps `target` instantly
+    // so the drag tracks the cursor.
+    let pending_scroll = merge_state.pending[RESULT_SCROLL_SLOT].take();
+    let max_scroll = (inner_h - widget_h).max(0.0);
+    let wheel_v = if ui.is_mouse_hovering_rect(
+        widget_pos,
+        [widget_pos[0] + widget_w, widget_pos[1] + widget_h],
+    ) {
+        ui.io().mouse_wheel
+    } else {
+        0.0
+    };
+    let prev_target = merge_state.target[RESULT_SCROLL_SLOT];
+    let prev_displayed = merge_state.last[RESULT_SCROLL_SLOT];
+    let mut target = if let Some(s) = pending_scroll {
+        s
+    } else {
+        prev_target - wheel_v * lh * SCROLL_LINES_PER_WHEEL_TICK
+    };
+    target = target.clamp(0.0, max_scroll);
+
+    // Clamp dt to ~one 30fps frame so a wake-up frame after idle doesn't
+    // collapse the easing into a single jump (mirrors merge_view).
+    let dt = ui.io().delta_time.max(0.0).min(0.033);
+    let k = 1.0 - (-dt * SCROLL_SMOOTH_SPEED).exp();
+    let mut displayed = prev_displayed + (target - prev_displayed) * k;
+    if (target - displayed).abs() < SCROLL_SNAP_EPSILON {
+        displayed = target;
+    }
+    displayed = displayed.clamp(0.0, max_scroll);
+
+    unsafe {
+        imgui::sys::igSetNextWindowScroll(imgui::sys::ImVec2 {
+            x: -1.0,
+            y: displayed,
+        });
+    }
 
     let _wp = ui.push_style_var(StyleVar::WindowPadding([0.0, 0.0]));
     let _cbg = ui.push_style_color(imgui::StyleColor::ChildBg, [0.0, 0.0, 0.0, 0.0]);
@@ -228,6 +311,82 @@ pub fn render(
         let _ = store.update_manual_result(session_id, new_text);
     }
     state.was_active_last_frame = widget_active;
+
+    // Line-number gutter (drawn after we know `scroll_y` so it stays aligned
+    // with the multiline as the user scrolls).
+    paint_line_number_gutter(
+        ui,
+        ln_gutter_rect,
+        scroll_y,
+        lh,
+        state.buffer.lines().count().max(1) as u32,
+    );
+
+    // 4-way scroll sync: post-build, detect whether the user dragged the
+    // native vertical scrollbar (the only path that can move scroll_y away
+    // from our `displayed` override) and snap target+last to the dragged
+    // position so the user sees a 1:1 follow. Otherwise the canonical
+    // values are our own eased `displayed` / `target`.
+    let drag_delta = scroll_y - displayed;
+    let (final_target, final_displayed) = if drag_delta.abs() > DRAG_DETECT_TOLERANCE {
+        let snapped = scroll_y.clamp(0.0, max_scroll);
+        (snapped, snapped)
+    } else {
+        (target, displayed)
+    };
+    merge_state.target[RESULT_SCROLL_SLOT] = final_target;
+    merge_state.last[RESULT_SCROLL_SLOT] = final_displayed;
+
+    // Per-hunk content-y ranges in the result pane, used by the unified sync.
+    let mut ranges: Vec<(u32, f32, f32)> = Vec::new();
+    for (id, first, last) in hunk_output_ranges(hunks, resolutions) {
+        let y0 = (first as f32 - 1.0) * lh;
+        let y1 = (last as f32) * lh;
+        if y1 > y0 {
+            ranges.push((id, y0, y1));
+        }
+    }
+
+    ResultPaneSync { ranges, view_h: widget_h }
+}
+
+/// Draw 1-based line numbers in the gutter strip, right-aligned with a
+/// small padding. Mirrors `merge_view::paint_gutter` minus the per-row
+/// hunk-tint background — result-pane tints already come from
+/// `result_line_origins` painted in `paint_text`.
+fn paint_line_number_gutter(
+    ui: &Ui,
+    g_rect: [f32; 4],
+    scroll_y: f32,
+    lh: f32,
+    line_count: u32,
+) {
+    if lh <= 0.0 {
+        return;
+    }
+    let dl = ui.get_window_draw_list();
+    let g_left = g_rect[0];
+    let g_top = g_rect[1];
+    let g_right = g_rect[2];
+    let g_bottom = g_rect[3];
+    let padding_y = ui.clone_style().frame_padding[1];
+    let first_line = (scroll_y / lh).floor() as u32 + 1;
+    let last_line = ((scroll_y + (g_bottom - g_top)) / lh).ceil() as u32 + 1;
+    dl.with_clip_rect_intersect([g_left, g_top], [g_right, g_bottom], || {
+        for line in first_line..=last_line.min(line_count) {
+            let y = g_top + padding_y + (line as f32 - 1.0) * lh - scroll_y;
+            if y + lh < g_top || y > g_bottom {
+                continue;
+            }
+            let text = format!("{line}");
+            let text_w = ui.calc_text_size(&text)[0];
+            dl.add_text(
+                [g_right - 4.0 - text_w, y + 2.0],
+                theme::OVERLAY1(),
+                &text,
+            );
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------
