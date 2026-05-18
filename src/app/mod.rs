@@ -199,6 +199,10 @@ struct AppState {
     /// modal scope itself can't reach, since it only has access to the
     /// frame `Ui`).
     theme_apply_pending: bool,
+    /// Last value we pushed to `gpu.window.set_title`. We diff against the
+    /// computed title each frame so we only call winit when something
+    /// actually changed (active tab switched, file path bound, etc).
+    last_window_title: String,
     /// CLI-supplied session to open on the first frame. Drained inside
     /// `frame_ui` once the GPU / imgui context is up.
     pending_initial: Option<InitialOpen>,
@@ -263,6 +267,7 @@ impl Default for AppState {
             preferences_open: false,
             preferences_draft: preferences::AppPreferences::default(),
             theme_apply_pending: false,
+            last_window_title: String::new(),
             pending_initial: None,
             animating: false,
             last_blink_request: Instant::now(),
@@ -548,6 +553,14 @@ fn render(gpu: &mut Gpu, state: &mut AppState) {
         theme::apply(&mut gpu.imgui);
     }
 
+    // Keep the OS-level window title in sync with the active comparison.
+    // Diff against the last value to avoid hammering winit each frame.
+    let title = compute_window_title(state);
+    if title != state.last_window_title {
+        gpu.window.set_title(&title);
+        state.last_window_title = title;
+    }
+
     gpu.platform
         .prepare_frame(gpu.imgui.io_mut(), &gpu.window)
         .expect("prepare imgui frame");
@@ -637,8 +650,10 @@ fn frame_ui(ui: &imgui::Ui, state: &mut AppState) {
                 | imgui::WindowFlags::NO_BRING_TO_FRONT_ON_FOCUS,
         )
         .build(|| {
-            tab_bar(ui, state);
-            ui.separator();
+            if state.tabs.len() > 1 {
+                tab_bar(ui, state);
+                ui.separator();
+            }
             current_session_summary(ui, state);
         });
 }
@@ -1068,6 +1083,13 @@ fn close_active_tab(state: &mut AppState) {
     state.active = idx
         .and_then(|i| state.tabs.get(i.min(state.tabs.len().saturating_sub(1))))
         .map(|t| t.session_id);
+    // Closing the last comparison quits the app — matches the tab-bar
+    // convention that "no tabs left" implies "no work to do here". Applies
+    // uniformly to Ctrl+W, the menu item, and the in-tab close glyph.
+    if state.tabs.is_empty() {
+        state.quit_requested = true;
+        return;
+    }
     state.status = format!("closed tab (session {id})");
 }
 
@@ -1091,7 +1113,10 @@ fn cycle_tab(state: &mut AppState, delta: i32) {
 }
 
 fn tab_bar(ui: &imgui::Ui, state: &mut AppState) {
-    if state.tabs.is_empty() {
+    // With at most one comparison open, the tab strip is pure visual noise —
+    // hide it. The caller still draws its separator unconditionally; we
+    // simply contribute nothing this frame.
+    if state.tabs.len() <= 1 {
         return;
     }
 
@@ -2197,6 +2222,34 @@ fn basename(p: &PathBuf) -> String {
     p.file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| p.to_string_lossy().into_owned())
+}
+
+/// Build the OS-level window title from the active tab. 2-way appends
+/// both file basenames; 3-way appends only the result filename (falling
+/// back to the base file's name when no result path is bound yet).
+fn compute_window_title(state: &AppState) -> String {
+    let Some(id) = state.active else {
+        return "Diffie".to_string();
+    };
+    let Some(tab) = state.tabs.iter().find(|t| t.session_id == id) else {
+        return "Diffie".to_string();
+    };
+    match tab.mode {
+        TabMode::TwoWay => {
+            let a = pretty_basename(tab.paths.first());
+            let b = pretty_basename(tab.paths.get(1));
+            format!("Diffie \u{2014} {a} \u{2014} {b}")
+        }
+        TabMode::ThreeWay => {
+            let name = tab
+                .result_path
+                .as_ref()
+                .map(|p| basename(p))
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| pretty_basename(tab.paths.get(1)));
+            format!("Diffie \u{2014} {name}")
+        }
+    }
 }
 
 /// Tab-label-friendly version of `basename`: returns `(untitled)` for

@@ -464,6 +464,7 @@ fn render_pane(
         gutter_rect,
         anchors,
         side,
+        hunks,
         scroll_y_for_anchor,
         lh,
         buf_line_count_for_gutter,
@@ -610,11 +611,18 @@ fn render_pane(
     }
 
     // Ease the displayed scroll toward target with an exponential decay.
-    // Drag skips the easing.
+    // Drag skips the easing. dt is clamped to ~one frame at 30 fps (0.033s)
+    // rather than the raw delta — when the idle event loop is parked and a
+    // wheel tick wakes us up, `io.delta_time` reports the full sleep
+    // duration, which with SCROLL_SMOOTH_SPEED=25 collapses the first step
+    // to k≈0.92 (an instant jump) and ruins the easing feel on every other
+    // tick. Treating the first post-idle frame as a normal frame keeps the
+    // easing visible and matches what the user expects after a wheel
+    // event.
     let displayed = if drag_override.is_some() {
         target
     } else {
-        let dt = ui.io().delta_time.max(0.0).min(0.1);
+        let dt = ui.io().delta_time.max(0.0).min(0.033);
         let k = 1.0 - (-dt * SCROLL_SMOOTH_SPEED).exp();
         let mut d = prev_displayed + (target - prev_displayed) * k;
         if (target - d).abs() < SCROLL_SNAP_EPSILON {

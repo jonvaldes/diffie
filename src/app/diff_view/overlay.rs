@@ -679,12 +679,49 @@ pub(super) fn paint_anchor_rail(
     }
 }
 
-/// Paint per-row line numbers + anchor dots in the gutter strip.
+/// Same per-row tint that the pane's text painter draws behind change rows.
+/// Returned so the gutter can match its background to the line it labels.
+pub(super) fn row_bg_color(hunks: &[Hunk], side: Side, ln: u32) -> Option<[f32; 4]> {
+    for h in hunks {
+        let range = match side {
+            Side::Left => h.a_range,
+            Side::Right => h.b_range,
+        };
+        if range == (0, 0) || ln < range.0 || ln > range.1 {
+            continue;
+        }
+        for op in &h.ops {
+            match (side, op) {
+                (Side::Left, DiffOp::Delete { a, move_id, .. }) if *a == ln => {
+                    return Some(if move_id.is_some() {
+                        theme::with_alpha(theme::PEACH(), 0.30)
+                    } else {
+                        [0.55, 0.18, 0.18, 0.30]
+                    });
+                }
+                (Side::Right, DiffOp::Insert { b, move_id, .. }) if *b == ln => {
+                    return Some(if move_id.is_some() {
+                        theme::with_alpha(theme::PEACH(), 0.30)
+                    } else {
+                        [0.18, 0.50, 0.22, 0.30]
+                    });
+                }
+                _ => continue,
+            }
+        }
+    }
+    None
+}
+
+/// Paint per-row line numbers + per-row tints in the gutter strip. Row
+/// background colors come from `row_bg_color` so the gutter visually merges
+/// with the code line it labels.
 pub(super) fn paint_gutter(
     ui: &Ui,
     gutter_rect: [f32; 4],
     _anchors: &[Anchor],
-    _side: Side,
+    side: Side,
+    hunks: &[Hunk],
     scroll_y: f32,
     lh: f32,
     line_count: u32,
@@ -697,7 +734,8 @@ pub(super) fn paint_gutter(
         return;
     }
     let g_left = gutter_rect[0];
-    let g_w = gutter_rect[2] - g_left;
+    let g_right = gutter_rect[2];
+    let g_w = g_right - g_left;
     let first_line = (scroll_y / lh).floor() as u32 + 1;
     let last_line = ((scroll_y + g_h) / lh).ceil() as u32 + 1;
 
@@ -706,6 +744,15 @@ pub(super) fn paint_gutter(
         let y = line_screen_y(g_top, line, scroll_y, lh);
         if y + lh < g_top || y > g_bottom {
             continue;
+        }
+        let y0 = y.max(g_top);
+        let y1 = (y + lh).min(g_bottom);
+        if let Some(color) = row_bg_color(hunks, side, line) {
+            if y1 > y0 {
+                dl.add_rect([g_left, y0], [g_right, y1], color)
+                    .filled(true)
+                    .build();
+            }
         }
         let text = format!("{line}");
         let text_w = ui.calc_text_size(&text)[0];

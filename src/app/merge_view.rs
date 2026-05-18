@@ -514,7 +514,10 @@ fn render_pane(
     let displayed = if drag_override.is_some() {
         target
     } else {
-        let dt = ui.io().delta_time.max(0.0).min(0.1);
+        // Clamp dt to ~one 30 fps frame so the wake-up frame after an idle
+        // event-loop park doesn't collapse the easing into a single jump.
+        // See diff_view::render_pane for the longer explanation.
+        let dt = ui.io().delta_time.max(0.0).min(0.033);
         let k = 1.0 - (-dt * SCROLL_SMOOTH_SPEED).exp();
         let mut d = prev_displayed + (target - prev_displayed) * k;
         if (target - d).abs() < SCROLL_SNAP_EPSILON {
@@ -700,7 +703,7 @@ fn render_pane(
     );
 
     // Gutter on the left of this pane (line numbers).
-    paint_gutter(ui, pane_pos, g_w, pane_h, scroll_y_out, lh, buf_line_count as u32);
+    paint_gutter(ui, pane_pos, g_w, pane_h, scroll_y_out, lh, buf_line_count as u32, layout);
 
     // Custom vertical scrollbar with a minimap layer painted from the pane's
     // hunks — band colors match the per-row tints used by `tint_for_line`.
@@ -742,6 +745,7 @@ fn paint_gutter(
     scroll_y: f32,
     lh: f32,
     line_count: u32,
+    layout: &PaneLayout,
 ) {
     let dl = ui.get_window_draw_list();
     if lh <= 0.0 {
@@ -750,12 +754,37 @@ fn paint_gutter(
     let g_top = pane_pos[1];
     let g_bottom = pane_pos[1] + pane_h;
     let g_left = pane_pos[0];
+    let g_right = g_left + g_w;
+    // Match the per-row tint built by `tint_for_line` in `paint_pane_text`
+    // so the gutter background flows continuously into the code row.
+    let tint_for_line = |ln: u32| -> Option<[f32; 4]> {
+        for (_id, kind, lo, hi) in &layout.hunks {
+            let Some(kind_v) = *kind else { continue };
+            if ln >= *lo && ln <= *hi {
+                return Some(match kind_v {
+                    HunkKind::LocalOnly => theme::with_alpha(theme::GREEN(), 0.22),
+                    HunkKind::RemoteOnly => theme::with_alpha(theme::SAPPHIRE(), 0.22),
+                    HunkKind::Conflict => [0.55, 0.18, 0.18, 0.30],
+                });
+            }
+        }
+        None
+    };
     let first_line = (scroll_y / lh).floor() as u32 + 1;
     let last_line = ((scroll_y + pane_h) / lh).ceil() as u32 + 1;
     for line in first_line..=last_line.min(line_count) {
         let y = g_top + (line as f32 - 1.0) * lh - scroll_y;
         if y + lh < g_top || y > g_bottom {
             continue;
+        }
+        let y0 = y.max(g_top);
+        let y1 = (y + lh).min(g_bottom);
+        if let Some(color) = tint_for_line(line) {
+            if y1 > y0 {
+                dl.add_rect([g_left, y0], [g_right, y1], color)
+                    .filled(true)
+                    .build();
+            }
         }
         let text = format!("{line}");
         let text_w = ui.calc_text_size(&text)[0];
