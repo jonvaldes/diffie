@@ -816,24 +816,28 @@ fn paint_gutter(
     };
     let first_line = (scroll_y / lh).floor() as u32 + 1;
     let last_line = ((scroll_y + pane_h) / lh).ceil() as u32 + 1;
-    for line in first_line..=last_line.min(line_count) {
-        let y = g_top + padding_y + (line as f32 - 1.0) * lh - scroll_y;
-        if y + lh < g_top || y > g_bottom {
-            continue;
-        }
-        let y0 = y.max(g_top);
-        let y1 = (y + lh).min(g_bottom);
-        if let Some(color) = tint_for_line(line) {
-            if y1 > y0 {
-                dl.add_rect([g_left, y0], [g_right, y1], color)
-                    .filled(true)
-                    .build();
+    // Clip to the gutter rect so partial-row line numbers don't bleed
+    // into the filename header above when `scroll_y` falls between lines.
+    dl.with_clip_rect_intersect([g_left, g_top], [g_right, g_bottom], || {
+        for line in first_line..=last_line.min(line_count) {
+            let y = g_top + padding_y + (line as f32 - 1.0) * lh - scroll_y;
+            if y + lh < g_top || y > g_bottom {
+                continue;
             }
+            let y0 = y.max(g_top);
+            let y1 = (y + lh).min(g_bottom);
+            if let Some(color) = tint_for_line(line) {
+                if y1 > y0 {
+                    dl.add_rect([g_left, y0], [g_right, y1], color)
+                        .filled(true)
+                        .build();
+                }
+            }
+            let text = format!("{line}");
+            let text_w = ui.calc_text_size(&text)[0];
+            dl.add_text([g_left + g_w - 4.0 - text_w, y + 2.0], theme::OVERLAY1(), &text);
         }
-        let text = format!("{line}");
-        let text_w = ui.calc_text_size(&text)[0];
-        dl.add_text([g_left + g_w - 4.0 - text_w, y + 2.0], theme::OVERLAY1(), &text);
-    }
+    });
 }
 
 /// Paint everything for one merge pane on the foreground draw list:

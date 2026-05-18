@@ -746,24 +746,29 @@ pub(super) fn paint_gutter(
     let last_line = ((scroll_y + g_h) / lh).ceil() as u32 + 1;
 
     let line_no_color = theme::OVERLAY1();
-    for line in first_line..=last_line.min(line_count) {
-        let y = line_screen_y(g_top, line, scroll_y, lh) + padding_y;
-        if y + lh < g_top || y > g_bottom {
-            continue;
-        }
-        let y0 = y.max(g_top);
-        let y1 = (y + lh).min(g_bottom);
-        if let Some(color) = row_bg_color(hunks, side, line) {
-            if y1 > y0 {
-                dl.add_rect([g_left, y0], [g_right, y1], color)
-                    .filled(true)
-                    .build();
+    // Clip to the gutter rect so partial-row line numbers (which happens
+    // whenever `scroll_y` isn't an exact multiple of `lh`) don't bleed
+    // upward into the filename bar above us.
+    dl.with_clip_rect_intersect([g_left, g_top], [g_right, g_bottom], || {
+        for line in first_line..=last_line.min(line_count) {
+            let y = line_screen_y(g_top, line, scroll_y, lh) + padding_y;
+            if y + lh < g_top || y > g_bottom {
+                continue;
             }
+            let y0 = y.max(g_top);
+            let y1 = (y + lh).min(g_bottom);
+            if let Some(color) = row_bg_color(hunks, side, line) {
+                if y1 > y0 {
+                    dl.add_rect([g_left, y0], [g_right, y1], color)
+                        .filled(true)
+                        .build();
+                }
+            }
+            let text = format!("{line}");
+            let text_w = ui.calc_text_size(&text)[0];
+            dl.add_text([g_left + g_w - 4.0 - text_w, y + 2.0], line_no_color, &text);
         }
-        let text = format!("{line}");
-        let text_w = ui.calc_text_size(&text)[0];
-        dl.add_text([g_left + g_w - 4.0 - text_w, y + 2.0], line_no_color, &text);
-    }
+    });
 }
 
 #[cfg(test)]
