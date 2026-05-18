@@ -451,6 +451,18 @@ impl ApplicationHandler for App {
             renderer,
             last_frame: Instant::now(),
         });
+
+        // Paint one frame *before* revealing the window so the OS never
+        // exposes the uninitialised framebuffer (the half-white/half-black
+        // flash on Windows). RedrawRequested doesn't fire while the window
+        // is hidden, so without this explicit render the window-show step
+        // inside `render` would never run and the window would stay invisible
+        // forever.
+        let gpu = self
+            .gpu
+            .as_mut()
+            .expect("gpu just stored above");
+        render(gpu, &mut self.state);
     }
 
     fn window_event(
