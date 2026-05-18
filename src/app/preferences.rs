@@ -19,6 +19,22 @@ pub struct AppPreferences {
     pub show_whitespace: bool,
     #[serde(default)]
     pub code_font: CodeFont,
+    #[serde(default)]
+    pub window: WindowPlacement,
+}
+
+/// Last known window geometry, restored at startup. All fields are
+/// optional so a fresh install (or a settings file written by an older
+/// build) falls back to the hard-coded initial size and the
+/// OS-default position.
+#[derive(Default, Debug, Clone, Serialize, Deserialize)]
+pub struct WindowPlacement {
+    pub x: Option<i32>,
+    pub y: Option<i32>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    #[serde(default)]
+    pub maximized: bool,
 }
 
 impl Default for AppPreferences {
@@ -33,6 +49,7 @@ impl Default for AppPreferences {
             theme: Flavor::default(),
             show_whitespace: false,
             code_font: CodeFont::default(),
+            window: WindowPlacement::default(),
         }
     }
 }

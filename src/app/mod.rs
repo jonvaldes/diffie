@@ -312,13 +312,19 @@ impl ApplicationHandler for App {
             64,
         )
         .ok();
-        let attrs = Window::default_attributes()
+        let placement = &self.state.preferences.window;
+        let (init_w, init_h) = (
+            placement.width.unwrap_or(INITIAL_WIDTH),
+            placement.height.unwrap_or(INITIAL_HEIGHT),
+        );
+        let mut attrs = Window::default_attributes()
             .with_title("Diffie")
             .with_window_icon(icon)
-            .with_inner_size(winit::dpi::LogicalSize::new(
-                INITIAL_WIDTH as f64,
-                INITIAL_HEIGHT as f64,
-            ));
+            .with_inner_size(winit::dpi::PhysicalSize::new(init_w, init_h))
+            .with_maximized(placement.maximized);
+        if let (Some(x), Some(y)) = (placement.x, placement.y) {
+            attrs = attrs.with_position(winit::dpi::PhysicalPosition::new(x, y));
+        }
 
         // On Wayland the compositor reads the window icon from a
         // matching `.desktop` file resolved by app_id; the raw RGBA
@@ -463,6 +469,10 @@ impl ApplicationHandler for App {
                 gpu.surface_config.height = new_size.height.max(1);
                 gpu.surface.configure(&gpu.device, &gpu.surface_config);
                 gpu.window.request_redraw();
+                save_window_placement(&gpu.window, &mut self.state.preferences);
+            }
+            WindowEvent::Moved(_) => {
+                save_window_placement(&gpu.window, &mut self.state.preferences);
             }
             WindowEvent::RedrawRequested => {
                 render(gpu, &mut self.state);
@@ -523,6 +533,38 @@ impl ApplicationHandler for App {
         } else {
             event_loop.set_control_flow(ControlFlow::Wait);
         }
+    }
+}
+
+/// Snapshot the window's current geometry into `prefs.window` and persist
+/// to disk so the next launch restores it. Position+size are only captured
+/// when the window is in its normal (non-maximized) state — otherwise the
+/// restored maximized size would clobber the user's actual unmaximized
+/// geometry.
+fn save_window_placement(window: &Window, prefs: &mut preferences::AppPreferences) {
+    let maximized = window.is_maximized();
+    let mut changed = false;
+    if prefs.window.maximized != maximized {
+        prefs.window.maximized = maximized;
+        changed = true;
+    }
+    if !maximized {
+        let size = window.inner_size();
+        if prefs.window.width != Some(size.width) || prefs.window.height != Some(size.height) {
+            prefs.window.width = Some(size.width);
+            prefs.window.height = Some(size.height);
+            changed = true;
+        }
+        if let Ok(pos) = window.outer_position() {
+            if prefs.window.x != Some(pos.x) || prefs.window.y != Some(pos.y) {
+                prefs.window.x = Some(pos.x);
+                prefs.window.y = Some(pos.y);
+                changed = true;
+            }
+        }
+    }
+    if changed {
+        let _ = preferences::save(prefs);
     }
 }
 
