@@ -87,6 +87,11 @@ pub struct MergeViewState {
     last_caret: [Option<i32>; 3],
     /// Pending scroll value to apply next frame on a given pane.
     pending: [Option<f32>; 3],
+    /// First-frame focus line (1-based) per pane. Set by the open path to
+    /// the first non-Stable hunk's start so the user lands at the first
+    /// difference. Resolved to a `pending` scroll inside the pane render
+    /// once `lh` is known, then cleared.
+    pub(crate) pending_initial_line: [Option<u32>; 3],
     /// Bumped on external buffer mutations (undo/redo, Apply Local/Base/Remote);
     /// mixed into the widget ID so imgui re-initialises stb_textedit from `buf`.
     pub input_epoch: u32,
@@ -170,6 +175,27 @@ struct PaneLayout {
     /// Content y of the *top* of a given 1-based line, used by the connector
     /// to draw per-anchor curves.
     line_ys: HashMap<u32, f32>,
+}
+
+/// Walk the merge-hunk list and return the 1-based start line of the first
+/// non-Stable hunk on each pane, or `None` when everything is Stable.
+/// Per-pane line accumulation mirrors `pane_text`: Base pane sees `base`,
+/// Local/Remote panes see the merged `text` for Stable hunks.
+pub fn first_change_lines(hunks: &[MergeHunk]) -> Option<(u32, u32, u32)> {
+    let mut base_line: u32 = 1;
+    let mut local_line: u32 = 1;
+    let mut remote_line: u32 = 1;
+    for h in hunks {
+        if !matches!(h, MergeHunk::Stable { .. }) {
+            return Some((base_line, local_line, remote_line));
+        }
+        if let MergeHunk::Stable { base, text, .. } = h {
+            base_line += base.len() as u32;
+            local_line += text.len() as u32;
+            remote_line += text.len() as u32;
+        }
+    }
+    None
 }
 
 fn build_layout(hunks: &[MergeHunk], pane: Pane, lh: f32) -> PaneLayout {
@@ -419,6 +445,18 @@ fn render_pane(
     let buf_line_count = n + if trailing { 1 } else { 0 };
     let content_h = (buf_line_count as f32) * lh;
     let max_scroll = (content_h - pane_h).max(0.0);
+
+    // First-frame focus: resolve the stored initial line to a pending
+    // scroll now that `lh` and `max_scroll` are known. Overrides whatever
+    // else was pending on this pane (the view was just created — nothing
+    // else should be).
+    let pending_scroll = if let Some(line) = state.pending_initial_line[pane as usize].take() {
+        const TOP_MARGIN_LINES: f32 = 2.0;
+        let y = ((line.max(1) - 1) as f32 - TOP_MARGIN_LINES).max(0.0) * lh;
+        Some(y.min(max_scroll))
+    } else {
+        pending_scroll
+    };
 
     // Split wheel into vertical (smooth, fed to inner multiline) and
     // horizontal (pinned onto the outer scroll child). See diff_view

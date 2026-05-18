@@ -82,6 +82,13 @@ pub struct DiffViewState {
     /// `igSetNextWindowScroll`.
     pub(super) pending_left_scroll: Option<f32>,
     pub(super) pending_right_scroll: Option<f32>,
+    /// Line number (1-based) to focus on the first frame this view renders.
+    /// Set by the open path to the first non-equal hunk's start on this side
+    /// so the user lands at the first difference rather than at the top of
+    /// the file. Resolved into a pending scroll inside `render_pane` once
+    /// `lh` is known, then cleared.
+    pub(crate) pending_initial_a_line: Option<u32>,
+    pub(crate) pending_initial_b_line: Option<u32>,
     /// Live state of the hover-to-anchor interaction.
     pub(super) anchor_pick: AnchorPick,
     /// Jump-to-pair target consumed on the next render.

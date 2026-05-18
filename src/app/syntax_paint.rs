@@ -273,6 +273,16 @@ pub fn paint_caret(
     let target = caret_byte as usize;
     let mut byte_acc: usize = 0;
     let mut painted = false;
+    // Paint the caret as a 1px-wide filled rect rather than `add_line` with
+    // thickness 1.0 — that's an AA-stroked polyline, and on Windows the
+    // anti-aliasing spreads a single-pixel vertical line across two columns
+    // at ~50% coverage each, which can render as invisible. A filled rect
+    // is pixel-aligned and reliable on every platform.
+    let draw_caret = |dl: &imgui::DrawListMut, x: f32, y: f32| {
+        dl.add_rect([x, y + 1.0], [x + 1.0, y + lh - 1.0], theme::TEXT())
+            .filled(true)
+            .build();
+    };
     for (line_idx, line_text) in buf.lines().enumerate() {
         let line_end = byte_acc + line_text.len();
         if target >= byte_acc && target <= line_end {
@@ -280,9 +290,7 @@ pub fn paint_caret(
             let x = widget_left - scroll_x + text_x_at_byte(ui, line_text, local, padding_x);
             let y = widget_top + padding_y + (line_idx as f32) * lh - scroll_y;
             if y + lh >= widget_top && y <= widget_bottom && x >= widget_left && x <= widget_right {
-                dl.add_line([x, y + 1.0], [x, y + lh - 1.0], theme::TEXT())
-                    .thickness(1.0)
-                    .build();
+                draw_caret(dl, x, y);
             }
             painted = true;
             break;
@@ -294,9 +302,7 @@ pub fn paint_caret(
         let x = widget_left + padding_x - scroll_x;
         let y = widget_top + padding_y + (line_idx as f32) * lh - scroll_y;
         if y + lh >= widget_top && y <= widget_bottom {
-            dl.add_line([x, y + 1.0], [x, y + lh - 1.0], theme::TEXT())
-                .thickness(1.0)
-                .build();
+            draw_caret(dl, x, y);
         }
     }
 }

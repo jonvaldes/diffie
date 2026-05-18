@@ -501,9 +501,14 @@ impl ApplicationHandler for App {
             // Render as fast as the platform will let us.
             gpu.window.request_redraw();
             event_loop.set_control_flow(ControlFlow::Poll);
-        } else if self.state.focused.is_some() {
-            // Idle but a text input is focused — wake up periodically so
-            // imgui's blinking caret has frames to toggle on.
+        } else if !self.state.tabs.is_empty() {
+            // Any comparison is open — the text panes paint their own caret
+            // and need periodic frames to blink. `state.focused` would be a
+            // tighter signal, but `diff_view` doesn't update it (it ignores
+            // its own `focus_request` callback), so we'd never wake up in a
+            // 2-way diff. Triggering off "tab is open" is conservative —
+            // one frame per `CARET_BLINK_INTERVAL` is cheap and harmless
+            // even when no pane currently has a caret.
             let now = Instant::now();
             let next = self.state.last_blink_request + CARET_BLINK_INTERVAL;
             if now >= next {
@@ -2343,6 +2348,18 @@ fn open_two_way_paths(state: &mut AppState, a: PathBuf, b: PathBuf) {
             state.active = Some(id);
             state.status = format!("Opened 2-way: {label}");
             recents::add(&mut state.recents, recent);
+            // Snap the new view's first-frame scroll to the first non-equal
+            // hunk so the user lands on actual content instead of two empty
+            // file tops. Pre-creates the DiffViewState (normally lazy).
+            if let Ok(snap) = state.sessions.snapshot(id) {
+                if let SessionMode::TwoWay { hunks, .. } = &snap.mode {
+                    if let Some((a_line, b_line)) = diff_view::first_change_lines(hunks) {
+                        let view = state.diff_views.entry(id).or_default();
+                        view.pending_initial_a_line = Some(a_line);
+                        view.pending_initial_b_line = Some(b_line);
+                    }
+                }
+            }
         }
         Err(e) => state.status = format!("Open 2-way failed: {e}"),
     }
@@ -2467,6 +2484,18 @@ fn open_three_way_paths_with_result(
             state.active = Some(id);
             state.status = format!("Opened 3-way: {label}");
             recents::add(&mut state.recents, recent);
+            // Focus the first non-Stable hunk per pane so the user lands on
+            // the first conflict / divergence rather than at the top.
+            if let Ok(snap) = state.sessions.snapshot(id) {
+                if let SessionMode::ThreeWay { hunks, .. } = &snap.mode {
+                    if let Some((b, l, r)) = merge_view::first_change_lines(hunks) {
+                        let view = state.merge_views.entry(id).or_default();
+                        // Pane order in MergeViewState arrays mirrors the
+                        // `Pane` enum: 0 = Base, 1 = Local, 2 = Remote.
+                        view.pending_initial_line = [Some(b), Some(l), Some(r)];
+                    }
+                }
+            }
         }
         Err(e) => state.status = format!("Open 3-way failed: {e}"),
     }

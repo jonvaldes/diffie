@@ -120,6 +120,30 @@ pub(crate) fn track_caret_scroll_x(caret_x: f32, scroll_x: f32, view_w: f32, mar
     }
 }
 
+/// Walk the hunk list once and return the 1-based (a_line, b_line) of the
+/// first non-equal hunk. For hunks that are empty on a side (pure insert /
+/// pure delete), the missing side falls back to "the line right after the
+/// preceding hunk's last line" so both sides land at the same visual row
+/// when the panes scroll-sync. Returns `None` when the diff is all-equal.
+pub fn first_change_lines(hunks: &[Hunk]) -> Option<(u32, u32)> {
+    let mut prev_a_end: u32 = 0;
+    let mut prev_b_end: u32 = 0;
+    for h in hunks {
+        let is_change = h
+            .ops
+            .iter()
+            .any(|op| matches!(op, DiffOp::Delete { .. } | DiffOp::Insert { .. }));
+        if is_change {
+            let a = if h.a_range == (0, 0) { prev_a_end + 1 } else { h.a_range.0 };
+            let b = if h.b_range == (0, 0) { prev_b_end + 1 } else { h.b_range.0 };
+            return Some((a, b));
+        }
+        prev_a_end = h.a_range.1.max(prev_a_end);
+        prev_b_end = h.b_range.1.max(prev_b_end);
+    }
+    None
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn render(
     ui: &Ui,
@@ -444,13 +468,13 @@ fn render_pane(
     let widget_pos = [pane_pos[0] + g_w, pane_pos[1]];
     let widget_w = pane_w - g_w;
 
-    // Gutter strip — display only; clicks handled by rails in the connector.
+    // Reserve the gutter strip in the layout. We paint its contents below
+    // — *after* we've computed `own_scroll` for this frame — so the gutter
+    // tracks the same scroll value the code pane uses. Painting it here
+    // with `state.last_*_scroll_y` would leave the gutter one frame behind
+    // whichever pane the user is wheel-scrolling.
     ui.set_cursor_screen_pos(pane_pos);
     ui.dummy([g_w, pane_h]); // gutter strip — display only, clicks handled by rails
-    let scroll_y_for_anchor = match side {
-        Side::Left => state.last_left_scroll_y,
-        Side::Right => state.last_right_scroll_y,
-    };
     let gutter_rect = [pane_pos[0], pane_pos[1], pane_pos[0] + g_w, pane_pos[1] + pane_h];
     let buf_line_count_for_gutter = {
         let buf_ref: &str = match side {
@@ -459,16 +483,6 @@ fn render_pane(
         };
         (buf_ref.lines().count().max(1)) as u32
     };
-    overlay::paint_gutter(
-        ui,
-        gutter_rect,
-        anchors,
-        side,
-        hunks,
-        scroll_y_for_anchor,
-        lh,
-        buf_line_count_for_gutter,
-    );
 
     // Screen-space coordinates valid for the foreground draw list.
     let widget_rect = [
@@ -502,6 +516,21 @@ fn render_pane(
     let pending_scroll = match side {
         Side::Left => state.pending_left_scroll.take(),
         Side::Right => state.pending_right_scroll.take(),
+    };
+    // First-frame focus on the opening file's first hunk: resolve the
+    // stored line number to a scroll target now that `lh` is known. Wins
+    // over any prior pending scroll on this side (there shouldn't be one
+    // — the view was just created — but keep the intent explicit).
+    let initial_line = match side {
+        Side::Left => state.pending_initial_a_line.take(),
+        Side::Right => state.pending_initial_b_line.take(),
+    };
+    let pending_scroll = if let Some(line) = initial_line {
+        const TOP_MARGIN_LINES: f32 = 2.0;
+        let y = ((line.max(1) - 1) as f32 - TOP_MARGIN_LINES).max(0.0) * lh;
+        Some(y.min(max_scroll))
+    } else {
+        pending_scroll
     };
     let prev_target = match side {
         Side::Left => state.target_left_scroll,
@@ -631,6 +660,20 @@ fn render_pane(
         d
     };
     let own_scroll = displayed;
+
+    // Now that this frame's scroll is final, paint the gutter using it so
+    // gutter rows stay locked to the code rows even while the eased scroll
+    // is mid-animation.
+    overlay::paint_gutter(
+        ui,
+        gutter_rect,
+        anchors,
+        side,
+        hunks,
+        own_scroll,
+        lh,
+        buf_line_count_for_gutter,
+    );
 
     // Wrap the input_text_multiline in our own outer child window with
     // HORIZONTAL_SCROLLBAR enabled. The inner multiline is sized to
