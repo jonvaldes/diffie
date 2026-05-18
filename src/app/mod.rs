@@ -203,6 +203,11 @@ struct AppState {
     /// computed title each frame so we only call winit when something
     /// actually changed (active tab switched, file path bound, etc).
     last_window_title: String,
+    /// False until the first frame has been presented. We create the window
+    /// hidden (`with_visible(false)`) so Windows doesn't show the uninitialised
+    /// half-white/half-black framebuffer before our first wgpu submit, and flip
+    /// this to `true` right after `frame.present()` once there's content to see.
+    window_shown: bool,
     /// CLI-supplied session to open on the first frame. Drained inside
     /// `frame_ui` once the GPU / imgui context is up.
     pending_initial: Option<InitialOpen>,
@@ -268,6 +273,7 @@ impl Default for AppState {
             preferences_draft: preferences::AppPreferences::default(),
             theme_apply_pending: false,
             last_window_title: String::new(),
+            window_shown: false,
             pending_initial: None,
             animating: false,
             last_blink_request: Instant::now(),
@@ -321,7 +327,12 @@ impl ApplicationHandler for App {
             .with_title("Diffie")
             .with_window_icon(icon)
             .with_inner_size(winit::dpi::PhysicalSize::new(init_w, init_h))
-            .with_maximized(placement.maximized);
+            .with_maximized(placement.maximized)
+            // Create hidden so the OS doesn't expose the uninitialised
+            // framebuffer (a half white / half black flash on Windows)
+            // before our first wgpu present. The window is shown in
+            // `render()` once we've drawn a frame.
+            .with_visible(false);
         if let (Some(x), Some(y)) = (placement.x, placement.y) {
             attrs = attrs.with_position(winit::dpi::PhysicalPosition::new(x, y));
         }
@@ -660,6 +671,13 @@ fn render(gpu: &mut Gpu, state: &mut AppState) {
     }
     gpu.queue.submit(Some(encoder.finish()));
     frame.present();
+
+    // First frame just landed — reveal the window now that there's real
+    // content in the framebuffer.
+    if !state.window_shown {
+        gpu.window.set_visible(true);
+        state.window_shown = true;
+    }
 
     // Recompute "any animation in flight?" for the active session — drives
     // the event loop's wait/poll decision in `about_to_wait`.

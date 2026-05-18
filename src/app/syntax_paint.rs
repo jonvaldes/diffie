@@ -270,9 +270,6 @@ pub fn paint_caret(
     let widget_top = widget_rect[1];
     let widget_right = widget_rect[2];
     let widget_bottom = widget_rect[3];
-    let target = caret_byte as usize;
-    let mut byte_acc: usize = 0;
-    let mut painted = false;
     // Paint the caret as a 1px-wide filled rect rather than `add_line` with
     // thickness 1.0 — that's an AA-stroked polyline, and on Windows the
     // anti-aliasing spreads a single-pixel vertical line across two columns
@@ -283,27 +280,30 @@ pub fn paint_caret(
             .filled(true)
             .build();
     };
-    for (line_idx, line_text) in buf.lines().enumerate() {
-        let line_end = byte_acc + line_text.len();
-        if target >= byte_acc && target <= line_end {
-            let local = target - byte_acc;
-            let x = widget_left - scroll_x + text_x_at_byte(ui, line_text, local, padding_x);
-            let y = widget_top + padding_y + (line_idx as f32) * lh - scroll_y;
-            if y + lh >= widget_top && y <= widget_bottom && x >= widget_left && x <= widget_right {
-                draw_caret(dl, x, y);
-            }
-            painted = true;
-            break;
-        }
-        byte_acc = line_end + 1; // +1 for '\n'
-    }
-    if !painted && target >= byte_acc {
-        let line_idx = buf.lines().count();
-        let x = widget_left + padding_x - scroll_x;
-        let y = widget_top + padding_y + (line_idx as f32) * lh - scroll_y;
-        if y + lh >= widget_top && y <= widget_bottom {
-            draw_caret(dl, x, y);
-        }
+    // Locate the caret by counting `\n` bytes in `buf[..target]`. This is
+    // immune to the line-boundary off-by-one that the previous
+    // `split_inclusive('\n')` walk hit on CRLF buffers: a target sitting
+    // exactly on the byte after `\r\n` (i.e. the first byte of the next
+    // line) was being attributed to the *previous* chunk's `line_end` and
+    // rendered at the end of the prior line. On a CRLF file every line
+    // boundary tripped this and the misalignment grew with the buffer.
+    //
+    // Strip a trailing `\r` from the per-line slice before measuring its
+    // width: imgui's input_text skips `\r` glyphs when laying out, so the
+    // visible run on each line stops at `\r`. Including the `\r` in
+    // `calc_text_size` would push the caret one zero-width-but-non-zero
+    // character past the visible glyphs.
+    let target = (caret_byte as usize).min(buf.len());
+    let target = snap_to_char_boundary(buf, target);
+    let prefix = &buf[..target];
+    let line_idx = prefix.bytes().filter(|&b| b == b'\n').count();
+    let line_start = prefix.rfind('\n').map(|p| p + 1).unwrap_or(0);
+    let col_bytes = &buf[line_start..target];
+    let col_visible = col_bytes.strip_suffix('\r').unwrap_or(col_bytes);
+    let x = widget_left - scroll_x + padding_x + ui.calc_text_size(col_visible)[0];
+    let y = widget_top + padding_y + (line_idx as f32) * lh - scroll_y;
+    if y + lh >= widget_top && y <= widget_bottom && x >= widget_left && x <= widget_right {
+        draw_caret(dl, x, y);
     }
 }
 
