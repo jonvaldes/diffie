@@ -6,10 +6,63 @@
 //! Both view kinds suppress imgui's own text rendering and rely on this
 //! helper to paint text on the foreground draw list.
 
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
 use imgui::{DrawListMut, Ui};
 
 use crate::app::syntax::LineSpans;
 use crate::app::theme;
+
+/// Global toggle for rendering whitespace characters as visible glyphs.
+/// Set from `AppPreferences::show_whitespace`; read by the paint path.
+static SHOW_WS: AtomicBool = AtomicBool::new(false);
+
+pub fn set_show_whitespace(on: bool) {
+    SHOW_WS.store(on, Ordering::Relaxed);
+}
+
+pub fn show_whitespace_enabled() -> bool {
+    SHOW_WS.load(Ordering::Relaxed)
+}
+
+/// EOL glyph codepoint shown in the whitespace ghost layer. Updated when the
+/// user switches code fonts: `⏎` (U+23CE) when the active primary covers it,
+/// `¶` (U+00B6) for Noto Sans Mono, which doesn't ship U+23CE.
+static EOL_CODEPOINT: AtomicU32 = AtomicU32::new(0x23ce);
+
+pub fn set_eol_glyph(cp: u32) {
+    EOL_CODEPOINT.store(cp, Ordering::Relaxed);
+}
+
+fn eol_glyph() -> char {
+    char::from_u32(EOL_CODEPOINT.load(Ordering::Relaxed)).unwrap_or('\u{00b6}')
+}
+
+/// Build a "ghost" copy of `line` where spaces become `·`, tabs become `→`,
+/// and every other char is replaced with a single space. A trailing `↵`
+/// stands in for the line break itself so EOLs are visible too. Painted
+/// underneath the real text in a dim color so whitespace stays visible while
+/// real glyphs (drawn on top) still appear in their syntax colors. Works in
+/// monospace because `·`/`→` occupy a single cell — the same width as the
+/// space they replace. Tabs aren't perfectly aligned (their rendered width
+/// varies), but the arrow lands where the tab starts, which is the useful
+/// signal. Uses `¶` (U+00B6) rather than `↵` (U+21B5) because none of the
+/// embedded code fonts (JetBrains Mono, Fira Code, Cascadia Code, Noto Sans
+/// Mono) actually ship U+21B5 — their arrows block stops at U+2195/U+2199 —
+/// so the Noto fallback can't fill the hole either. The pilcrow is in
+/// Latin-1 and present in every font we ship.
+fn whitespace_ghost(line: &str) -> String {
+    let mut out = String::with_capacity(line.len() + 3);
+    for ch in line.chars() {
+        match ch {
+            ' ' => out.push('\u{00b7}'),
+            '\t' => out.push('\u{2192}'),
+            _ => out.push(' '),
+        }
+    }
+    out.push(eol_glyph());
+    out
+}
 
 /// Snap a byte offset to the nearest preceding char boundary in `s`.
 pub fn snap_to_char_boundary(s: &str, byte_offset: usize) -> usize {
@@ -43,11 +96,23 @@ pub fn paint_line_with_spans(
     scroll_x: f32,
     padding_x: f32,
 ) {
+    let show_ws = show_whitespace_enabled();
     if line_text.is_empty() {
+        if show_ws {
+            let mut buf = [0u8; 4];
+            dl.add_text(line_origin, theme::OVERLAY0(), eol_glyph().encode_utf8(&mut buf));
+        }
         return;
     }
     let widget_left = line_origin[0] - padding_x + scroll_x;
     let text_y = line_origin[1];
+
+    // Underlay: render whitespace glyphs in a dim color first; real text
+    // (drawn afterward) covers the ghost where chars are non-whitespace.
+    if show_ws {
+        let ghost = whitespace_ghost(line_text);
+        dl.add_text(line_origin, theme::OVERLAY0(), &ghost);
+    }
 
     let Some(line_spans) = line_spans.filter(|v| !v.is_empty()) else {
         dl.add_text(line_origin, theme::TEXT(), line_text);

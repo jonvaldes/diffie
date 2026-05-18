@@ -780,7 +780,9 @@ fn paint_pane_text(
                 return Some(match kind_v {
                     HunkKind::LocalOnly => theme::with_alpha(theme::GREEN(), 0.22),
                     HunkKind::RemoteOnly => theme::with_alpha(theme::SAPPHIRE(), 0.22),
-                    HunkKind::Conflict => theme::with_alpha(theme::RED(), 0.30),
+                    // Match the 2-way Delete row tint so "removal" and
+                    // "conflict" read as the same red across both views.
+                    HunkKind::Conflict => [0.55, 0.18, 0.18, 0.30],
                 });
             }
         }
@@ -1075,7 +1077,7 @@ fn ribbon_color(h: &MergeHunk) -> [f32; 4] {
         MergeHunk::Stable { .. } => theme::with_alpha(theme::OVERLAY1(), 0.10),
         MergeHunk::LocalOnly { .. } => theme::with_alpha(theme::GREEN(), 0.28),
         MergeHunk::RemoteOnly { .. } => theme::with_alpha(theme::SAPPHIRE(), 0.28),
-        MergeHunk::Conflict { .. } => theme::with_alpha(theme::RED(), 0.32),
+        MergeHunk::Conflict { .. } => [0.55, 0.18, 0.18, 0.32],
     }
 }
 

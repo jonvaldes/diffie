@@ -856,7 +856,10 @@ pub(crate) fn paint_vbar(ui: &Ui, widget_rect: [f32; 4], scroll_y: f32, content_
     let x_r = widget_rect[2];
     let x_l = x_r - VBAR_W;
     let (ty, th) = vbar_thumb_geom(track_top, track_h, scroll_y, content_h);
-    let dl = ui.get_foreground_draw_list();
+    // Use the window's draw list (not the foreground one) so the scrollbar
+    // participates in window stacking — modal popups like Preferences
+    // correctly cover it instead of being drawn over.
+    let dl = ui.get_window_draw_list();
     // Track — subtle, doesn't fight with the syntax-highlighted text behind.
     dl.add_rect_filled_multicolor(
         [x_l, track_top],

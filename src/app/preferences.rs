@@ -5,6 +5,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::app::fonts::CodeFont;
 use crate::app::theme::Flavor;
 use crate::diff::DiffOptions;
 
@@ -14,6 +15,10 @@ pub struct AppPreferences {
     pub default_options: DiffOptions,
     #[serde(default)]
     pub theme: Flavor,
+    #[serde(default)]
+    pub show_whitespace: bool,
+    #[serde(default)]
+    pub code_font: CodeFont,
 }
 
 impl Default for AppPreferences {
@@ -26,6 +31,8 @@ impl Default for AppPreferences {
             default_engine: "histogram".to_string(),
             default_options: DiffOptions::default(),
             theme: Flavor::default(),
+            show_whitespace: false,
+            code_font: CodeFont::default(),
         }
     }
 }

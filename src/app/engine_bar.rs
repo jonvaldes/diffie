@@ -3,6 +3,8 @@
 //! sub-line granularity are tab-stable choices that live in the
 //! Preferences modal as defaults for new tabs.
 
+use crate::app::preferences::{self, AppPreferences};
+use crate::app::syntax_paint;
 use crate::app::theme;
 use crate::diff::{DiffOptions, Whitespace};
 use crate::session::{SessionId, SessionStore};
@@ -32,6 +34,7 @@ pub fn render(
     session_id: SessionId,
     _current_engine: &str,
     current_options: DiffOptions,
+    prefs: &mut AppPreferences,
     status: &mut String,
 ) {
     ui.text("Whitespace:");
@@ -77,6 +80,36 @@ pub fn render(
             opts.whitespace = new_ws;
             apply_options(store, session_id, opts, status);
         }
+    }
+
+    // "Show whitespace" toggle — purely a render-time pref, persisted in
+    // AppPreferences and mirrored into a global flag the paint path reads.
+    ui.same_line_with_spacing(0.0, 12.0);
+    let show_ws = prefs.show_whitespace;
+    let _tint = show_ws.then(|| {
+        (
+            ui.push_style_color(imgui::StyleColor::Button, theme::SURFACE1()),
+            ui.push_style_color(imgui::StyleColor::ButtonHovered, theme::SURFACE2()),
+            ui.push_style_color(imgui::StyleColor::ButtonActive, theme::OVERLAY0()),
+        )
+    });
+    // nf-fa-eye — "show whitespace"
+    if ui.button_with_size("\u{f06e}##show_ws", [btn_w, frame_h]) {
+        prefs.show_whitespace = !show_ws;
+        syntax_paint::set_show_whitespace(prefs.show_whitespace);
+        match preferences::save(prefs) {
+            Ok(()) => {
+                *status = if prefs.show_whitespace {
+                    "whitespace visible".into()
+                } else {
+                    "whitespace hidden".into()
+                };
+            }
+            Err(e) => *status = format!("preferences save error: {e}"),
+        }
+    }
+    if ui.is_item_hovered() {
+        ui.tooltip_text("Show whitespace characters");
     }
 }
 

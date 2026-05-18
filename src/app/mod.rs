@@ -26,6 +26,7 @@ use crate::session::{SessionId, SessionMode, SessionStore};
 
 mod diff_view;
 mod engine_bar;
+mod fonts;
 mod merge_view;
 mod preferences;
 pub mod three_way_header;
@@ -377,6 +378,8 @@ impl ApplicationHandler for App {
         // Apply the user's saved theme flavor before priming the style
         // table so the first frame already paints in the chosen palette.
         theme::set_flavor(self.state.preferences.theme);
+        syntax_paint::set_show_whitespace(self.state.preferences.show_whitespace);
+        syntax_paint::set_eol_glyph(self.state.preferences.code_font.eol_codepoint());
         theme::apply(&mut imgui);
         syntax::prime_tables();
         // Cross-platform clipboard via arboard so set/get_clipboard_text on
@@ -390,7 +393,7 @@ impl ApplicationHandler for App {
         let hidpi_factor = window.scale_factor();
         let font_size = (13.0 * hidpi_factor) as f32;
         imgui.io_mut().font_global_scale = (1.0 / hidpi_factor) as f32;
-        let mono_font = load_fonts(&mut imgui, font_size);
+        let mono_font = load_fonts(&mut imgui, font_size, self.state.preferences.code_font);
         self.state.mono_font = Some(mono_font);
 
         let renderer = Renderer::new(
@@ -534,7 +537,7 @@ fn render(gpu: &mut Gpu, state: &mut AppState) {
         state.font_rebuild_pending = false;
         let hidpi_factor = gpu.window.scale_factor();
         let ui_font_size = (13.0 * hidpi_factor) as f32;
-        let new_mono = load_fonts(&mut gpu.imgui, ui_font_size);
+        let new_mono = load_fonts(&mut gpu.imgui, ui_font_size, state.preferences.code_font);
         state.mono_font = Some(new_mono);
         gpu.renderer
             .reload_font_texture(&mut gpu.imgui, &gpu.device, &gpu.queue);
@@ -887,17 +890,23 @@ fn keyboard_shortcuts(ui: &imgui::Ui, state: &mut AppState) {
     }
 }
 
-/// Clear the font atlas and re-add Roboto Regular (UI) + Roboto Mono Nerd
-/// Font (code) at the current `code_font_zoom`. Both fonts get the
-/// Nerd-Font icon glyphs merged in on the PUA range so icon codepoints
-/// like \u{f067} (`nf-fa-plus`) render whether they appear in UI labels
-/// or code views. Returns the mono `FontId`.
-fn load_fonts(imgui: &mut Context, ui_font_size: f32) -> FontId {
-    let fonts = imgui.fonts();
-    fonts.clear();
+/// Clear the font atlas and re-add the UI font + code font.
+///
+/// UI font: Roboto Regular + Nerd icons (PUA) merged in. Unchanged.
+///
+/// Code font: user's `CodeFont` choice as primary, with Noto Sans Mono merged
+/// in on the same glyph ranges (fills any codepoint the primary's TTF lacks
+/// — imgui drops missing-glyph entries during atlas build, so the merge
+/// genuinely fills holes rather than colliding), and the Nerd-Font icon
+/// block (PUA) merged in last so icon codepoints render inline in code.
+///
+/// Returns the mono `FontId`.
+fn load_fonts(imgui: &mut Context, ui_font_size: f32, code_font: fonts::CodeFont) -> FontId {
+    let atlas = imgui.fonts();
+    atlas.clear();
     let nerd_font_data: &'static [u8] =
         include_bytes!("../../assets/RobotoMonoNerdFont-Regular.ttf");
-    fonts.add_font(&[
+    atlas.add_font(&[
         FontSource::TtfData {
             data: aetna_fonts_roboto::ROBOTO_REGULAR,
             size_pixels: ui_font_size,
@@ -921,15 +930,35 @@ fn load_fonts(imgui: &mut Context, ui_font_size: f32) -> FontId {
         },
     ]);
     let code_size = ui_font_size * CODE_FONT_BASE_SCALE * code_font_zoom();
-    fonts.add_font(&[FontSource::TtfData {
-        data: nerd_font_data,
-        size_pixels: code_size,
-        config: Some(imgui::FontConfig {
+    atlas.add_font(&[
+        FontSource::TtfData {
+            data: code_font.bytes(),
             size_pixels: code_size,
-            glyph_ranges: FontGlyphRanges::from_slice(MONO_GLYPH_RANGES),
-            ..Default::default()
-        }),
-    }])
+            config: Some(imgui::FontConfig {
+                size_pixels: code_size,
+                glyph_ranges: FontGlyphRanges::from_slice(MONO_GLYPH_RANGES),
+                ..Default::default()
+            }),
+        },
+        FontSource::TtfData {
+            data: fonts::NOTO_SANS_MONO,
+            size_pixels: code_size,
+            config: Some(imgui::FontConfig {
+                size_pixels: code_size,
+                glyph_ranges: FontGlyphRanges::from_slice(MONO_GLYPH_RANGES),
+                ..Default::default()
+            }),
+        },
+        FontSource::TtfData {
+            data: nerd_font_data,
+            size_pixels: code_size,
+            config: Some(imgui::FontConfig {
+                size_pixels: code_size,
+                glyph_ranges: FontGlyphRanges::from_slice(NERD_ICON_GLYPH_RANGES),
+                ..Default::default()
+            }),
+        },
+    ])
 }
 
 /// Codepoint ranges loaded into the font atlas. Default imgui covers only
@@ -973,6 +1002,7 @@ static MONO_GLYPH_RANGES: &[u32] = &[
     0x2010, 0x205E,
     0x2190, 0x21FF,
     0x2200, 0x22FF,
+    0x2300, 0x23FF, // Miscellaneous Technical (⏎ U+23CE, used as EOL marker)
     0x2700, 0x27BF,
     0xE000, 0xF8FF, // Nerd-Font private-use icons
     0,
@@ -1309,6 +1339,19 @@ fn preferences_modal(ui: &imgui::Ui, state: &mut AppState) {
         );
 
         ui.separator();
+        ui.text("Code font:");
+        ui.same_line();
+        let mut font_idx = fonts::ALL
+            .iter()
+            .position(|f| *f == state.preferences_draft.code_font)
+            .unwrap_or(0);
+        let font_labels: Vec<&str> = fonts::ALL.iter().map(|f| f.label()).collect();
+        ui.set_next_item_width(260.0);
+        if ui.combo_simple_string("##pref_code_font", &mut font_idx, &font_labels) {
+            state.preferences_draft.code_font = fonts::ALL[font_idx];
+        }
+
+        ui.separator();
         ui.text("Theme:");
         ui.same_line();
         const FLAVORS: &[theme::Flavor] = &[theme::Flavor::Macchiato, theme::Flavor::Latte];
@@ -1325,7 +1368,11 @@ fn preferences_modal(ui: &imgui::Ui, state: &mut AppState) {
         ui.separator();
         if ui.button("OK") {
             let theme_changed = state.preferences.theme != state.preferences_draft.theme;
+            let font_changed = state.preferences.code_font != state.preferences_draft.code_font;
             state.preferences = state.preferences_draft.clone();
+            if font_changed {
+                state.font_rebuild_pending = true;
+            }
             if theme_changed {
                 // Live-switch the palette accessor (theme::current()).
                 // The App drives the actual imgui style re-application
@@ -1333,6 +1380,8 @@ fn preferences_modal(ui: &imgui::Ui, state: &mut AppState) {
                 theme::set_flavor(state.preferences.theme);
                 state.theme_apply_pending = true;
             }
+            syntax_paint::set_show_whitespace(state.preferences.show_whitespace);
+            syntax_paint::set_eol_glyph(state.preferences.code_font.eol_codepoint());
             if let Err(e) = preferences::save(&state.preferences) {
                 state.status = format!("preferences save error: {e}");
             } else {
@@ -1859,6 +1908,7 @@ fn current_session_summary(ui: &imgui::Ui, state: &mut AppState) {
         id,
         &snap.engine,
         snap.options,
+        &mut state.preferences,
         &mut state.status,
     );
     ui.separator();
