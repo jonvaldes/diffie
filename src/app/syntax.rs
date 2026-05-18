@@ -398,6 +398,11 @@ pub enum Lang {
     CSharp,
     Hlsl,
     Rust,
+    Xml,
+    Json,
+    Yaml,
+    Lua,
+    Toml,
 }
 
 impl Lang {
@@ -407,6 +412,11 @@ impl Lang {
             Lang::CSharp => tree_sitter_c_sharp::LANGUAGE.into(),
             Lang::Hlsl => tree_sitter_hlsl::LANGUAGE_HLSL.into(),
             Lang::Rust => tree_sitter_rust::LANGUAGE.into(),
+            Lang::Xml => tree_sitter_xml::LANGUAGE_XML.into(),
+            Lang::Json => tree_sitter_json::LANGUAGE.into(),
+            Lang::Yaml => tree_sitter_yaml::LANGUAGE.into(),
+            Lang::Lua => tree_sitter_lua::LANGUAGE.into(),
+            Lang::Toml => tree_sitter_toml_ng::LANGUAGE.into(),
         }
     }
 }
@@ -427,6 +437,12 @@ pub fn lang_for_path(path: &Path) -> Option<Lang> {
             Some(Lang::Hlsl)
         }
         "rs" => Some(Lang::Rust),
+        "xml" | "xsd" | "xsl" | "xslt" | "svg" | "rss" | "atom" | "plist" | "csproj"
+        | "vcxproj" | "props" | "targets" | "config" | "resx" => Some(Lang::Xml),
+        "json" | "jsonc" | "json5" => Some(Lang::Json),
+        "yaml" | "yml" => Some(Lang::Yaml),
+        "lua" => Some(Lang::Lua),
+        "toml" => Some(Lang::Toml),
         _ => None,
     }
 }
@@ -460,6 +476,11 @@ impl HighlightCache {
             Some(Lang::CSharp) => 2,
             Some(Lang::Hlsl) => 3,
             Some(Lang::Rust) => 4,
+            Some(Lang::Xml) => 5,
+            Some(Lang::Json) => 6,
+            Some(Lang::Yaml) => 7,
+            Some(Lang::Lua) => 8,
+            Some(Lang::Toml) => 9,
             None => 0,
         };
         let content_hash = hash_lines(lines);
@@ -635,9 +656,14 @@ fn classify(node: &tree_sitter::Node) -> Option<(SyntaxKind, bool)> {
         return None;
     }
     match k {
-        // Comments
-        "comment" | "line_comment" | "block_comment" => Some((SyntaxKind::Comment, true)),
-        // Strings & char literals (cpp, cs, hlsl variants)
+        // Comments — covers cpp/cs/rust ("comment", "line_comment", "block_comment"),
+        // toml/yaml/lua ("comment"), and tree-sitter-xml's "Comment".
+        "comment" | "line_comment" | "block_comment" | "Comment" => {
+            Some((SyntaxKind::Comment, true))
+        }
+        // Strings & char literals. Covers C-family (`*_literal`, `string_content`),
+        // plain `string` (json/toml/lua/yaml), YAML scalars, and XML's
+        // `AttValue` (the quoted attribute value as a whole).
         "string_literal"
         | "raw_string_literal"
         | "char_literal"
@@ -645,20 +671,45 @@ fn classify(node: &tree_sitter::Node) -> Option<(SyntaxKind, bool)> {
         | "verbatim_string_literal"
         | "interpolated_string_text"
         | "string_content"
-        | "system_lib_string" => Some((SyntaxKind::String, true)),
-        // Numerics
-        "number_literal" | "integer_literal" | "real_literal" | "float_literal" => {
-            Some((SyntaxKind::Number, true))
-        }
+        | "system_lib_string"
+        | "string"
+        | "string_scalar"
+        | "block_scalar"
+        | "single_quote_scalar"
+        | "double_quote_scalar"
+        | "AttValue"
+        | "EntityValue" => Some((SyntaxKind::String, true)),
+        // Numerics — adds plain `number`/`integer`/`float` for json/toml/lua/yaml.
+        "number_literal"
+        | "integer_literal"
+        | "real_literal"
+        | "float_literal"
+        | "number"
+        | "integer"
+        | "float"
+        | "integer_scalar"
+        | "float_scalar" => Some((SyntaxKind::Number, true)),
         // Types
         "primitive_type"
         | "type_identifier"
         | "sized_type_specifier"
         | "predefined_type"
         | "implicit_type" => Some((SyntaxKind::Type, true)),
-        // Constants
-        "true" | "false" | "null_literal" | "boolean_literal" | "this_expression" => {
-            Some((SyntaxKind::Constant, true))
+        // Constants — bool/null variants across languages.
+        "true"
+        | "false"
+        | "null"
+        | "nil"
+        | "null_literal"
+        | "boolean_literal"
+        | "boolean_scalar"
+        | "null_scalar"
+        | "this_expression" => Some((SyntaxKind::Constant, true)),
+        // Identifier-ish things we want to treat as keywords for visual
+        // structure. Plain "Name" (XML element/attribute names) and
+        // "bare_key" / TOML table headers read better as colored tokens.
+        "Name" | "bare_key" | "dotted_key" | "PITarget" => {
+            Some((SyntaxKind::Keyword, true))
         }
         _ => None,
     }

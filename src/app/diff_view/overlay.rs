@@ -736,12 +736,18 @@ pub(super) fn paint_gutter(
     let g_left = gutter_rect[0];
     let g_right = gutter_rect[2];
     let g_w = g_right - g_left;
+    // The code pane's text painter offsets each row by the multiline's
+    // frame_padding.y (see `paint_text_lines`). Apply the same offset here
+    // so the gutter row backgrounds line up with the row tints painted
+    // behind the code; without it the gutter sits a few pixels above the
+    // code rows.
+    let padding_y = ui.clone_style().frame_padding[1];
     let first_line = (scroll_y / lh).floor() as u32 + 1;
     let last_line = ((scroll_y + g_h) / lh).ceil() as u32 + 1;
 
     let line_no_color = theme::OVERLAY1();
     for line in first_line..=last_line.min(line_count) {
-        let y = line_screen_y(g_top, line, scroll_y, lh);
+        let y = line_screen_y(g_top, line, scroll_y, lh) + padding_y;
         if y + lh < g_top || y > g_bottom {
             continue;
         }

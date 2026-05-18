@@ -358,14 +358,17 @@ pub fn render(
 
     // Draw bezier connectors on top, *after* the panes have all rendered.
     // origin y is the top of each pane's text widget in screen space; the
-    // y0 of each pane's connector strip is the same.
+    // y0 of each pane's connector strip is the same. Add the multiline's
+    // frame_padding.y so ribbons line up with the text rows (matching the
+    // offset `paint_text_lines` and `paint_gutter` apply).
+    let pane_text_padding_y = ui.clone_style().frame_padding[1];
     draw_connector(
         ui,
         connector_rb_pos,
         CONNECTOR_W,
         pane_h,
-        remote_origin[1] - remote_scroll,
-        base_origin[1] - base_scroll,
+        remote_origin[1] + pane_text_padding_y - remote_scroll,
+        base_origin[1] + pane_text_padding_y - base_scroll,
         &remote_layout.ranges,
         &base_layout.ranges,
         &remote_layout.line_ys,
@@ -379,8 +382,8 @@ pub fn render(
         connector_bl_pos,
         CONNECTOR_W,
         pane_h,
-        base_origin[1] - base_scroll,
-        local_origin[1] - local_scroll,
+        base_origin[1] + pane_text_padding_y - base_scroll,
+        local_origin[1] + pane_text_padding_y - local_scroll,
         &base_layout.ranges,
         &local_layout.ranges,
         &base_layout.line_ys,
@@ -793,6 +796,9 @@ fn paint_gutter(
     let g_bottom = pane_pos[1] + pane_h;
     let g_left = pane_pos[0];
     let g_right = g_left + g_w;
+    // Match the multiline's frame_padding.y offset used by `paint_text_lines`
+    // so gutter row backgrounds align with the code-row tints.
+    let padding_y = ui.clone_style().frame_padding[1];
     // Match the per-row tint built by `tint_for_line` in `paint_pane_text`
     // so the gutter background flows continuously into the code row.
     let tint_for_line = |ln: u32| -> Option<[f32; 4]> {
@@ -811,7 +817,7 @@ fn paint_gutter(
     let first_line = (scroll_y / lh).floor() as u32 + 1;
     let last_line = ((scroll_y + pane_h) / lh).ceil() as u32 + 1;
     for line in first_line..=last_line.min(line_count) {
-        let y = g_top + (line as f32 - 1.0) * lh - scroll_y;
+        let y = g_top + padding_y + (line as f32 - 1.0) * lh - scroll_y;
         if y + lh < g_top || y > g_bottom {
             continue;
         }

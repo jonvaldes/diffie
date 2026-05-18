@@ -371,13 +371,17 @@ pub fn render(
 
     // Bezier connector ribbons between the two panes, drawn after both
     // panes render so we have their final widget rects + scroll values.
+    // `paint_text_lines` offsets each row by the multiline's frame
+    // padding.y; include it here so ribbons line up with the text rows
+    // (and with the gutter tints) rather than sitting a few pixels above.
+    let pane_text_padding_y = ui.clone_style().frame_padding[1];
     overlay::draw_connector(
         ui,
         connector_pos,
         CONNECTOR_W,
         pane_h,
-        left_widget_rect[1] - left_scroll_y,
-        right_widget_rect[1] - right_scroll_y,
+        left_widget_rect[1] + pane_text_padding_y - left_scroll_y,
+        right_widget_rect[1] + pane_text_padding_y - right_scroll_y,
         &left_ranges,
         &right_ranges,
         anchors,
