@@ -339,8 +339,20 @@ impl ApplicationHandler for App {
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
 
         // --- wgpu -----------------------------------------------------------
+        // On Windows, restrict to DX12 (skip the Vulkan probe that adds
+        // ~hundreds of ms to startup) and prefer the integrated GPU. A code
+        // diff tool doesn't need the discrete GPU, and waking the dGPU on
+        // hybrid-graphics laptops adds 1-3s of visible delay before the
+        // window paints. Other platforms keep PRIMARY (Vulkan on Linux,
+        // Metal on macOS) and HighPerformance — both fast there.
+        #[cfg(target_os = "windows")]
+        let (backends, power_preference) =
+            (wgpu::Backends::DX12, wgpu::PowerPreference::LowPower);
+        #[cfg(not(target_os = "windows"))]
+        let (backends, power_preference) =
+            (wgpu::Backends::PRIMARY, wgpu::PowerPreference::HighPerformance);
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::PRIMARY,
+            backends,
             ..wgpu::InstanceDescriptor::new_without_display_handle()
         });
         let surface = instance
@@ -348,7 +360,7 @@ impl ApplicationHandler for App {
             .expect("create surface");
         let adapter =
             pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance,
+                power_preference,
                 compatible_surface: Some(&surface),
                 force_fallback_adapter: false,
             }))
