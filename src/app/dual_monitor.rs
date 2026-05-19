@@ -135,6 +135,95 @@ pub fn pair_label(pair: &MonitorPair) -> String {
     )
 }
 
+use std::sync::Arc;
+use winit::window::Window;
+
+/// Snapshot of window state captured at the moment dual-monitor mode is
+/// entered, so we can restore it on exit. Re-read live from winit rather
+/// than reusing `AppPreferences::window` because the user may have moved
+/// or resized the window since the last placement save.
+#[derive(Debug, Clone)]
+pub struct PriorWindowState {
+    pub outer_position: (i32, i32),
+    pub inner_size: (u32, u32),
+    pub maximized: bool,
+    pub decorations: bool,
+}
+
+/// Active dual-monitor session. Held on the `Gpu` while the mode is on.
+#[derive(Debug, Clone)]
+pub struct ActiveDualMonitor {
+    pub pair: MonitorPair,
+    pub prior: PriorWindowState,
+}
+
+/// Read the live monitors from the window and convert to plain rects.
+pub fn monitors_from_window(window: &Window) -> Vec<MonitorRect> {
+    window
+        .available_monitors()
+        .map(|m| {
+            let pos = m.position();
+            let size = m.size();
+            MonitorRect {
+                x: pos.x,
+                y: pos.y,
+                w: size.width,
+                h: size.height,
+            }
+        })
+        .collect()
+}
+
+/// Capture the window's current placement so we can restore it on exit.
+/// winit doesn't expose a getter for `is_decorated`, so we assume the
+/// default (decorated = true) — Diffie never toggles decorations except
+/// via this module, so the assumption holds.
+pub fn snapshot_prior(window: &Window) -> PriorWindowState {
+    let pos = window
+        .outer_position()
+        .map(|p| (p.x, p.y))
+        .unwrap_or((0, 0));
+    let size = window.inner_size();
+    PriorWindowState {
+        outer_position: pos,
+        inner_size: (size.width, size.height),
+        maximized: window.is_maximized(),
+        decorations: true,
+    }
+}
+
+/// Move + resize the window to span the pair, borderless.
+pub fn enter(window: &Arc<Window>, pair: MonitorPair) -> ActiveDualMonitor {
+    let prior = snapshot_prior(window);
+    let u = union_rect(&pair);
+    // Order matters: un-maximize first (set_outer_position is a no-op
+    // while maximized on Windows), drop decorations, then move + size.
+    if prior.maximized {
+        window.set_maximized(false);
+    }
+    window.set_decorations(false);
+    window.set_outer_position(winit::dpi::PhysicalPosition::new(u.x, u.y));
+    let _ = window
+        .request_inner_size(winit::dpi::PhysicalSize::new(u.w, u.h));
+    ActiveDualMonitor { pair, prior }
+}
+
+/// Restore decorations + the captured prior placement.
+pub fn exit(window: &Arc<Window>, active: &ActiveDualMonitor) {
+    window.set_decorations(active.prior.decorations);
+    window.set_outer_position(winit::dpi::PhysicalPosition::new(
+        active.prior.outer_position.0,
+        active.prior.outer_position.1,
+    ));
+    let _ = window.request_inner_size(winit::dpi::PhysicalSize::new(
+        active.prior.inner_size.0,
+        active.prior.inner_size.1,
+    ));
+    if active.prior.maximized {
+        window.set_maximized(true);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
