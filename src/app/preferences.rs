@@ -9,6 +9,18 @@ use crate::app::fonts::CodeFont;
 use crate::app::theme::Flavor;
 use crate::diff::DiffOptions;
 
+/// Default UI font size in pixels (pre-DPI scale). Applied to menus,
+/// buttons, headers, status bar — anything in the chrome rendered with
+/// the proportional font. Code panes scale off this via
+/// `CODE_FONT_BASE_SCALE`, so changing it adjusts both axes proportionally.
+pub const DEFAULT_UI_FONT_SIZE: f32 = 13.0;
+pub const MIN_UI_FONT_SIZE: f32 = 9.0;
+pub const MAX_UI_FONT_SIZE: f32 = 24.0;
+
+fn default_ui_font_size() -> f32 {
+    DEFAULT_UI_FONT_SIZE
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppPreferences {
     pub default_engine: String,
@@ -21,6 +33,8 @@ pub struct AppPreferences {
     pub code_font: CodeFont,
     #[serde(default)]
     pub window: WindowPlacement,
+    #[serde(default = "default_ui_font_size")]
+    pub ui_font_size: f32,
 }
 
 /// Last known window geometry, restored at startup. All fields are
@@ -50,6 +64,7 @@ impl Default for AppPreferences {
             show_whitespace: false,
             code_font: CodeFont::default(),
             window: WindowPlacement::default(),
+            ui_font_size: DEFAULT_UI_FONT_SIZE,
         }
     }
 }

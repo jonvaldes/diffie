@@ -425,7 +425,7 @@ impl ApplicationHandler for App {
         platform.attach_window(imgui.io_mut(), &window, HiDpiMode::Default);
 
         let hidpi_factor = window.scale_factor();
-        let font_size = (13.0 * hidpi_factor) as f32;
+        let font_size = (self.state.preferences.ui_font_size as f64 * hidpi_factor) as f32;
         imgui.io_mut().font_global_scale = (1.0 / hidpi_factor) as f32;
         let mono_font = load_fonts(&mut imgui, font_size, self.state.preferences.code_font);
         self.state.mono_font = Some(mono_font);
@@ -623,7 +623,7 @@ fn render(gpu: &mut Gpu, state: &mut AppState) {
     if state.font_rebuild_pending {
         state.font_rebuild_pending = false;
         let hidpi_factor = gpu.window.scale_factor();
-        let ui_font_size = (13.0 * hidpi_factor) as f32;
+        let ui_font_size = (state.preferences.ui_font_size as f64 * hidpi_factor) as f32;
         let new_mono = load_fonts(&mut gpu.imgui, ui_font_size, state.preferences.code_font);
         state.mono_font = Some(new_mono);
         gpu.renderer
@@ -1466,6 +1466,23 @@ fn preferences_modal(ui: &imgui::Ui, state: &mut AppState) {
         }
 
         ui.separator();
+        ui.text("UI font size:");
+        ui.same_line();
+        ui.set_next_item_width(260.0);
+        let mut ui_font_size = state.preferences_draft.ui_font_size;
+        if imgui::Drag::new("##pref_ui_font_size")
+            .range(preferences::MIN_UI_FONT_SIZE, preferences::MAX_UI_FONT_SIZE)
+            .speed(0.1)
+            .display_format("%.1f px")
+            .build(ui, &mut ui_font_size)
+        {
+            state.preferences_draft.ui_font_size = ui_font_size.clamp(
+                preferences::MIN_UI_FONT_SIZE,
+                preferences::MAX_UI_FONT_SIZE,
+            );
+        }
+
+        ui.separator();
         ui.text("Theme:");
         ui.same_line();
         const FLAVORS: &[theme::Flavor] = &[theme::Flavor::Macchiato, theme::Flavor::Latte];
@@ -1482,7 +1499,9 @@ fn preferences_modal(ui: &imgui::Ui, state: &mut AppState) {
         ui.separator();
         if ui.button("OK") {
             let theme_changed = state.preferences.theme != state.preferences_draft.theme;
-            let font_changed = state.preferences.code_font != state.preferences_draft.code_font;
+            let font_changed = state.preferences.code_font != state.preferences_draft.code_font
+                || (state.preferences.ui_font_size - state.preferences_draft.ui_font_size).abs()
+                    > f32::EPSILON;
             state.preferences = state.preferences_draft.clone();
             if font_changed {
                 state.font_rebuild_pending = true;
