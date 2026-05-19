@@ -25,6 +25,7 @@ use crate::io as fileio;
 use crate::session::{SessionId, SessionMode, SessionStore};
 
 mod diff_view;
+mod dual_monitor;
 mod engine_bar;
 mod fonts;
 mod merge_view;
