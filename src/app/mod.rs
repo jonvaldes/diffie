@@ -638,6 +638,7 @@ fn save_window_placement(window: &Window, prefs: &mut preferences::AppPreference
 fn toggle_dual_monitor(gpu: &mut Gpu, state: &mut AppState) {
     if gpu.dual_monitor.is_some() {
         exit_dual_monitor(gpu);
+        state.status = "Dual-Monitor: off".to_string();
         return;
     }
     let monitors = dual_monitor::monitors_from_window(&gpu.window);
@@ -1039,8 +1040,8 @@ fn menu_bar(ui: &imgui::Ui, state: &mut AppState) {
                 state.dual_monitor_request = Some(DualMonitorRequest::Toggle);
             }
             ui.menu_with_enabled("Dual-Monitor", is_two_way || dual_on, || {
-                let monitors = state.dual_monitor_known_monitors.clone();
-                let pairs = dual_monitor::adjacent_pairs(&monitors);
+                let pairs =
+                    dual_monitor::adjacent_pairs(&state.dual_monitor_known_monitors);
                 if pairs.is_empty() {
                     ui.menu_item_config("(no adjacent pair available)")
                         .enabled(false)
