@@ -5,6 +5,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::app::dual_monitor::MonitorRect;
 use crate::app::fonts::CodeFont;
 use crate::app::theme::Flavor;
 use crate::diff::DiffOptions;
@@ -35,6 +36,8 @@ pub struct AppPreferences {
     pub window: WindowPlacement,
     #[serde(default = "default_ui_font_size")]
     pub ui_font_size: f32,
+    #[serde(default)]
+    pub dual_monitor_pair: Option<[MonitorRect; 2]>,
 }
 
 /// Last known window geometry, restored at startup. All fields are
@@ -65,6 +68,7 @@ impl Default for AppPreferences {
             code_font: CodeFont::default(),
             window: WindowPlacement::default(),
             ui_font_size: DEFAULT_UI_FONT_SIZE,
+            dual_monitor_pair: None,
         }
     }
 }
