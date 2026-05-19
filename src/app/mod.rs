@@ -530,16 +530,27 @@ impl ApplicationHandler for App {
         }
 
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => {
+                exit_dual_monitor(gpu);
+                event_loop.exit();
+            }
             WindowEvent::Resized(new_size) => {
                 gpu.surface_config.width = new_size.width.max(1);
                 gpu.surface_config.height = new_size.height.max(1);
                 gpu.surface.configure(&gpu.device, &gpu.surface_config);
                 gpu.window.request_redraw();
-                save_window_placement(&gpu.window, &mut self.state.preferences);
+                save_window_placement(
+                    &gpu.window,
+                    &mut self.state.preferences,
+                    gpu.dual_monitor.is_some(),
+                );
             }
             WindowEvent::Moved(_) => {
-                save_window_placement(&gpu.window, &mut self.state.preferences);
+                save_window_placement(
+                    &gpu.window,
+                    &mut self.state.preferences,
+                    gpu.dual_monitor.is_some(),
+                );
             }
             WindowEvent::RedrawRequested => {
                 render(gpu, &mut self.state);
@@ -608,7 +619,14 @@ impl ApplicationHandler for App {
 /// when the window is in its normal (non-maximized) state — otherwise the
 /// restored maximized size would clobber the user's actual unmaximized
 /// geometry.
-fn save_window_placement(window: &Window, prefs: &mut preferences::AppPreferences) {
+fn save_window_placement(
+    window: &Window,
+    prefs: &mut preferences::AppPreferences,
+    dual_monitor_active: bool,
+) {
+    if dual_monitor_active {
+        return;
+    }
     let maximized = window.is_maximized();
     let mut changed = false;
     if prefs.window.maximized != maximized {
