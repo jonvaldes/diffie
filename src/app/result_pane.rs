@@ -83,6 +83,8 @@ pub fn render(
     hunks: &[MergeHunk],
     resolutions: &HashMap<u32, Resolution>,
     result_highlights: &[LineSpans],
+    search: &mut crate::app::search_ui::AppSearch,
+    focused_pane: Option<crate::app::FocusedPane>,
 ) -> ResultPaneSync {
     if state.force_reload || !state.was_active_last_frame {
         if let Ok(text) = store.compute_result(session_id) {
@@ -147,6 +149,34 @@ pub fn render(
     let widget_focused_cell: Cell<bool> = Cell::new(false);
     let scroll_y_cell: Cell<f32> = Cell::new(0.0);
     let caret_byte: Cell<i32> = Cell::new(-1);
+    // Populated below from search.jump_request before the multiline build; the
+    // CaretCapture callback consumes it via `.take()` on the next on_always.
+    let pending_caret_set: Cell<Option<i32>> = Cell::new(None);
+    // Set when we centered the view on a search match so the scroll-sync
+    // logic below knows to override `target`.
+    let mut search_jump_scroll: Option<f32> = None;
+
+    // Compute search matches for the current result buffer up front so we can
+    // decide whether to stage a caret jump (which has to happen BEFORE the
+    // multiline build).
+    let pane_id = crate::app::search_ui::PaneId::Result;
+    let matches =
+        crate::app::search_ui::compute_and_register(search, pane_id, &state.buffer);
+    let focused_pid = focused_pane.map(crate::app::search_ui::PaneId::from_focused);
+    let prev_caret_for_jump = caret_byte.get().max(0) as usize;
+    if let Some(jump) = crate::app::search_ui::consume_jump_for_pane(
+        search,
+        pane_id,
+        &matches,
+        prev_caret_for_jump,
+        focused_pid,
+    ) {
+        pending_caret_set.set(Some(jump.caret_byte as i32));
+        let max_scroll_now = (inner_h - widget_h).max(0.0);
+        let target_y =
+            ((jump.line as f32 - 1.0) * lh - widget_h * 0.5 + lh * 0.5).max(0.0);
+        search_jump_scroll = Some(target_y.clamp(0.0, max_scroll_now));
+    }
 
     // Scroll model: keep this in step with `merge_view::render_pane`. We
     // ease a `displayed` value from `last` toward `target`, and override
@@ -168,18 +198,27 @@ pub fn render(
     };
     let prev_target = merge_state.target[RESULT_SCROLL_SLOT];
     let prev_displayed = merge_state.last[RESULT_SCROLL_SLOT];
-    let mut target = if let Some(s) = pending_scroll {
+    let mut target = if let Some(s) = search_jump_scroll {
+        s
+    } else if let Some(s) = pending_scroll {
         s
     } else {
         prev_target - wheel_v * lh * SCROLL_LINES_PER_WHEEL_TICK
     };
     target = target.clamp(0.0, max_scroll);
+    // Search jumps snap immediately so the matched line is centered on the
+    // same frame.
+    let snap_scroll = search_jump_scroll.is_some();
 
     // Clamp dt to ~one 30fps frame so a wake-up frame after idle doesn't
     // collapse the easing into a single jump (mirrors merge_view).
     let dt = ui.io().delta_time.max(0.0).min(0.033);
     let k = 1.0 - (-dt * SCROLL_SMOOTH_SPEED).exp();
-    let mut displayed = prev_displayed + (target - prev_displayed) * k;
+    let mut displayed = if snap_scroll {
+        target
+    } else {
+        prev_displayed + (target - prev_displayed) * k
+    };
     if (target - displayed).abs() < SCROLL_SNAP_EPSILON {
         displayed = target;
     }
@@ -204,19 +243,33 @@ pub fn render(
 
             struct CaretCapture<'a> {
                 cursor: &'a Cell<i32>,
+                pending_set: &'a Cell<Option<i32>>,
             }
             impl<'a> imgui::InputTextCallbackHandler for CaretCapture<'a> {
-                fn on_always(&mut self, data: imgui::TextCallbackData) {
+                fn on_always(&mut self, mut data: imgui::TextCallbackData) {
+                    if let Some(c) = self.pending_set.take() {
+                        let c = c.max(0) as usize;
+                        data.set_cursor_pos(c);
+                        // Collapse any selection to the new caret.
+                        *data.selection_start_mut() = c as i32;
+                        *data.selection_end_mut() = c as i32;
+                    }
                     self.cursor.set(data.cursor_pos() as i32);
                 }
             }
 
             // Inner multiline sized to full content — no internal scroll.
+            if pending_caret_set.get().is_some() {
+                ui.set_keyboard_focus_here();
+            }
             let changed = ui
                 .input_text_multiline("##diffie_result", &mut state.buffer, [widget_w, inner_h])
                 .callback(
                     imgui::InputTextMultilineCallback::ALWAYS,
-                    CaretCapture { cursor: &caret_byte },
+                    CaretCapture {
+                        cursor: &caret_byte,
+                        pending_set: &pending_caret_set,
+                    },
                 )
                 .build();
             widget_active_cell.set(ui.is_item_active());
@@ -274,6 +327,40 @@ pub fn render(
             style.frame_padding[1],
             lh,
         );
+    }
+
+    // Search highlights + scrollbar ticks over the merged buffer.
+    {
+        let char_adv = ui.calc_text_size("m")[0].max(1.0);
+        let widget_rect = [
+            widget_pos[0],
+            widget_pos[1],
+            widget_pos[0] + widget_w,
+            widget_pos[1] + widget_h,
+        ];
+        let style = ui.clone_style();
+        crate::app::search_ui::paint_highlights(
+            ui,
+            widget_rect,
+            &matches,
+            search.current,
+            pane_id,
+            scroll_y,
+            0.0,
+            lh,
+            char_adv,
+            style.frame_padding,
+        );
+        // Native scrollbar lives on the right edge of the outer child window.
+        let sb_w = style.scrollbar_size.max(8.0);
+        let vbar_rect = [
+            widget_pos[0] + widget_w - sb_w,
+            widget_pos[1],
+            widget_pos[0] + widget_w,
+            widget_pos[1] + widget_h,
+        ];
+        let total_lines = state.buffer.lines().count().max(1) as u32;
+        crate::app::search_ui::paint_scrollbar_ticks(ui, vbar_rect, total_lines, &matches);
     }
 
     // Origin-side accent stripe between gutter and text widget.

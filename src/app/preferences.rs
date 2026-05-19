@@ -38,6 +38,12 @@ pub struct AppPreferences {
     pub ui_font_size: f32,
     #[serde(default)]
     pub dual_monitor_pair: Option<[MonitorRect; 2]>,
+    #[serde(default)]
+    pub search_case_sensitive: bool,
+    #[serde(default)]
+    pub search_whole_word: bool,
+    #[serde(default)]
+    pub search_regex: bool,
 }
 
 /// Last known window geometry, restored at startup. All fields are
@@ -69,6 +75,9 @@ impl Default for AppPreferences {
             window: WindowPlacement::default(),
             ui_font_size: DEFAULT_UI_FONT_SIZE,
             dual_monitor_pair: None,
+            search_case_sensitive: false,
+            search_whole_word: false,
+            search_regex: false,
         }
     }
 }

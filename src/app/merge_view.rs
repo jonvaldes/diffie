@@ -239,6 +239,7 @@ pub struct UpperPaneRanges {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 pub fn render(
     ui: &Ui,
     store: &SessionStore,
@@ -253,6 +254,8 @@ pub fn render(
     base_highlights: &[LineSpans],
     local_highlights: &[LineSpans],
     remote_highlights: &[LineSpans],
+    search: &mut crate::app::search_ui::AppSearch,
+    focused_pane: Option<crate::app::FocusedPane>,
 ) -> UpperPaneRanges {
     let empty = UpperPaneRanges {
         base: Vec::new(),
@@ -332,10 +335,12 @@ pub fn render(
         [Cell::new(None), Cell::new(None), Cell::new(None)];
     let focus_event: Cell<Option<crate::app::FocusedPane>> = Cell::new(None);
 
+    let focused_pid = focused_pane.map(crate::app::search_ui::PaneId::from_focused);
+
     let (_remote_rect, remote_scroll, remote_origin) = render_pane(
         ui, state, remote_pos, pane_w, pane_h, Pane::Remote, session_id,
         pending_edits, &remote_layout, &hover_panes[2], &focus_event,
-        remote_highlights, lh,
+        remote_highlights, lh, search, focused_pid,
     );
 
     ui.set_cursor_screen_pos(connector_rb_pos);
@@ -344,7 +349,7 @@ pub fn render(
     let (_base_rect, base_scroll, base_origin) = render_pane(
         ui, state, base_pos, pane_w, pane_h, Pane::Base, session_id,
         pending_edits, &base_layout, &hover_panes[0], &focus_event,
-        base_highlights, lh,
+        base_highlights, lh, search, focused_pid,
     );
 
     ui.set_cursor_screen_pos(connector_bl_pos);
@@ -353,7 +358,7 @@ pub fn render(
     let (_local_rect, local_scroll, local_origin) = render_pane(
         ui, state, local_pos, pane_w, pane_h, Pane::Local, session_id,
         pending_edits, &local_layout, &hover_panes[1], &focus_event,
-        local_highlights, lh,
+        local_highlights, lh, search, focused_pid,
     );
 
     if let Some(p) = focus_event.get() {
@@ -445,6 +450,8 @@ fn render_pane(
     focus_event: &Cell<Option<crate::app::FocusedPane>>,
     highlights: &[LineSpans],
     lh: f32,
+    search: &mut crate::app::search_ui::AppSearch,
+    focused_pid: Option<crate::app::search_ui::PaneId>,
 ) -> ([f32; 4], f32, [f32; 2]) {
     let g_w = gutter_w();
     let widget_pos = [pane_pos[0] + g_w, pane_pos[1]];
@@ -783,6 +790,50 @@ fn render_pane(
         &bands,
         buf_line_count as u32,
     );
+
+    // Search overlays.
+    let pane_id = match pane {
+        Pane::Base => crate::app::search_ui::PaneId::ThreeWayBase,
+        Pane::Local => crate::app::search_ui::PaneId::ThreeWayLocal,
+        Pane::Remote => crate::app::search_ui::PaneId::ThreeWayRemote,
+    };
+    let matches =
+        crate::app::search_ui::compute_and_register(search, pane_id, buf_for_paint);
+    let char_adv = ui.calc_text_size("m")[0].max(1.0);
+    let frame_pad_paint = ui.clone_style().frame_padding;
+    crate::app::search_ui::paint_highlights(
+        ui,
+        widget_rect,
+        &matches,
+        search.current,
+        pane_id,
+        scroll_y_out,
+        scroll_x_out,
+        lh,
+        char_adv,
+        frame_pad_paint,
+    );
+    let vbar_rect = [vbar_x_l, widget_pos[1], vbar_x_r, widget_pos[1] + pane_h];
+    crate::app::search_ui::paint_scrollbar_ticks(
+        ui,
+        vbar_rect,
+        buf_line_count as u32,
+        &matches,
+    );
+    let caret_now = state.last_caret[pane as usize].unwrap_or(-1).max(0) as usize;
+    if let Some(jump) = crate::app::search_ui::consume_jump_for_pane(
+        search,
+        pane_id,
+        &matches,
+        caret_now,
+        focused_pid,
+    ) {
+        let target_y =
+            ((jump.line as f32 - 1.0) * lh - pane_h * 0.5 + lh * 0.5).max(0.0);
+        state.pending[pane as usize] = Some(target_y);
+        state.last_caret[pane as usize] = Some(jump.caret_byte as i32);
+        state.input_epoch = state.input_epoch.wrapping_add(1);
+    }
 
     // Restore Arrow cursor over the scrollbar / while dragging it.
     if content_h > pane_h && (in_track || dragging) {

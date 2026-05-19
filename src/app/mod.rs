@@ -33,6 +33,7 @@ mod preferences;
 pub mod three_way_header;
 mod recents;
 mod result_pane;
+pub mod search_ui;
 mod syntax;
 mod syntax_paint;
 mod theme;
@@ -239,6 +240,8 @@ struct AppState {
     /// Snapshot of `available_monitors()` so the submenu can list pairs
     /// without holding a winit reference.
     dual_monitor_known_monitors: Vec<dual_monitor::MonitorRect>,
+    /// Live find-in-panes state (query, toggles, per-frame match lists).
+    pub search: search_ui::AppSearch,
 }
 
 /// Imgui's default caret blink rate is one cycle per second; rendering at
@@ -306,6 +309,14 @@ impl Default for AppState {
             dual_monitor_active: false,
             dual_monitor_current_pair: None,
             dual_monitor_known_monitors: Vec::new(),
+            search: {
+                let prefs = preferences::load();
+                let mut s = search_ui::AppSearch::default();
+                s.case_sensitive = prefs.search_case_sensitive;
+                s.whole_word = prefs.search_whole_word;
+                s.regex = prefs.search_regex;
+                s
+            },
         }
     }
 }
@@ -839,6 +850,9 @@ fn render(gpu: &mut Gpu, state: &mut AppState) {
 // --- UI -------------------------------------------------------------------
 
 fn frame_ui(ui: &imgui::Ui, state: &mut AppState) {
+    // Reset per-frame search match registry. Panes register their lists
+    // during render below; the jump-request consumer reads them afterwards.
+    state.search.begin_frame();
     if let Some(initial) = state.pending_initial.take() {
         match initial {
             InitialOpen::TwoWay { a, b } => open_two_way_paths(state, a, b),
@@ -1115,11 +1129,22 @@ fn keyboard_shortcuts(ui: &imgui::Ui, state: &mut AppState) {
             state.dual_monitor_request = Some(DualMonitorRequest::Toggle);
         }
     }
+    // F3 / Shift+F3 cycle search matches without needing focus on the field.
+    if ui.is_key_pressed(Key::F3) && state.search.active_query().is_some() {
+        state.search.jump_request = Some(if ui.io().key_shift {
+            search_ui::JumpDir::Prev
+        } else {
+            search_ui::JumpDir::Next
+        });
+    }
     let io = ui.io();
     let ctrl = io.key_ctrl;
     let shift = io.key_shift;
     if !ctrl {
         return;
+    }
+    if !shift && ui.is_key_pressed(Key::F) {
+        state.search.focus_request = true;
     }
     if ui.is_key_pressed(Key::O) {
         if shift {
@@ -2224,6 +2249,7 @@ fn current_session_summary(ui: &imgui::Ui, state: &mut AppState) {
         snap.options,
         &mut state.preferences,
         &mut state.status,
+        &mut state.search,
     );
     ui.separator();
     // Per-pane header strip (filename + browse + save) is rendered per-mode,
@@ -2267,6 +2293,10 @@ fn current_session_summary(ui: &imgui::Ui, state: &mut AppState) {
                 .syntax
                 .highlights(b_key, b_lang, &b_lines_vec)
                 .to_vec();
+            let focused_for_session = state
+                .focused
+                .and_then(|(s, p)| (s == id).then_some(p));
+            let search = &mut state.search;
             let view_state = state.diff_views.entry(id).or_default();
             let mut focus_request: Option<FocusedPane> = None;
             let mut pending_edits: Vec<undo_stack::DiffEdit> = Vec::new();
@@ -2283,6 +2313,8 @@ fn current_session_summary(ui: &imgui::Ui, state: &mut AppState) {
                 &mut pending_edits,
                 &a_highlights,
                 &b_highlights,
+                search,
+                focused_for_session,
             );
             if let Some(p) = focus_request {
                 state.focused = Some((id, p));
@@ -2376,6 +2408,10 @@ fn current_session_summary(ui: &imgui::Ui, state: &mut AppState) {
                 let store = &state.sessions;
                 let status = &mut state.status;
                 let mono = state.mono_font;
+                let focused_for_session = state
+                    .focused
+                    .and_then(|(s, p)| (s == id).then_some(p));
+                let search = &mut state.search;
                 let view_state = state.merge_views.entry(id).or_default();
                 let mut focus_request: Option<FocusedPane> = None;
                 let mut pending_edits: Vec<undo_stack::DiffEdit> = Vec::new();
@@ -2397,6 +2433,8 @@ fn current_session_summary(ui: &imgui::Ui, state: &mut AppState) {
                             &base_h,
                             &local_h,
                             &remote_h,
+                            search,
+                            focused_for_session,
                         ));
                     });
                 upper_ranges = ranges_out.unwrap_or(merge_view::UpperPaneRanges {
@@ -2460,6 +2498,11 @@ fn current_session_summary(ui: &imgui::Ui, state: &mut AppState) {
             }
             {
                 let mono = state.mono_font;
+                let focused_for_session = state
+                    .focused
+                    .and_then(|(s, p)| (s == id).then_some(p));
+                let search = &mut state.search;
+                let sessions = &state.sessions;
                 let result = state.result_panes.entry(id).or_default();
                 let view_state = state.merge_views.entry(id).or_default();
                 let mut focus_request: Option<FocusedPane> = None;
@@ -2470,7 +2513,7 @@ fn current_session_summary(ui: &imgui::Ui, state: &mut AppState) {
                     .build(|| {
                         result_sync = Some(result_pane::render(
                             ui,
-                            &state.sessions,
+                            sessions,
                             id,
                             result,
                             view_state,
@@ -2479,6 +2522,8 @@ fn current_session_summary(ui: &imgui::Ui, state: &mut AppState) {
                             hunks,
                             resolutions,
                             &result_highlights,
+                            search,
+                            focused_for_session,
                         ));
                     });
                 if let Some(p) = focus_request {

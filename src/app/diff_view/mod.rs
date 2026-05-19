@@ -158,6 +158,8 @@ pub fn render(
     pending_edits: &mut Vec<DiffEdit>,
     a_highlights: &[crate::app::syntax::LineSpans],
     b_highlights: &[crate::app::syntax::LineSpans],
+    search: &mut crate::app::search_ui::AppSearch,
+    focused_pane: Option<crate::app::FocusedPane>,
 ) {
     // Sync buffers from session at frame start.
     let snap = match store.snapshot(session_id) {
@@ -229,10 +231,12 @@ pub fn render(
     let prev_left_target_for_sync = state.target_left_scroll;
     let prev_right_target_for_sync = state.target_right_scroll;
 
+    let focused_pid = focused_pane.map(crate::app::search_ui::PaneId::from_focused);
+
     let (left_widget_rect, left_scroll_y) = render_pane(
         ui, state, left_pos, pane_w, pane_h, Side::Left, session_id,
         pending_edits, hunks, anchors, &hover_left,
-        a_highlights, lh,
+        a_highlights, lh, search, focused_pid,
     );
 
     // Connector strip: split into left rail / middle / right rail.
@@ -258,7 +262,7 @@ pub fn render(
     let (right_widget_rect, right_scroll_y) = render_pane(
         ui, state, right_pos, pane_w, pane_h, Side::Right, session_id,
         pending_edits, hunks, anchors, &hover_right,
-        b_highlights, lh,
+        b_highlights, lh, search, focused_pid,
     );
 
     let prev_left_target = prev_left_target_for_sync;
@@ -453,6 +457,7 @@ pub fn render(
 
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn render_pane(
     ui: &Ui,
     state: &mut DiffViewState,
@@ -467,6 +472,8 @@ fn render_pane(
     hover_out: &Cell<Option<(u32, [f32; 2])>>,
     highlights: &[crate::app::syntax::LineSpans],
     lh: f32,
+    search: &mut crate::app::search_ui::AppSearch,
+    focused_pid: Option<crate::app::search_ui::PaneId>,
 ) -> ([f32; 4], f32) {
     let g_w = gutter_w();
     let widget_pos = [pane_pos[0] + g_w, pane_pos[1]];
@@ -883,6 +890,27 @@ fn render_pane(
         hover_out,
     );
 
+    // Search highlights overlay on top of the painted text.
+    let pane_id = match side {
+        Side::Left => crate::app::search_ui::PaneId::TwoWayA,
+        Side::Right => crate::app::search_ui::PaneId::TwoWayB,
+    };
+    let matches = crate::app::search_ui::compute_and_register(search, pane_id, buf_for_paint);
+    let char_adv = ui.calc_text_size("m")[0].max(1.0);
+    let frame_pad_paint = ui.clone_style().frame_padding;
+    crate::app::search_ui::paint_highlights(
+        ui,
+        widget_rect,
+        &matches,
+        search.current,
+        pane_id,
+        scroll_y_out,
+        scroll_x_out,
+        lh,
+        char_adv,
+        frame_pad_paint,
+    );
+
     // Custom vertical scrollbar — painted last so it sits above text. Pinned
     // to widget_rect's right edge (which doesn't move when the user scrolls
     // horizontally), so it never disappears off-screen the way the inner
@@ -899,6 +927,50 @@ fn render_pane(
         &bands,
         buf_line_count_for_gutter,
     );
+
+    // Search match ticks on the vbar track.
+    let vbar_rect = [vbar_x_l, widget_pos[1], vbar_x_r, widget_pos[1] + pane_h];
+    crate::app::search_ui::paint_scrollbar_ticks(
+        ui,
+        vbar_rect,
+        buf_line_count_for_gutter,
+        &matches,
+    );
+
+    // Consume a pending jump request if this pane is the focused one.
+    let caret_now = match side {
+        Side::Left => state.a_last_caret,
+        Side::Right => state.b_last_caret,
+    }
+    .unwrap_or(-1)
+    .max(0) as usize;
+    if let Some(jump) = crate::app::search_ui::consume_jump_for_pane(
+        search,
+        pane_id,
+        &matches,
+        caret_now,
+        focused_pid,
+    ) {
+        // Center the matched line vertically.
+        let target_y = ((jump.line as f32 - 1.0) * lh - pane_h * 0.5 + lh * 0.5).max(0.0);
+        match side {
+            Side::Left => state.pending_left_scroll = Some(target_y),
+            Side::Right => state.pending_right_scroll = Some(target_y),
+        }
+        // Remember the new caret so the next frame's "current caret" is
+        // already past this match for Next, before this match for Prev.
+        let new_caret = jump.caret_byte as i32;
+        match side {
+            Side::Left => state.a_last_caret = Some(new_caret),
+            Side::Right => state.b_last_caret = Some(new_caret),
+        }
+        // Bump the input epoch so the multiline re-initialises from the
+        // buffer; otherwise stb_textedit keeps its stale caret state and
+        // the user's first arrow press snaps back. The CaretCapture path
+        // would also work via set_cursor_pos, but bumping the epoch is
+        // simpler and matches the post-undo handling already in place.
+        state.input_epoch = state.input_epoch.wrapping_add(1);
+    }
 
     // Override imgui's auto-set TextInput (I-beam) cursor with Arrow when the
     // mouse is over the scrollbar or actively dragging it. set_mouse_cursor

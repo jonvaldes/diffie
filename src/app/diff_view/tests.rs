@@ -143,6 +143,7 @@ fn run_frame_with_wgpu(
         .size([1200.0, 800.0], imgui::Condition::Always)
         .position([0.0, 0.0], imgui::Condition::Always)
         .build(|| {
+            let mut search = crate::app::search_ui::AppSearch::default();
             render(
                 ui,
                 store,
@@ -156,6 +157,8 @@ fn run_frame_with_wgpu(
                 &mut pending_edits,
                 &[],
                 &[],
+                &mut search,
+                None,
             );
         });
     let draw_data = ctx.render();

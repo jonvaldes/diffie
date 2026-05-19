@@ -507,6 +507,7 @@ dependencies = [
  "imgui-winit-support",
  "merge3",
  "pollster",
+ "regex",
  "rfd",
  "serde",
  "serde_json",

@@ -4,6 +4,7 @@
 //! Preferences modal as defaults for new tabs.
 
 use crate::app::preferences::{self, AppPreferences};
+use crate::app::search_ui::{self, AppSearch};
 use crate::app::syntax_paint;
 use crate::app::theme;
 use crate::diff::{DiffOptions, Whitespace};
@@ -36,6 +37,7 @@ pub fn render(
     current_options: DiffOptions,
     prefs: &mut AppPreferences,
     status: &mut String,
+    search: &mut AppSearch,
 ) {
     ui.text("Whitespace:");
     ui.same_line();
@@ -111,6 +113,30 @@ pub fn render(
     if ui.is_item_hovered() {
         ui.tooltip_text("Show whitespace characters");
     }
+
+    // Find input + toggles (Ctrl+F focuses).
+    ui.same_line_with_spacing(0.0, 16.0);
+    ui.text("Find:");
+    ui.same_line();
+    let prev_case = search.case_sensitive;
+    let prev_word = search.whole_word;
+    let prev_rx = search.regex;
+    search_ui::render_find_bar(ui, search);
+    // Persist toggles when they change.
+    if search.case_sensitive != prev_case
+        || search.whole_word != prev_word
+        || search.regex != prev_rx
+    {
+        prefs.search_case_sensitive = search.case_sensitive;
+        prefs.search_whole_word = search.whole_word;
+        prefs.search_regex = search.regex;
+        if let Err(e) = preferences::save(prefs) {
+            *status = format!("preferences save error: {e}");
+        }
+    }
+    // Suppress unused-binding warnings on session_id/store when this path
+    // doesn't touch the diff session.
+    let _ = (store, session_id);
 }
 
 fn apply_options(store: &SessionStore, id: SessionId, opts: DiffOptions, status: &mut String) {
