@@ -227,6 +227,18 @@ struct AppState {
     /// the loop can go idle on the same frame the input fired, before the
     /// view code has a chance to mark itself animating.
     last_input_at: Instant,
+    /// Set by the View menu / F11 shortcut. Drained after each frame in
+    /// `render` so we can call into helpers that need `&mut Gpu` (which
+    /// the imgui closure doesn't have access to).
+    dual_monitor_request: Option<DualMonitorRequest>,
+    /// Mirror of `gpu.dual_monitor.is_some()`, refreshed each frame so
+    /// the View menu (which only sees AppState) can show the checkmark.
+    dual_monitor_active: bool,
+    /// Mirror of `gpu.dual_monitor.as_ref().map(|a| a.pair)`.
+    dual_monitor_current_pair: Option<dual_monitor::MonitorPair>,
+    /// Snapshot of `available_monitors()` so the submenu can list pairs
+    /// without holding a winit reference.
+    dual_monitor_known_monitors: Vec<dual_monitor::MonitorRect>,
 }
 
 /// Imgui's default caret blink rate is one cycle per second; rendering at
@@ -237,6 +249,17 @@ const CARET_BLINK_INTERVAL: Duration = Duration::from_millis(500);
 /// loop to drop into a true idle wait. Covers the gap between an input
 /// arriving and the resulting animation showing up in `is_animating()`.
 const INPUT_REDRAW_GRACE: Duration = Duration::from_millis(200);
+
+/// Deferred dual-monitor request emitted by View-menu items / F11. The
+/// imgui frame closure only has access to `&mut AppState`, so toggling the
+/// mode (which needs `&mut Gpu` for the live `Window`) happens after the
+/// frame completes — `render` drains this enum into the helpers below.
+#[derive(Debug, Clone)]
+enum DualMonitorRequest {
+    Toggle,
+    EnterPair(dual_monitor::MonitorPair),
+    Exit,
+}
 
 /// Identifier shared between diff/merge views and the result pane so view
 /// code can record "the focused pane" without a generic-side enum. The Edit
@@ -279,6 +302,10 @@ impl Default for AppState {
             animating: false,
             last_blink_request: Instant::now(),
             last_input_at: Instant::now(),
+            dual_monitor_request: None,
+            dual_monitor_active: false,
+            dual_monitor_current_pair: None,
+            dual_monitor_known_monitors: Vec::new(),
         }
     }
 }
@@ -295,6 +322,9 @@ struct Gpu {
     platform: WinitPlatform,
     renderer: Renderer,
     last_frame: Instant,
+    /// `Some` while dual-monitor mode is active. Drives menu state and
+    /// enables window restore on app close.
+    dual_monitor: Option<dual_monitor::ActiveDualMonitor>,
 }
 
 #[derive(Default)]
@@ -451,6 +481,7 @@ impl ApplicationHandler for App {
             platform,
             renderer,
             last_frame: Instant::now(),
+            dual_monitor: None,
         });
 
         // Paint one frame *before* revealing the window so the OS never
@@ -604,6 +635,65 @@ fn save_window_placement(window: &Window, prefs: &mut preferences::AppPreference
     }
 }
 
+fn toggle_dual_monitor(gpu: &mut Gpu, state: &mut AppState) {
+    if gpu.dual_monitor.is_some() {
+        exit_dual_monitor(gpu);
+        return;
+    }
+    let monitors = dual_monitor::monitors_from_window(&gpu.window);
+    let saved = state.preferences.dual_monitor_pair.as_ref();
+    let pair = saved
+        .and_then(|s| dual_monitor::match_saved_pair(&monitors, s))
+        .or_else(|| {
+            let pos = gpu
+                .window
+                .outer_position()
+                .map(|p| (p.x, p.y))
+                .unwrap_or((0, 0));
+            let size = gpu.window.inner_size();
+            let center = (
+                pos.0 + (size.width as i32) / 2,
+                pos.1 + (size.height as i32) / 2,
+            );
+            dual_monitor::pick_pair_near(&monitors, center)
+        });
+    let Some(pair) = pair else {
+        state.status =
+            "Dual-Monitor: no adjacent monitor pair available.".to_string();
+        return;
+    };
+    enter_dual_monitor(gpu, state, pair);
+}
+
+fn enter_dual_monitor_with_pair(
+    gpu: &mut Gpu,
+    state: &mut AppState,
+    pair: dual_monitor::MonitorPair,
+) {
+    if gpu.dual_monitor.is_some() {
+        exit_dual_monitor(gpu);
+    }
+    enter_dual_monitor(gpu, state, pair);
+}
+
+fn enter_dual_monitor(
+    gpu: &mut Gpu,
+    state: &mut AppState,
+    pair: dual_monitor::MonitorPair,
+) {
+    let active = dual_monitor::enter(&gpu.window, pair);
+    state.preferences.dual_monitor_pair = Some([pair.0, pair.1]);
+    let _ = preferences::save(&state.preferences);
+    state.status = format!("Dual-Monitor: {}", dual_monitor::pair_label(&pair));
+    gpu.dual_monitor = Some(active);
+}
+
+fn exit_dual_monitor(gpu: &mut Gpu) {
+    if let Some(active) = gpu.dual_monitor.take() {
+        dual_monitor::exit(&gpu.window, &active);
+    }
+}
+
 fn render(gpu: &mut Gpu, state: &mut AppState) {
     let now = Instant::now();
     gpu.imgui.io_mut().update_delta_time(now - gpu.last_frame);
@@ -643,6 +733,13 @@ fn render(gpu: &mut Gpu, state: &mut AppState) {
         gpu.window.set_title(&title);
         state.last_window_title = title;
     }
+
+    // Refresh the mirror fields the View menu reads. Done here (rather than
+    // inside `frame_ui`) so the menu sees a consistent snapshot for the
+    // whole frame.
+    state.dual_monitor_active = gpu.dual_monitor.is_some();
+    state.dual_monitor_current_pair = gpu.dual_monitor.as_ref().map(|a| a.pair);
+    state.dual_monitor_known_monitors = dual_monitor::monitors_from_window(&gpu.window);
 
     gpu.platform
         .prepare_frame(gpu.imgui.io_mut(), &gpu.window)
@@ -690,6 +787,20 @@ fn render(gpu: &mut Gpu, state: &mut AppState) {
     if !state.window_shown {
         gpu.window.set_visible(true);
         state.window_shown = true;
+    }
+
+    // Drain any deferred dual-monitor request now that the frame is on
+    // screen. Doing this after present means the menu item's click feedback
+    // paints before the window jumps.
+    if let Some(req) = state.dual_monitor_request.take() {
+        match req {
+            DualMonitorRequest::Toggle => toggle_dual_monitor(gpu, state),
+            DualMonitorRequest::EnterPair(pair) => {
+                enter_dual_monitor_with_pair(gpu, state, pair);
+            }
+            DualMonitorRequest::Exit => exit_dual_monitor(gpu),
+        }
+        gpu.window.request_redraw();
     }
 
     // Recompute "any animation in flight?" for the active session — drives
@@ -915,6 +1026,50 @@ fn menu_bar(ui: &imgui::Ui, state: &mut AppState) {
             {
                 cycle_tab(state, -1);
             }
+            ui.separator();
+            let is_two_way = active_mode(state) == Some(TabMode::TwoWay);
+            let dual_on = state.dual_monitor_active;
+            if ui
+                .menu_item_config("Dual-Monitor Mode")
+                .shortcut("F11")
+                .selected(dual_on)
+                .enabled(is_two_way || dual_on)
+                .build()
+            {
+                state.dual_monitor_request = Some(DualMonitorRequest::Toggle);
+            }
+            ui.menu_with_enabled("Dual-Monitor", is_two_way || dual_on, || {
+                let monitors = state.dual_monitor_known_monitors.clone();
+                let pairs = dual_monitor::adjacent_pairs(&monitors);
+                if pairs.is_empty() {
+                    ui.menu_item_config("(no adjacent pair available)")
+                        .enabled(false)
+                        .build();
+                    return;
+                }
+                for pair in pairs {
+                    let label = dual_monitor::pair_label(&pair);
+                    let active_pair = state
+                        .dual_monitor_current_pair
+                        .map(|p| p == pair)
+                        .unwrap_or(false);
+                    if ui
+                        .menu_item_config(&label)
+                        .selected(active_pair)
+                        .build()
+                    {
+                        state.dual_monitor_request =
+                            Some(DualMonitorRequest::EnterPair(pair));
+                    }
+                }
+                if dual_on {
+                    ui.separator();
+                    if ui.menu_item("Exit Dual-Monitor Mode") {
+                        state.dual_monitor_request =
+                            Some(DualMonitorRequest::Exit);
+                    }
+                }
+            });
         });
 
         // Right-aligned status text in the menu bar — replaces the old
@@ -935,6 +1090,12 @@ fn menu_bar(ui: &imgui::Ui, state: &mut AppState) {
 
 fn keyboard_shortcuts(ui: &imgui::Ui, state: &mut AppState) {
     use imgui::Key;
+    if ui.is_key_pressed(Key::F11) {
+        let is_two_way = active_mode(state) == Some(TabMode::TwoWay);
+        if is_two_way || state.dual_monitor_active {
+            state.dual_monitor_request = Some(DualMonitorRequest::Toggle);
+        }
+    }
     let io = ui.io();
     let ctrl = io.key_ctrl;
     let shift = io.key_shift;
