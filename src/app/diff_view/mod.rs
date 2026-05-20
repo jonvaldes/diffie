@@ -234,11 +234,12 @@ pub fn render(
     let prev_right_target_for_sync = state.target_right_scroll;
 
     let focused_pid = focused_pane.map(crate::app::search_ui::PaneId::from_focused);
+    let focus_event: Cell<Option<crate::app::FocusedPane>> = Cell::new(None);
 
     let (left_widget_rect, left_scroll_y) = render_pane(
         ui, state, left_pos, pane_w, pane_h, Side::Left, session_id,
         pending_edits, hunks, anchors, &hover_left,
-        a_highlights, lh, search, focused_pid,
+        a_highlights, lh, search, focused_pid, &focus_event,
         read_only,
     );
 
@@ -265,9 +266,13 @@ pub fn render(
     let (right_widget_rect, right_scroll_y) = render_pane(
         ui, state, right_pos, pane_w, pane_h, Side::Right, session_id,
         pending_edits, hunks, anchors, &hover_right,
-        b_highlights, lh, search, focused_pid,
+        b_highlights, lh, search, focused_pid, &focus_event,
         read_only,
     );
+
+    if let Some(p) = focus_event.get() {
+        *focus_request = Some(p);
+    }
 
     let prev_left_target = prev_left_target_for_sync;
     let prev_right_target = prev_right_target_for_sync;
@@ -483,7 +488,6 @@ pub fn render(
     // Reserve space so subsequent widgets land below the panes.
     ui.set_cursor_screen_pos([panes_top_left[0], panes_top_left[1] + pane_h]);
 
-    let _ = focus_request;
 }
 
 
@@ -505,6 +509,7 @@ fn render_pane(
     lh: f32,
     search: &mut crate::app::search_ui::AppSearch,
     focused_pid: Option<crate::app::search_ui::PaneId>,
+    focus_event: &Cell<Option<crate::app::FocusedPane>>,
     read_only: bool,
 ) -> ([f32; 4], f32) {
     let g_w = gutter_w();
@@ -847,6 +852,9 @@ fn render_pane(
     drop(_wp);
 
     let widget_active = widget_active_cell.get();
+    if widget_active {
+        focus_event.set(Some(side.as_focused_pane()));
+    }
     let buf_clone = new_buf_cell.take();
     let scroll_y_out = own_scroll;
     let scroll_x_out = scroll_x_cell.get();
