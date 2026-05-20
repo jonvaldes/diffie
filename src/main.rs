@@ -20,6 +20,13 @@ fn main() {
 
     let initial = match args.len() {
         0 => None,
+        1 => match diffie_lib::swarm::url::parse(args[0]) {
+            Ok(u) => Some(diffie_lib::app::InitialOpen::Swarm(u)),
+            Err(_) => {
+                print_usage(prog, &mut std::io::stderr());
+                std::process::exit(2);
+            }
+        },
         2 => Some(diffie_lib::app::InitialOpen::TwoWay {
             a: PathBuf::from(args[0]),
             b: PathBuf::from(args[1]),
@@ -45,6 +52,7 @@ fn print_usage<W: std::io::Write>(prog: &str, out: &mut W) {
     let _ = writeln!(out, "  {prog}                                  Launch with no session");
     let _ = writeln!(out, "  {prog} <fileA> <fileB>                  Open a 2-way diff");
     let _ = writeln!(out, "  {prog} <base> <fileA> <fileB> <result>  Open a 3-way merge");
+    let _ = writeln!(out, "  {prog} <swarm-url>                       Open a Swarm review or changelist");
 }
 
 #[cfg(not(feature = "gui"))]

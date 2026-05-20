@@ -112,6 +112,7 @@ pub enum InitialOpen {
         /// path is just recorded so Ctrl+S writes there without prompting.
         result: PathBuf,
     },
+    Swarm(crate::swarm::url::SwarmUrl),
 }
 
 pub fn run() {
@@ -214,6 +215,7 @@ struct AppState {
     /// CLI-supplied session to open on the first frame. Drained inside
     /// `frame_ui` once the GPU / imgui context is up.
     pending_initial: Option<InitialOpen>,
+    pending_swarm: Option<crate::swarm::url::SwarmUrl>,
     /// True when something needs to keep redrawing as fast as possible —
     /// e.g. mid-ease scroll. Recomputed at the end of every frame from the
     /// per-session view states. Used by the event loop to switch between
@@ -303,6 +305,7 @@ impl Default for AppState {
             last_window_title: String::new(),
             window_shown: false,
             pending_initial: None,
+            pending_swarm: None,
             animating: false,
             last_blink_request: Instant::now(),
             last_input_at: Instant::now(),
@@ -860,6 +863,7 @@ fn frame_ui(ui: &imgui::Ui, state: &mut AppState) {
             InitialOpen::ThreeWay { base, local, remote, result } => {
                 open_three_way_paths_with_result(state, base, local, remote, Some(result));
             }
+            InitialOpen::Swarm(url) => { state.pending_swarm = Some(url); }
         }
     }
     keyboard_shortcuts(ui, state);
