@@ -159,6 +159,8 @@ fn run_frame_with_wgpu(
                 &[],
                 &mut search,
                 None,
+                false,
+                [crate::app::SideDisplay::Normal; 2],
             );
         });
     let draw_data = ctx.render();

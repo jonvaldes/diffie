@@ -508,7 +508,11 @@ pub(super) fn draw_control_overlay(
     hunks: &[Hunk],
     side: Side,
     pending_jump_out: &Cell<Option<PendingJump>>,
+    read_only: bool,
 ) {
+    if read_only {
+        return;
+    }
     let hunk = hunks.iter().find(|h| h.id == hunk_id);
     let move_id = hunk.and_then(hunk_move_id);
     let paired = move_id.and_then(|id| find_paired_hunk(hunks, id, side));

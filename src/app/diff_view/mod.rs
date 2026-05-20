@@ -160,6 +160,8 @@ pub fn render(
     b_highlights: &[crate::app::syntax::LineSpans],
     search: &mut crate::app::search_ui::AppSearch,
     focused_pane: Option<crate::app::FocusedPane>,
+    read_only: bool,
+    side_display: [crate::app::SideDisplay; 2],
 ) {
     // Sync buffers from session at frame start.
     let snap = match store.snapshot(session_id) {
@@ -237,6 +239,7 @@ pub fn render(
         ui, state, left_pos, pane_w, pane_h, Side::Left, session_id,
         pending_edits, hunks, anchors, &hover_left,
         a_highlights, lh, search, focused_pid,
+        read_only,
     );
 
     // Connector strip: split into left rail / middle / right rail.
@@ -263,6 +266,7 @@ pub fn render(
         ui, state, right_pos, pane_w, pane_h, Side::Right, session_id,
         pending_edits, hunks, anchors, &hover_right,
         b_highlights, lh, search, focused_pid,
+        read_only,
     );
 
     let prev_left_target = prev_left_target_for_sync;
@@ -436,15 +440,42 @@ pub fn render(
     if let Some((hid, pos)) = hover_left.get() {
         overlay::draw_control_overlay(
             ui, session_id, hid, pos, lh, pending_edits, hunks, Side::Left,
-            &pending_jump_cell,
+            &pending_jump_cell, read_only,
         );
     }
     if let Some((hid, pos)) = hover_right.get() {
         overlay::draw_control_overlay(
             ui, session_id, hid, pos, lh, pending_edits, hunks, Side::Right,
-            &pending_jump_cell,
+            &pending_jump_cell, read_only,
         );
     }
+
+    // Side-display overlay: paint a centered placeholder over panes whose
+    // side_display is non-Normal (Swarm "added"/"deleted"/"binary").
+    let dl = ui.get_foreground_draw_list();
+    for (i, sd) in side_display.iter().enumerate() {
+        let msg = match sd {
+            crate::app::SideDisplay::Normal => continue,
+            crate::app::SideDisplay::Added => "(added in this change)",
+            crate::app::SideDisplay::Deleted => "(deleted in this change)",
+            crate::app::SideDisplay::Binary => "(binary file - not diffed)",
+        };
+        let pane_pos = if i == 0 { left_pos } else { right_pos };
+        let ts = ui.calc_text_size(msg);
+        let cx = pane_pos[0] + (pane_w - ts[0]) * 0.5;
+        let cy = pane_pos[1] + (pane_h - ts[1]) * 0.5;
+        // Background panel for legibility.
+        let pad = 8.0;
+        dl.add_rect(
+            [cx - pad, cy - pad],
+            [cx + ts[0] + pad, cy + ts[1] + pad],
+            super::theme::with_alpha(super::theme::MANTLE(), 0.92),
+        )
+        .filled(true)
+        .build();
+        dl.add_text([cx, cy], super::theme::TEXT(), msg);
+    }
+
     if let Some(j) = pending_jump_cell.get() {
         state.pending_jump = Some(j);
     }
@@ -474,6 +505,7 @@ fn render_pane(
     lh: f32,
     search: &mut crate::app::search_ui::AppSearch,
     focused_pid: Option<crate::app::search_ui::PaneId>,
+    read_only: bool,
 ) -> ([f32; 4], f32) {
     let g_w = gutter_w();
     let widget_pos = [pane_pos[0] + g_w, pane_pos[1]];
@@ -787,7 +819,7 @@ fn render_pane(
                 // `set_item_allow_overlap`). BeginDisabled blocks all input
                 // to subsequent items; visuals are unaffected here because
                 // we paint text/caret ourselves on the foreground draw list.
-                unsafe { imgui::sys::igBeginDisabled(scrollbar_grabbing) };
+                unsafe { imgui::sys::igBeginDisabled(scrollbar_grabbing || read_only) };
                 let changed = ui
                     .input_text_multiline(&widget_id, buf, [inner_w, pane_h])
                     .no_undo_redo(true)

@@ -1020,10 +1020,11 @@ fn menu_bar(ui: &imgui::Ui, state: &mut AppState) {
             let has_session = state.active.is_some();
             let is_two_way = active_mode(state) == Some(TabMode::TwoWay);
             let is_three_way = active_mode(state) == Some(TabMode::ThreeWay);
+            let is_ro = is_active_session_readonly(state);
             if ui
                 .menu_item_config("Save File A")
                 .shortcut("Ctrl+S")
-                .enabled(is_two_way)
+                .enabled(is_two_way && !is_ro)
                 .build()
             {
                 save_two_way_side(state, crate::session::TwoWaySide::A);
@@ -1031,7 +1032,7 @@ fn menu_bar(ui: &imgui::Ui, state: &mut AppState) {
             if ui
                 .menu_item_config("Save File B")
                 .shortcut("Ctrl+Shift+S")
-                .enabled(is_two_way)
+                .enabled(is_two_way && !is_ro)
                 .build()
             {
                 save_two_way_side(state, crate::session::TwoWaySide::B);
@@ -1039,14 +1040,14 @@ fn menu_bar(ui: &imgui::Ui, state: &mut AppState) {
             if ui
                 .menu_item_config("Save Result")
                 .shortcut("Ctrl+S")
-                .enabled(is_three_way)
+                .enabled(is_three_way && !is_ro)
                 .build()
             {
                 save_result(state);
             }
             if ui
                 .menu_item_config("Save Result As…")
-                .enabled(is_three_way)
+                .enabled(is_three_way && !is_ro)
                 .build()
             {
                 save_result_as(state);
@@ -1079,10 +1080,11 @@ fn menu_bar(ui: &imgui::Ui, state: &mut AppState) {
                 .and_then(|id| state.undo_stacks.get(&id))
                 .map(|r| (r.can_undo(), r.can_redo()))
                 .unwrap_or((false, false));
+            let is_ro = is_active_session_readonly(state);
             if ui
                 .menu_item_config("Undo")
                 .shortcut("Ctrl+Z")
-                .enabled(can_undo)
+                .enabled(can_undo && !is_ro)
                 .build()
             {
                 do_undo(state);
@@ -1090,7 +1092,7 @@ fn menu_bar(ui: &imgui::Ui, state: &mut AppState) {
             if ui
                 .menu_item_config("Redo")
                 .shortcut("Ctrl+Shift+Z")
-                .enabled(can_redo)
+                .enabled(can_redo && !is_ro)
                 .build()
             {
                 do_redo(state);
@@ -1854,6 +1856,14 @@ fn active_mode(state: &AppState) -> Option<TabMode> {
     state.tabs.iter().find(|t| t.session_id == id).map(|t| t.mode)
 }
 
+fn is_active_session_readonly(state: &AppState) -> bool {
+    state
+        .active
+        .and_then(|id| state.sessions.snapshot(id).ok())
+        .map(|s| s.read_only)
+        .unwrap_or(false)
+}
+
 fn save_two_way_side(state: &mut AppState, side: crate::session::TwoWaySide) {
     let Some(id) = state.active else {
         return;
@@ -2435,6 +2445,13 @@ fn current_session_summary(ui: &imgui::Ui, state: &mut AppState) {
             let view_state = state.diff_views.entry(id).or_default();
             let mut focus_request: Option<FocusedPane> = None;
             let mut pending_edits: Vec<undo_stack::DiffEdit> = Vec::new();
+            let ro = snap.read_only;
+            let sd = state
+                .tabs
+                .iter()
+                .find(|t| t.session_id == id)
+                .map(|t| t.side_display)
+                .unwrap_or([SideDisplay::Normal; 2]);
             diff_view::render(
                 ui,
                 store,
@@ -2450,13 +2467,15 @@ fn current_session_summary(ui: &imgui::Ui, state: &mut AppState) {
                 &b_highlights,
                 search,
                 focused_for_session,
+                ro,
+                sd,
             );
             if let Some(p) = focus_request {
                 state.focused = Some((id, p));
             }
             // Apply queued mutations via the per-session undo stack so each
             // operation is reversible via Edit > Undo / Redo.
-            if !pending_edits.is_empty() {
+            if !pending_edits.is_empty() && !snap.read_only {
                 let record = state.undo_stacks.entry(id).or_default();
                 let mut needs_epoch_bump = false;
                 for edit in pending_edits {
