@@ -35,6 +35,7 @@ mod recents;
 mod result_pane;
 pub mod search_ui;
 mod swarm_creds;
+mod swarm_login;
 mod syntax;
 mod syntax_paint;
 mod theme;
@@ -216,6 +217,10 @@ struct AppState {
     /// `frame_ui` once the GPU / imgui context is up.
     pending_initial: Option<InitialOpen>,
     pending_swarm: Option<crate::swarm::url::SwarmUrl>,
+    swarm_auth: Option<swarm_login::SwarmAuth>,
+    swarm_loader: Option<crate::swarm::loader::LoaderHandle>,
+    swarm_progress: Option<(usize, usize)>,
+    swarm_info_meta: HashMap<SessionId, crate::swarm::model::ReviewMeta>,
     /// True when something needs to keep redrawing as fast as possible —
     /// e.g. mid-ease scroll. Recomputed at the end of every frame from the
     /// per-session view states. Used by the event loop to switch between
@@ -306,6 +311,10 @@ impl Default for AppState {
             window_shown: false,
             pending_initial: None,
             pending_swarm: None,
+            swarm_auth: None,
+            swarm_loader: None,
+            swarm_progress: None,
+            swarm_info_meta: HashMap::new(),
             animating: false,
             last_blink_request: Instant::now(),
             last_input_at: Instant::now(),
@@ -866,6 +875,30 @@ fn frame_ui(ui: &imgui::Ui, state: &mut AppState) {
             InitialOpen::Swarm(url) => { state.pending_swarm = Some(url); }
         }
     }
+
+    // Promote pending Swarm URL into an auth state machine.
+    if let Some(url) = state.pending_swarm.take() {
+        state.swarm_auth = Some(swarm_login::SwarmAuth::new(url));
+    }
+
+    // Drive the Swarm login modal if active.
+    if let Some(auth) = state.swarm_auth.as_mut() {
+        let consumed = swarm_login::render(ui, auth);
+        if consumed {
+            match state.swarm_auth.take().unwrap() {
+                swarm_login::SwarmAuth::Ready { url, user, ticket } => {
+                    let api: std::sync::Arc<dyn crate::swarm::client::SwarmApi> =
+                        std::sync::Arc::new(crate::swarm::client::Client::new(
+                            url.host.clone(), user, ticket,
+                        ));
+                    state.swarm_loader = Some(crate::swarm::loader::spawn(api, url));
+                }
+                swarm_login::SwarmAuth::Cancelled => state.quit_requested = true,
+                swarm_login::SwarmAuth::Pending { .. } => {}
+            }
+        }
+    }
+
     keyboard_shortcuts(ui, state);
     menu_bar(ui, state);
     preferences_modal(ui, state);
