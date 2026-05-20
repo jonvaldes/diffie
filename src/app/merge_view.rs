@@ -799,7 +799,6 @@ fn render_pane(
     };
     let matches =
         crate::app::search_ui::compute_and_register(search, pane_id, buf_for_paint);
-    let char_adv = ui.calc_text_size("m")[0].max(1.0);
     let frame_pad_paint = ui.clone_style().frame_padding;
     crate::app::search_ui::paint_highlights(
         ui,
@@ -810,7 +809,7 @@ fn render_pane(
         scroll_y_out,
         scroll_x_out,
         lh,
-        char_adv,
+        buf_for_paint,
         frame_pad_paint,
     );
     let vbar_rect = [vbar_x_l, widget_pos[1], vbar_x_r, widget_pos[1] + pane_h];

@@ -234,8 +234,10 @@ pub fn compute_and_register(
 /// are painted by the caller on top; the soft fill bleeds through enough
 /// for the text to stay legible.
 ///
-/// `char_advance` is the per-character pixel width of the monospace font.
-/// `pane_id` is used to find the "current" match within `current`.
+/// `buf` is the full pane text — needed so x positions can be derived from
+/// `calc_text_size(prefix)`, the same metric the text painter uses. A
+/// per-character advance would mis-place rectangles on lines containing
+/// tabs (which imgui expands to several cells).
 #[allow(clippy::too_many_arguments)]
 pub fn paint_highlights(
     ui: &imgui::Ui,
@@ -246,7 +248,7 @@ pub fn paint_highlights(
     scroll_y: f32,
     scroll_x: f32,
     lh: f32,
-    char_advance: f32,
+    buf: &str,
     frame_pad: [f32; 2],
 ) {
     if matches.is_empty() {
@@ -264,8 +266,16 @@ pub fn paint_highlights(
             if y1 < clip_y0 || y0 > clip_y1 {
                 continue;
             }
-            let x0 = widget_rect[0] + frame_pad[0] + m.start_col as f32 * char_advance - scroll_x;
-            let x1 = widget_rect[0] + frame_pad[0] + m.end_col as f32 * char_advance - scroll_x;
+            let line_start = buf[..m.byte_start.min(buf.len())]
+                .rfind('\n')
+                .map(|p| p + 1)
+                .unwrap_or(0);
+            let prefix = &buf[line_start..m.byte_start.min(buf.len())];
+            let match_text = &buf[m.byte_start.min(buf.len())..m.byte_end.min(buf.len())];
+            let prefix_w = ui.calc_text_size(prefix)[0];
+            let match_w = ui.calc_text_size(match_text)[0];
+            let x0 = widget_rect[0] + frame_pad[0] + prefix_w - scroll_x;
+            let x1 = x0 + match_w;
             let is_current = current == Some((pane, i));
             let color = if is_current { CURRENT_MATCH_FILL } else { MATCH_FILL };
             dl.add_rect([x0, y0], [x1, y1], color).filled(true).build();

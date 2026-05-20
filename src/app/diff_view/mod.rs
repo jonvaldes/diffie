@@ -928,7 +928,6 @@ fn render_pane(
         Side::Right => crate::app::search_ui::PaneId::TwoWayB,
     };
     let matches = crate::app::search_ui::compute_and_register(search, pane_id, buf_for_paint);
-    let char_adv = ui.calc_text_size("m")[0].max(1.0);
     let frame_pad_paint = ui.clone_style().frame_padding;
     crate::app::search_ui::paint_highlights(
         ui,
@@ -939,7 +938,7 @@ fn render_pane(
         scroll_y_out,
         scroll_x_out,
         lh,
-        char_adv,
+        buf_for_paint,
         frame_pad_paint,
     );
 

@@ -331,7 +331,6 @@ pub fn render(
 
     // Search highlights + scrollbar ticks over the merged buffer.
     {
-        let char_adv = ui.calc_text_size("m")[0].max(1.0);
         let widget_rect = [
             widget_pos[0],
             widget_pos[1],
@@ -348,7 +347,7 @@ pub fn render(
             scroll_y,
             0.0,
             lh,
-            char_adv,
+            &state.buffer,
             style.frame_padding,
         );
         // Native scrollbar lives on the right edge of the outer child window.
