@@ -34,6 +34,7 @@ pub mod three_way_header;
 mod recents;
 mod result_pane;
 pub mod search_ui;
+mod swarm_creds;
 mod syntax;
 mod syntax_paint;
 mod theme;
