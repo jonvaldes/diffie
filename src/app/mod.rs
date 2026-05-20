@@ -2315,11 +2315,53 @@ fn save_three_way_side(state: &mut AppState, id: SessionId, idx: usize) {
     }
 }
 
+fn render_swarm_info_active(ui: &imgui::Ui, state: &mut AppState, id: SessionId) {
+    let Some(meta) = state.swarm_info_meta.get(&id).cloned() else {
+        ui.text_disabled("Swarm info unavailable.");
+        return;
+    };
+    // Build the file-row list from currently-open Swarm file tabs.
+    let file_rows: Vec<swarm_info_view::InfoFileRow> = state.tabs.iter()
+        .filter(|t| t.mode == TabMode::TwoWay && state.swarm_file_actions.contains_key(&t.session_id))
+        .map(|t| swarm_info_view::InfoFileRow {
+            depot_path: t.label.clone(),
+            action_label: state.swarm_file_actions.get(&t.session_id).cloned().unwrap_or_default(),
+            session_id: Some(t.session_id),
+        })
+        .collect();
+    let mut click_index: Option<usize> = None;
+    let mut open_in_browser = false;
+    swarm_info_view::render(ui, swarm_info_view::InfoContext {
+        meta: &meta,
+        progress: state.swarm_progress,
+        file_rows: &file_rows,
+        click_index: &mut click_index,
+        open_in_browser: &mut open_in_browser,
+    });
+    if let Some(i) = click_index {
+        if let Some(row) = file_rows.get(i) {
+            if let Some(sid) = row.session_id {
+                state.active = Some(sid);
+            }
+        }
+    }
+    if open_in_browser {
+        let _ = open::that(&meta.url);
+    }
+}
+
 fn current_session_summary(ui: &imgui::Ui, state: &mut AppState) {
     let Some(id) = state.active else {
         ui.text_disabled("No session open. Open two files (2-way) or three files (3-way) to begin.");
         return;
     };
+    // SwarmInfo tabs have no backing DiffSession; render them via a
+    // dedicated path and return.
+    let tab_mode = state.tabs.iter().find(|t| t.session_id == id).map(|t| t.mode);
+    if matches!(tab_mode, Some(TabMode::SwarmInfo)) {
+        render_swarm_info_active(ui, state, id);
+        return;
+    }
     let snap = match state.sessions.snapshot(id) {
         Ok(s) => s,
         Err(e) => {
