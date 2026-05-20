@@ -42,6 +42,7 @@ gui = [
     "dep:ureq",
     "dep:base64",
     "dep:keyring",
+    "dep:open",
 ]
 
 [dependencies]
@@ -57,7 +58,7 @@ regex = "1"
 url = "2"
 
 # gui (gated by `gui` feature)
-imgui = { version = "0.12", optional = true }
+imgui = { version = "0.12", optional = true, features = ["tables-api"] }
 imgui-winit-support = { version = "0.13", optional = true }
 imgui-wgpu = { version = "0.28", optional = true }
 winit = { version = "0.30", features = ["x11", "wayland", "wayland-csd-adwaita", "wayland-dlopen", "rwh_06"], optional = true }
@@ -83,6 +84,7 @@ tree-sitter-toml-ng = { version = "0.7", optional = true }
 ureq = { version = "2", default-features = false, features = ["tls", "json"], optional = true }
 base64 = { version = "0.22", optional = true }
 keyring = { version = "3", optional = true, features = ["apple-native", "windows-native", "sync-secret-service"] }
+open = { version = "5", optional = true }
 
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"

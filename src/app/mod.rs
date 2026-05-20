@@ -35,6 +35,7 @@ mod recents;
 mod result_pane;
 pub mod search_ui;
 mod swarm_creds;
+mod swarm_info_view;
 mod swarm_login;
 mod syntax;
 mod syntax_paint;
@@ -131,6 +132,7 @@ pub fn run_with(initial: Option<InitialOpen>) {
 enum TabMode {
     TwoWay,
     ThreeWay,
+    SwarmInfo,
 }
 
 #[derive(Clone, Debug)]
@@ -1498,6 +1500,7 @@ fn tab_bar(ui: &imgui::Ui, state: &mut AppState) {
         let badge = match tab.mode {
             TabMode::TwoWay => "\u{f0ec}",
             TabMode::ThreeWay => "\u{f126}",
+            TabMode::SwarmInfo => "\u{f05a}",
         };
         let label_text = format!("{badge}  {}", tab.label);
         let label_size = ui.calc_text_size(&label_text);
@@ -1941,6 +1944,8 @@ fn pane_header_bar(ui: &imgui::Ui, state: &mut AppState, id: SessionId) -> Optio
                 (Some(ThreeWaySide::Local), "LOCAL"),
             ],
         ),
+        // Swarm info tab has no diff panes; placeholder until Task 11 wires it.
+        TabMode::SwarmInfo => (0, &[]),
     };
     if state.tabs[tab_idx].path_inputs.len() < segments {
         state.tabs[tab_idx]
@@ -2122,6 +2127,8 @@ fn browse_replace_side_at(state: &mut AppState, id: SessionId, idx: usize) {
                 pretty_basename(t.paths.get(1))
             ),
             TabMode::ThreeWay => pretty_basename(t.paths.get(1)),
+            // Swarm info tab has no editable sides; no-op.
+            TabMode::SwarmInfo => t.label.clone(),
         };
     }
     // Bump the input epoch so imgui re-initialises the multiline text edit
@@ -2137,6 +2144,8 @@ fn browse_replace_side_at(state: &mut AppState, id: SessionId, idx: usize) {
                 v.input_epoch = v.input_epoch.wrapping_add(1);
             }
         }
+        // Swarm info tab has no diff/merge view; no-op.
+        TabMode::SwarmInfo => {}
     }
     state.status = format!("loaded: {}", path.display());
 }
@@ -2201,6 +2210,8 @@ fn load_typed_path_into_side(state: &mut AppState, id: SessionId, idx: usize, pa
                 pretty_basename(t.paths.get(1))
             ),
             TabMode::ThreeWay => pretty_basename(t.paths.get(1)),
+            // Swarm info tab has no editable sides; no-op.
+            TabMode::SwarmInfo => t.label.clone(),
         };
     }
     match mode {
@@ -2214,6 +2225,8 @@ fn load_typed_path_into_side(state: &mut AppState, id: SessionId, idx: usize, pa
                 v.input_epoch = v.input_epoch.wrapping_add(1);
             }
         }
+        // Swarm info tab has no diff/merge view; no-op.
+        TabMode::SwarmInfo => {}
     }
     state.status = format!("loaded: {}", path.display());
 }
@@ -2661,6 +2674,9 @@ fn compute_window_title(state: &AppState) -> String {
                 .unwrap_or_else(|| pretty_basename(tab.paths.get(1)));
             format!("Diffie \u{2014} {name}")
         }
+        // Swarm info tab uses the tab label as title suffix until Task 11
+        // wires the proper review/changelist title.
+        TabMode::SwarmInfo => format!("Diffie \u{2014} {}", tab.label),
     }
 }
 
