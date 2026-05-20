@@ -335,6 +335,41 @@ impl SessionStore {
         Ok(id)
     }
 
+    /// Constructs a read-only 2-way session for Swarm-loaded files.
+    /// `Binary`/`Empty` sides are stored as empty strings; the GUI layer
+    /// overlays a placeholder message based on the per-tab display state.
+    pub fn open_two_way_readonly(
+        &self,
+        a_text: String,
+        b_text: String,
+        a_trailing_newline: bool,
+        b_trailing_newline: bool,
+        engine: Option<String>,
+        options: DiffOptions,
+    ) -> Result<SessionId, SessionError> {
+        let engine = engine.unwrap_or_else(default_engine_name);
+        let hunks = recompute_two_way(&engine, &a_text, &b_text, &[], &options)?;
+        let id = self.alloc_id();
+        let s = DiffSession {
+            id, engine, options,
+            mode: SessionMode::TwoWay {
+                a_text, b_text,
+                a_trailing_newline, b_trailing_newline,
+                anchors: vec![],
+                hunks,
+                decisions: HashMap::new(),
+            },
+            manual_result: None,
+            read_only: true,
+        };
+        self.sessions.lock().unwrap().insert(id, s);
+        Ok(id)
+    }
+
+    /// Allocates a SessionId without a backing DiffSession — used for the
+    /// Swarm info tab which has no diff state.
+    pub fn next_swarm_info_id(&self) -> SessionId { self.alloc_id() }
+
     pub fn open_three_way(
         &self,
         base_text: &str,

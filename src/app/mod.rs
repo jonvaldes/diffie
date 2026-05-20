@@ -135,6 +135,14 @@ enum TabMode {
     SwarmInfo,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub enum SideDisplay {
+    Normal,
+    Added,
+    Deleted,
+    Binary,
+}
+
 #[derive(Clone, Debug)]
 struct Tab {
     session_id: SessionId,
@@ -154,6 +162,9 @@ struct Tab {
     /// the header strip. Parallel to `paths`; rewritten whenever `paths`
     /// changes (browse dialog, CLI open).
     path_inputs: Vec<String>,
+    /// For Swarm-loaded 2-way tabs: per-side overlay state (added/deleted/binary).
+    /// For non-Swarm tabs and the info tab itself, both entries are `Normal`.
+    side_display: [SideDisplay; 2],
 }
 
 struct AppState {
@@ -223,6 +234,8 @@ struct AppState {
     swarm_loader: Option<crate::swarm::loader::LoaderHandle>,
     swarm_progress: Option<(usize, usize)>,
     swarm_info_meta: HashMap<SessionId, crate::swarm::model::ReviewMeta>,
+    /// Per file-tab: the action label shown in the info tab's file list.
+    swarm_file_actions: std::collections::HashMap<SessionId, String>,
     /// True when something needs to keep redrawing as fast as possible —
     /// e.g. mid-ease scroll. Recomputed at the end of every frame from the
     /// per-session view states. Used by the event loop to switch between
@@ -317,6 +330,7 @@ impl Default for AppState {
             swarm_loader: None,
             swarm_progress: None,
             swarm_info_meta: HashMap::new(),
+            swarm_file_actions: std::collections::HashMap::new(),
             animating: false,
             last_blink_request: Instant::now(),
             last_input_at: Instant::now(),
@@ -897,6 +911,34 @@ fn frame_ui(ui: &imgui::Ui, state: &mut AppState) {
                 }
                 swarm_login::SwarmAuth::Cancelled => state.quit_requested = true,
                 swarm_login::SwarmAuth::Pending { .. } => {}
+            }
+        }
+    }
+
+    // Drain Swarm loader events.
+    if let Some(handle) = state.swarm_loader.as_ref() {
+        let mut events = Vec::new();
+        while let Ok(ev) = handle.rx.try_recv() {
+            events.push(ev);
+        }
+        for ev in events {
+            use crate::swarm::loader::LoaderEvent as E;
+            match ev {
+                E::MetaReady(meta) => open_swarm_info_tab(state, meta),
+                E::FileTotalKnown(n) => state.swarm_progress = Some((0, n)),
+                E::FileReady { entry, left, right } => {
+                    open_swarm_file_tab(state, entry, left, right);
+                    if let Some((d, t)) = state.swarm_progress.as_mut() {
+                        *d += 1; if *d > *t { *d = *t; }
+                    }
+                }
+                E::FileFailed { depot_path, error } => {
+                    state.status = format!("Swarm: {depot_path}: {error}");
+                    if let Some((d, t)) = state.swarm_progress.as_mut() {
+                        *d += 1; if *d > *t { *d = *t; }
+                    }
+                }
+                E::AllDone => { /* leave handle; we just stop polling effectively */ }
             }
         }
     }
@@ -2697,6 +2739,72 @@ fn pick_file(title: &str) -> Option<PathBuf> {
 /// Open a fresh 2-way tab with two empty buffers and no bound paths.
 /// The user fills the panes via the per-pane filename field (typed
 /// path + Enter, or the `…` browse button) in the view's header strip.
+fn open_swarm_info_tab(state: &mut AppState, meta: crate::swarm::model::ReviewMeta) {
+    let id = state.sessions.next_swarm_info_id();
+    let label = match meta.kind {
+        crate::swarm::model::TargetKind::Review => format!("Review #{}", meta.id),
+        crate::swarm::model::TargetKind::Change => format!("Change #{}", meta.id),
+    };
+    state.swarm_info_meta.insert(id, meta);
+    state.tabs.push(Tab {
+        session_id: id,
+        label,
+        mode: TabMode::SwarmInfo,
+        paths: vec![],
+        result_path: None,
+        path_inputs: vec![],
+        side_display: [SideDisplay::Normal; 2],
+    });
+    state.active = Some(id);
+}
+
+fn open_swarm_file_tab(
+    state: &mut AppState,
+    entry: crate::swarm::model::FileEntry,
+    left: crate::swarm::loader::SidePayload,
+    right: crate::swarm::loader::SidePayload,
+) {
+    use crate::swarm::loader::SidePayload;
+    let (a_text, a_trailing, disp_a) = match left {
+        SidePayload::Text(t, nl) => (t, nl, SideDisplay::Normal),
+        SidePayload::Empty => (String::new(), false, SideDisplay::Added),
+        SidePayload::Binary => (String::new(), false, SideDisplay::Binary),
+    };
+    let (b_text, b_trailing, disp_b) = match right {
+        SidePayload::Text(t, nl) => (t, nl, SideDisplay::Normal),
+        SidePayload::Empty => (String::new(), false, SideDisplay::Deleted),
+        SidePayload::Binary => (String::new(), false, SideDisplay::Binary),
+    };
+    let id = state.sessions.open_two_way_readonly(
+        a_text, b_text, a_trailing, b_trailing,
+        Some(state.preferences.default_engine.clone()),
+        state.preferences.default_options,
+    ).expect("open swarm session");
+    let label = entry.depot_path
+        .rsplit('/')
+        .next()
+        .unwrap_or(&entry.depot_path)
+        .to_string();
+    let action_label = match &entry.action {
+        crate::swarm::model::FileAction::Add => "add".to_string(),
+        crate::swarm::model::FileAction::Edit => "edit".to_string(),
+        crate::swarm::model::FileAction::Delete => "delete".to_string(),
+        crate::swarm::model::FileAction::Rename { from } => format!("rename from {from}"),
+        crate::swarm::model::FileAction::Branch => "branch".to_string(),
+        crate::swarm::model::FileAction::Integrate => "integrate".to_string(),
+    };
+    state.swarm_file_actions.insert(id, action_label);
+    state.tabs.push(Tab {
+        session_id: id,
+        label,
+        mode: TabMode::TwoWay,
+        paths: vec![],
+        result_path: None,
+        path_inputs: vec![],
+        side_display: [disp_a, disp_b],
+    });
+}
+
 fn open_two_way(state: &mut AppState) {
     let engine = Some(state.preferences.default_engine.clone());
     let opts = state.preferences.default_options;
@@ -2717,6 +2825,7 @@ fn open_two_way(state: &mut AppState) {
                 paths: vec![PathBuf::new(), PathBuf::new()],
                 result_path: None,
                 path_inputs: vec![String::new(), String::new()],
+                side_display: [SideDisplay::Normal; 2],
             });
             state.active = Some(id);
             state.status = "Opened empty 2-way".into();
@@ -2767,6 +2876,7 @@ fn open_two_way_paths(state: &mut AppState, a: PathBuf, b: PathBuf) {
                 paths,
                 result_path: None,
                 path_inputs,
+                side_display: [SideDisplay::Normal; 2],
             });
             state.active = Some(id);
             state.status = format!("Opened 2-way: {label}");
@@ -2810,6 +2920,7 @@ fn open_three_way(state: &mut AppState) {
                 paths: vec![PathBuf::new(), PathBuf::new(), PathBuf::new()],
                 result_path: None,
                 path_inputs: vec![String::new(), String::new(), String::new()],
+                side_display: [SideDisplay::Normal; 2],
             });
             state.active = Some(id);
             state.status = "Opened empty 3-way".into();
@@ -2903,6 +3014,7 @@ fn open_three_way_paths_with_result(
                 paths,
                 result_path: result,
                 path_inputs,
+                side_display: [SideDisplay::Normal; 2],
             });
             state.active = Some(id);
             state.status = format!("Opened 3-way: {label}");
