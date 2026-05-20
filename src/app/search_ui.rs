@@ -55,6 +55,11 @@ pub struct AppSearch {
     pub matches: HashMap<PaneId, Vec<Match>>,
     /// Total match count across all panes this frame.
     pub total_matches: usize,
+    /// Previous frame's `total_matches`. The find bar renders before panes
+    /// register their matches for the current frame, so it consults this for
+    /// the "no results" red-background indicator — otherwise the field would
+    /// flash red on every keystroke before the next frame's panes register.
+    pub last_total_matches: usize,
     /// Set by Ctrl+F; consumed by the engine bar to focus the input.
     pub focus_request: bool,
     /// Set by Enter / F3 / Shift+F3; consumed by view code.
@@ -73,6 +78,7 @@ impl Default for AppSearch {
             compiled: Ok(None),
             matches: HashMap::new(),
             total_matches: 0,
+            last_total_matches: 0,
             focus_request: false,
             jump_request: None,
             current: None,
@@ -110,13 +116,14 @@ impl AppSearch {
         }
         match &self.compiled {
             Err(()) => true,
-            Ok(Some(_)) => self.total_matches == 0,
+            Ok(Some(_)) => self.last_total_matches == 0,
             Ok(None) => false,
         }
     }
 
     /// Clear per-frame state at the top of a frame.
     pub fn begin_frame(&mut self) {
+        self.last_total_matches = self.total_matches;
         self.matches.clear();
         self.total_matches = 0;
     }
