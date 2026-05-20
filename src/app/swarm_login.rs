@@ -73,7 +73,8 @@ pub fn render(ui: &imgui::Ui, auth: &mut SwarmAuth) -> bool {
                         return true;
                     }
                     Err(e) => {
-                        if let SwarmAuth::Pending { error, rx, .. } = auth {
+                        if let SwarmAuth::Pending { url, error, rx, .. } = auth {
+                            super::swarm_creds::clear_ticket(&url.host);
                             *error = Some(e);
                             *rx = None;
                         }
