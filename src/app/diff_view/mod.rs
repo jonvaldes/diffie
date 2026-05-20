@@ -18,7 +18,7 @@ mod overlay;
 #[cfg(test)]
 mod tests;
 
-pub use common::{DiffViewState, Side};
+pub use common::{DiffViewState, HunkNav, Side};
 pub(crate) use common::VBAR_W;
 use common::{
     build_pane_ranges, gutter_w, next_anchor_pick, rail_w, target_scroll, AnchorPick,
@@ -125,6 +125,33 @@ pub(crate) fn track_caret_scroll_x(caret_x: f32, scroll_x: f32, view_w: f32, mar
 /// pure delete), the missing side falls back to "the line right after the
 /// preceding hunk's last line" so both sides land at the same visual row
 /// when the panes scroll-sync. Returns `None` when the diff is all-equal.
+/// Pick the next/previous change hunk's (a_line, b_line) start relative to
+/// the given 1-based reference line on side A. Empty-on-a-side hunks fall
+/// back to the line right after the preceding hunk's last line, mirroring
+/// `first_change_lines` so jumps land at the same visual row on both panes.
+fn pick_change_hunk(hunks: &[Hunk], ref_a_line: i64, dir: HunkNav) -> Option<(u32, u32)> {
+    let mut anchors: Vec<(u32, u32)> = Vec::new();
+    let mut prev_a_end: u32 = 0;
+    let mut prev_b_end: u32 = 0;
+    for h in hunks {
+        let is_change = h
+            .ops
+            .iter()
+            .any(|op| matches!(op, DiffOp::Delete { .. } | DiffOp::Insert { .. }));
+        if is_change {
+            let a = if h.a_range == (0, 0) { prev_a_end + 1 } else { h.a_range.0 };
+            let b = if h.b_range == (0, 0) { prev_b_end + 1 } else { h.b_range.0 };
+            anchors.push((a, b));
+        }
+        prev_a_end = h.a_range.1.max(prev_a_end);
+        prev_b_end = h.b_range.1.max(prev_b_end);
+    }
+    match dir {
+        HunkNav::Next => anchors.into_iter().find(|(a, _)| (*a as i64) > ref_a_line),
+        HunkNav::Prev => anchors.into_iter().rev().find(|(a, _)| (*a as i64) < ref_a_line),
+    }
+}
+
 pub fn first_change_lines(hunks: &[Hunk]) -> Option<(u32, u32)> {
     let mut prev_a_end: u32 = 0;
     let mut prev_b_end: u32 = 0;
@@ -221,6 +248,18 @@ pub fn render(
                 Side::Left => state.pending_left_scroll = Some(target_y),
                 Side::Right => state.pending_right_scroll = Some(target_y),
             }
+        }
+    }
+
+    // Keyboard-driven next/prev change-hunk navigation (Ctrl+4 / Ctrl+3).
+    if let Some(dir) = state.pending_hunk_nav.take() {
+        let center_a = ((state.target_left_scroll + pane_h * 0.5) / lh).floor() as i64 + 1;
+        if let Some((a, b)) = pick_change_hunk(hunks, center_a, dir) {
+            let center = |line: u32| {
+                ((line as f32 - 1.0) * lh - pane_h * 0.5 + lh * 0.5).max(0.0)
+            };
+            state.pending_left_scroll = Some(center(a));
+            state.pending_right_scroll = Some(center(b));
         }
     }
 

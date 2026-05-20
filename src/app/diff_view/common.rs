@@ -37,6 +37,15 @@ pub(super) struct PendingJump {
     pub(super) target_line: crate::diff::LineNo,
 }
 
+/// Keyboard-driven navigation request to the next/previous change hunk,
+/// set by Ctrl+4/Ctrl+3 in `keyboard_shortcuts` and consumed inside the
+/// view's render where `lh` and the hunk list are available.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HunkNav {
+    Next,
+    Prev,
+}
+
 /// Per-session view state that must persist across frames.
 #[derive(Default)]
 pub struct DiffViewState {
@@ -93,6 +102,9 @@ pub struct DiffViewState {
     pub(super) anchor_pick: AnchorPick,
     /// Jump-to-pair target consumed on the next render.
     pub(super) pending_jump: Option<PendingJump>,
+    /// Keyboard-driven next/prev-hunk navigation, set by Ctrl+4/Ctrl+3 and
+    /// consumed on the next render.
+    pub(crate) pending_hunk_nav: Option<HunkNav>,
     /// Bumped on external buffer mutations (undo/redo, Apply A->B/B->A)
     /// and mixed into the widget ID so imgui re-initialises its
     /// stb_textedit state from `buf` instead of writing stale internal

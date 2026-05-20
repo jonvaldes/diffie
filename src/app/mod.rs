@@ -1282,6 +1282,57 @@ fn keyboard_shortcuts(ui: &imgui::Ui, state: &mut AppState) {
             do_undo(state);
         }
     }
+    if !shift {
+        let mode = active_mode(state);
+        let id = state.active;
+        // Ctrl+4 / Ctrl+3: next / previous diff hunk (both 2-way and 3-way).
+        let diff_nav = if ui.is_key_pressed(Key::Alpha4) {
+            Some(true)
+        } else if ui.is_key_pressed(Key::Alpha3) {
+            Some(false)
+        } else {
+            None
+        };
+        if let (Some(forward), Some(id)) = (diff_nav, id) {
+            match mode {
+                Some(TabMode::TwoWay) => {
+                    let v = state.diff_views.entry(id).or_default();
+                    v.pending_hunk_nav = Some(if forward {
+                        diff_view::HunkNav::Next
+                    } else {
+                        diff_view::HunkNav::Prev
+                    });
+                }
+                Some(TabMode::ThreeWay) => {
+                    let v = state.merge_views.entry(id).or_default();
+                    v.pending_hunk_nav = Some(if forward {
+                        merge_view::HunkNav3::NextDiff
+                    } else {
+                        merge_view::HunkNav3::PrevDiff
+                    });
+                }
+                _ => {}
+            }
+        }
+        // Ctrl+2 / Ctrl+1: next / previous conflict (3-way only).
+        let conflict_nav = if ui.is_key_pressed(Key::Alpha2) {
+            Some(true)
+        } else if ui.is_key_pressed(Key::Alpha1) {
+            Some(false)
+        } else {
+            None
+        };
+        if let (Some(forward), Some(id)) = (conflict_nav, id) {
+            if matches!(mode, Some(TabMode::ThreeWay)) {
+                let v = state.merge_views.entry(id).or_default();
+                v.pending_hunk_nav = Some(if forward {
+                    merge_view::HunkNav3::NextConflict
+                } else {
+                    merge_view::HunkNav3::PrevConflict
+                });
+            }
+        }
+    }
 }
 
 /// Clear the font atlas and re-add the UI font + code font.

@@ -92,6 +92,10 @@ pub struct MergeViewState {
     /// Pending scroll value to apply next frame on a given pane. Slot 3 is
     /// the result pane (consumed by `result_pane::render`).
     pub pending: [Option<f32>; 4],
+    /// Keyboard-driven next/prev hunk navigation, set by Ctrl+4/Ctrl+3 (any
+    /// non-Stable hunk) or Ctrl+2/Ctrl+1 (Conflict only). Consumed inside
+    /// `render` once `lh` and the per-pane layout are known.
+    pub pending_hunk_nav: Option<HunkNav3>,
     /// First-frame focus line (1-based) per pane. Set by the open path to
     /// the first non-Stable hunk's start so the user lands at the first
     /// difference. Resolved to a `pending` scroll inside the pane render
@@ -116,6 +120,17 @@ impl MergeViewState {
         const EPS: f32 = 0.5;
         (0..4).any(|i| (self.target[i] - self.last[i]).abs() > EPS)
     }
+}
+
+/// Keyboard navigation request for the 3-way view. `NextDiff`/`PrevDiff` step
+/// through any non-Stable hunk (Ctrl+4 / Ctrl+3); `NextConflict`/`PrevConflict`
+/// restrict to `Conflict` hunks only (Ctrl+2 / Ctrl+1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HunkNav3 {
+    NextDiff,
+    PrevDiff,
+    NextConflict,
+    PrevConflict,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -201,6 +216,30 @@ pub fn first_change_lines(hunks: &[MergeHunk]) -> Option<(u32, u32, u32)> {
         }
     }
     None
+}
+
+/// From a pane's layout, pick the hunk id of the next/previous navigable
+/// hunk relative to a 1-based reference line. The filter (any diff vs.
+/// conflict-only) is encoded in `nav`.
+fn pick_nav_hunk(layout: &PaneLayout, ref_line: i64, nav: HunkNav3) -> Option<u32> {
+    let conflict_only = matches!(nav, HunkNav3::NextConflict | HunkNav3::PrevConflict);
+    let forward = matches!(nav, HunkNav3::NextDiff | HunkNav3::NextConflict);
+    let filtered: Vec<(u32, u32)> = layout
+        .hunks
+        .iter()
+        .filter_map(|(id, kind, start, _)| {
+            let k = (*kind)?;
+            if conflict_only && !matches!(k, HunkKind::Conflict) {
+                return None;
+            }
+            Some((*id, *start))
+        })
+        .collect();
+    if forward {
+        filtered.into_iter().find(|(_, s)| (*s as i64) > ref_line).map(|(id, _)| id)
+    } else {
+        filtered.into_iter().rev().find(|(_, s)| (*s as i64) < ref_line).map(|(id, _)| id)
+    }
 }
 
 fn build_layout(hunks: &[MergeHunk], pane: Pane, lh: f32) -> PaneLayout {
@@ -319,6 +358,35 @@ pub fn render(
     let base_layout = build_layout(hunks, Pane::Base, lh);
     let local_layout = build_layout(hunks, Pane::Local, lh);
     let remote_layout = build_layout(hunks, Pane::Remote, lh);
+
+    // Keyboard-driven next/prev hunk navigation (Ctrl+4/Ctrl+3 for any
+    // non-Stable hunk; Ctrl+2/Ctrl+1 for Conflict only). We pick the target
+    // by stepping relative to whatever hunk is closest to the current Base
+    // center line, then center the matching hunk on all three upper panes.
+    // The result pane follows via the 4-way sync once one pane moves.
+    if let Some(nav) = state.pending_hunk_nav.take() {
+        let center_base = ((state.target[Pane::Base as usize] + pane_h * 0.5) / lh).floor() as i64 + 1;
+        if let Some(hunk_id) = pick_nav_hunk(&base_layout, center_base, nav) {
+            let center_for = |layout: &PaneLayout| -> Option<f32> {
+                layout
+                    .hunks
+                    .iter()
+                    .find(|(id, _, _, _)| *id == hunk_id)
+                    .map(|(_, _, start, _)| {
+                        ((*start as f32 - 1.0) * lh - pane_h * 0.5 + lh * 0.5).max(0.0)
+                    })
+            };
+            if let Some(y) = center_for(&base_layout) {
+                state.pending[Pane::Base as usize] = Some(y);
+            }
+            if let Some(y) = center_for(&local_layout) {
+                state.pending[Pane::Local as usize] = Some(y);
+            }
+            if let Some(y) = center_for(&remote_layout) {
+                state.pending[Pane::Remote as usize] = Some(y);
+            }
+        }
+    }
 
     // Layout: Remote | connector_rb | Base | connector_bl | Local. Putting
     // Base in the middle makes each connector a true pair (Remote↔Base on the
