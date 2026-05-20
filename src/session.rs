@@ -89,6 +89,7 @@ pub struct DiffSession {
     pub mode: SessionMode,
     /// User-edited result buffer (overrides computed result when set).
     pub manual_result: Option<String>,
+    pub read_only: bool,
 }
 
 #[derive(Default)]
@@ -101,6 +102,8 @@ pub struct SessionStore {
 pub enum SessionError {
     #[error("unknown session id: {0}")]
     UnknownSession(SessionId),
+    #[error("session is read-only")]
+    ReadOnly,
     #[error("unknown engine: {0}")]
     UnknownEngine(String),
     #[error("wrong session mode for this operation")]
@@ -326,6 +329,7 @@ impl SessionStore {
                 decisions: HashMap::new(),
             },
             manual_result: None,
+            read_only: false,
         };
         self.sessions.lock().unwrap().insert(id, s);
         Ok(id)
@@ -378,6 +382,7 @@ impl SessionStore {
                 resolutions: HashMap::new(),
             },
             manual_result: None,
+            read_only: false,
         };
         self.sessions.lock().unwrap().insert(id, s);
         Ok(id)
@@ -460,6 +465,9 @@ impl SessionStore {
     ) -> Result<(), SessionError> {
         let mut sessions = self.sessions.lock().unwrap();
         let s = sessions.get_mut(&id).ok_or(SessionError::UnknownSession(id))?;
+        if s.read_only {
+            return Err(SessionError::ReadOnly);
+        }
         match (&mut s.mode, side) {
             (SessionMode::TwoWay { a_text, .. }, SideRef::TwoWay(TwoWaySide::A)) => *a_text = new_text,
             (SessionMode::TwoWay { b_text, .. }, SideRef::TwoWay(TwoWaySide::B)) => *b_text = new_text,
@@ -732,5 +740,17 @@ mod tests {
         };
         store.set_three_way_resolution(id, conflict_id, Resolution::Local).unwrap();
         assert_eq!(store.compute_result(id).unwrap(), "a\nL\nc");
+    }
+
+    #[test]
+    fn set_side_text_no_op_when_read_only() {
+        let store = SessionStore::new();
+        let id = store.open_two_way("a\n", "b\n", None).unwrap();
+        store.with(id, |s| { s.read_only = true; Ok(()) }).unwrap();
+        let res = store.set_side_text(id, SideRef::TwoWay(TwoWaySide::A), "changed".into());
+        assert!(matches!(res, Err(SessionError::ReadOnly)));
+        let snap = store.snapshot(id).unwrap();
+        let SessionMode::TwoWay { a_text, .. } = snap.mode else { panic!() };
+        assert_eq!(a_text, "a");
     }
 }
