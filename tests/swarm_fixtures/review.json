@@ -1,0 +1,24 @@
+{
+  "review": {
+    "id": 12345,
+    "author": "alice",
+    "description": "Fix the foo widget so it doesn't bar.\n",
+    "state": "needsReview",
+    "created": 1715000000,
+    "updated": 1715100000,
+    "participants": {
+      "bob": { "vote": { "value": 1 } },
+      "carol": { "vote": { "value": 0 } }
+    },
+    "versions": [
+      { "change": 99001, "user": "alice" },
+      { "change": 99002, "user": "alice" }
+    ]
+  },
+  "files": [
+    { "depotFile": "//depot/foo.rs", "action": "edit", "rev": "3", "fileSize": 1234, "type": "text" },
+    { "depotFile": "//depot/added.rs", "action": "add", "rev": "1", "fileSize": 200, "type": "text" },
+    { "depotFile": "//depot/gone.rs", "action": "delete", "rev": "5", "fileSize": 0, "type": "text" },
+    { "depotFile": "//depot/img.png", "action": "edit", "rev": "2", "fileSize": 50000, "type": "binary" }
+  ]
+}

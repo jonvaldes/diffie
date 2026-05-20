@@ -1,3 +1,4 @@
-//! Helix Swarm integration: URL parsing, REST client, background loader.
+//! Helix Swarm integration.
 
 pub mod url;
+pub mod model;

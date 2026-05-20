@@ -1,0 +1,12 @@
+{
+  "change": {
+    "change": 99002,
+    "user": "alice",
+    "description": "Quick fix for the bar regression.\n",
+    "status": "submitted",
+    "time": 1715100000
+  },
+  "files": [
+    { "depotFile": "//depot/bar.rs", "action": "edit", "rev": "8", "fileSize": 500, "type": "text" }
+  ]
+}
