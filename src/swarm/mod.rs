@@ -2,3 +2,4 @@
 
 pub mod url;
 pub mod model;
+pub mod client;
